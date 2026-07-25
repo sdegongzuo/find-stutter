@@ -1,0 +1,31 @@
+[package]
+name = "find-stutter-ui"
+version = "0.1.0"
+edition = "2021"
+description = "System stutter monitor - UI overlay"
+
+[dependencies]
+find-stutter-core = { path = "../core" }
+eframe = { version = "0.30", features = [
+    "default",
+    "glow",
+    "persistence",
+] }
+egui = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+tray-icon = "0.19"
+muda = "0.15"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+log = "0.4"
+env_logger = "0.11"
+sysinfo = "0.33"
+crossbeam-channel = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+raw-window-handle = "0.6"

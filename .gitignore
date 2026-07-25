@@ -1,0 +1,11 @@
+# Rust build artifacts
+/target
+/fsbuild
+
+# Runtime / project data
+stutter.db
+.workbuddy/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+[sampling]
+interval_ms = 1000
+slow_interval_factor = 5
+
+[detection]
+cpu_threshold = 90.0
+mem_threshold_percent = 90.0
+mem_threshold_mb = 500
+swap_threshold = 50.0
+disk_rate_spike_ratio = 5.0
+spike_ratio = 2.0
+sustained_seconds = 3
+
+[ui]
+skin = "default"
+always_on_top = true
+show_upload = true
+show_download = true
+show_cpu = true
+show_memory = true
+show_gpu = true
+show_disk = true
+show_cpu_freq = false
+show_temperature = false
+mouse_transparent = false
+click_through = false
+
+[storage]
+db_path = "stutter.db"
+retention_days = 30
+
+[notifications]
+stutter_alert = true
+min_severity = "major"
+
+[logging]
+level = "info"
