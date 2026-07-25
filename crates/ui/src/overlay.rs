@@ -1,5 +1,7 @@
 use crate::skin::SkinConfig;
 use egui::{Color32, FontId, RichText, Ui};
+use find_stutter_core::Severity;
+use std::time::Instant;
 
 pub fn format_bytes(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {
@@ -30,11 +32,21 @@ pub struct OverlayState {
     pub sent_total: u64,
     pub recv_total: u64,
     pub stutter_count: u32,
+    /// 最近一次触发闪烁提醒的卡顿严重程度（仅 Major/Critical）
+    pub last_stutter_severity: Option<Severity>,
+    /// 闪烁提醒的截止时刻；当前时刻小于该值时边框脉冲闪烁
+    pub flash_until: Instant,
 }
 
 impl Default for OverlayState {
     fn default() -> Self {
-        Self { sent_total: 0, recv_total: 0, stutter_count: 0 }
+        Self {
+            sent_total: 0,
+            recv_total: 0,
+            stutter_count: 0,
+            last_stutter_severity: None,
+            flash_until: Instant::now(),
+        }
     }
 }
 
@@ -178,10 +190,17 @@ mod tests {
 
     #[test]
     fn overlay_state_clone() {
-        let state = OverlayState { sent_total: 100, recv_total: 200, stutter_count: 3 };
+        let state = OverlayState {
+            sent_total: 100,
+            recv_total: 200,
+            stutter_count: 3,
+            last_stutter_severity: None,
+            flash_until: Instant::now(),
+        };
         let cloned = state.clone();
         assert_eq!(cloned.sent_total, 100);
         assert_eq!(cloned.recv_total, 200);
         assert_eq!(cloned.stutter_count, 3);
+        assert_eq!(cloned.last_stutter_severity, None);
     }
 }

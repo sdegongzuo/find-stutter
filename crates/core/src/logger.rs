@@ -1,5 +1,5 @@
 use crate::types::{Sample, StutterEvent, StorageConfig};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Utc};
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
 
@@ -13,6 +13,9 @@ pub struct Logger {
 impl Logger {
     pub fn new(config: &StorageConfig) -> anyhow::Result<Self> {
         let conn = Connection::open(&config.db_path)?;
+        // 开启 WAL：采集线程每秒写入，GUI / 导出命令并发读取时互不阻塞
+        // （P3 服务化采集 + GUI 只读模式的基础）
+        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

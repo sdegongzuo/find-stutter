@@ -1,37 +1,63 @@
+# ============================================================
+# find-stutter 配置文件
+# 修改后保存即可（部分字段需重启程序生效；采集阈值即时生效）
+# ============================================================
+
 [sampling]
+# 采样间隔（毫秒）。默认 1000 = 每秒一次
 interval_ms = 1000
+# 系统空闲时的降频系数：CPU/内存持续低位时，采样间隔放大为 interval_ms * slow_interval_factor
 slow_interval_factor = 5
 
 [detection]
+# CPU 使用率超过该百分比（%）即视为潜在卡顿
 cpu_threshold = 90.0
+# 内存使用率超过该百分比（%）即视为潜在卡顿
 mem_threshold_percent = 90.0
+# 或：可用内存低于该值（MB）即视为潜在卡顿
 mem_threshold_mb = 500
+# 交换分区使用率超过该百分比（%）即视为潜在卡顿
 swap_threshold = 50.0
+# 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
 disk_rate_spike_ratio = 5.0
+# 综合指标相对基线的突增倍数
 spike_ratio = 2.0
+# 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
 
 [ui]
+# 皮肤名称，对应 skins 目录下的 TOML 文件（默认 "default"）
 skin = "default"
+# 是否置顶显示
 always_on_top = true
+# 各指标是否显示（可独立关闭）
 show_upload = true
 show_download = true
 show_cpu = true
 show_memory = true
 show_gpu = true
 show_disk = true
+# 是否在详情面板显示 CPU 频率
 show_cpu_freq = false
+# 是否在详情面板显示温度（CPU 温度需 WMI 支持）
 show_temperature = false
+# 鼠标穿透（已废弃，保留兼容；实际穿透请用右键菜单「点击穿透模式」或按 T）
 mouse_transparent = false
+# 点击穿透模式（已废弃，保留兼容；实际穿透请用右键菜单或按 T）
 click_through = false
 
 [storage]
+# SQLite 数据库文件路径
 db_path = "stutter.db"
+# 数据保留天数，超过自动清理
 retention_days = 30
 
 [notifications]
+# 检测到卡顿是否弹出提醒
 stutter_alert = true
+# 提醒的最低严重程度：minor / major / critical
 min_severity = "major"
 
 [logging]
+# 日志级别：error / warn / info / debug / trace
 level = "info"
