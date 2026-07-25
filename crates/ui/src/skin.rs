@@ -1,4 +1,8 @@
-use egui::Color32;
+//! 皮肤配置：纯数据（颜色用 `#RRGGBB` 字符串存储），无 UI 框架依赖。
+//!
+//! 由 [`SkinConfig::load`] 从 `skins/<name>/skin.toml` 读取，反序列化后存为字符串，
+//! 真正使用颜色时调用 [`crate::overlay::parse_color`] 解析为 `slint::Color`。
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,30 +49,6 @@ fn default_gpu_color() -> String { "#CBA6F7".into() }
 fn default_disk_color() -> String { "#94E2D5".into() }
 fn default_label_color() -> String { "#BAC2DE".into() }
 
-fn parse_color(hex: &str) -> Color32 {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
-        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-        Color32::from_rgb(r, g, b)
-    } else {
-        Color32::WHITE
-    }
-}
-
-impl SkinConfig {
-    pub fn bg_color(&self) -> Color32 { parse_color(&self.background_color) }
-    pub fn border_color(&self) -> Color32 { parse_color(&self.border_color) }
-    pub fn upload_color(&self) -> Color32 { parse_color(&self.upload_color) }
-    pub fn download_color(&self) -> Color32 { parse_color(&self.download_color) }
-    pub fn cpu_color(&self) -> Color32 { parse_color(&self.cpu_color) }
-    pub fn memory_color(&self) -> Color32 { parse_color(&self.memory_color) }
-    pub fn gpu_color(&self) -> Color32 { parse_color(&self.gpu_color) }
-    pub fn disk_color(&self) -> Color32 { parse_color(&self.disk_color) }
-    pub fn label_color(&self) -> Color32 { parse_color(&self.label_color) }
-}
-
 impl Default for SkinConfig {
     fn default() -> Self {
         Self {
@@ -89,13 +69,15 @@ impl Default for SkinConfig {
     }
 }
 
-#[allow(dead_code)]
-pub fn load_skin(name: &str) -> SkinConfig {
-    let path = format!("skins/{}/skin.toml", name);
-    if let Ok(content) = std::fs::read_to_string(&path) {
-        toml::from_str(&content).unwrap_or_default()
-    } else {
-        SkinConfig::default()
+impl SkinConfig {
+    /// 从 `skins/<name>/skin.toml` 加载，文件不存在或解析失败返回默认皮肤
+    pub fn load(name: &str) -> Self {
+        let path = format!("skins/{}/skin.toml", name);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            toml::from_str(&content).unwrap_or_default()
+        } else {
+            Self::default()
+        }
     }
 }
 
@@ -122,97 +104,25 @@ mod tests {
     }
 
     #[test]
-    fn parse_color_red() {
-        let skin = SkinConfig { upload_color: "#FF0000".into(), ..SkinConfig::default() };
-        assert_eq!(skin.upload_color(), Color32::from_rgb(255, 0, 0));
-    }
-
-    #[test]
-    fn parse_color_green() {
-        let skin = SkinConfig { download_color: "#00FF00".into(), ..SkinConfig::default() };
-        assert_eq!(skin.download_color(), Color32::from_rgb(0, 255, 0));
-    }
-
-    #[test]
-    fn parse_color_blue() {
-        let skin = SkinConfig { cpu_color: "#0000FF".into(), ..SkinConfig::default() };
-        assert_eq!(skin.cpu_color(), Color32::from_rgb(0, 0, 255));
-    }
-
-    #[test]
-    fn parse_color_invalid_returns_white() {
-        let skin = SkinConfig { upload_color: "#XYZ".into(), ..SkinConfig::default() };
-        assert_eq!(skin.upload_color(), Color32::WHITE);
-    }
-
-    #[test]
-    fn parse_color_no_hash_prefix() {
-        let skin = SkinConfig { memory_color: "FF00FF".into(), ..SkinConfig::default() };
-        assert_eq!(skin.memory_color(), Color32::from_rgb(255, 0, 255));
-    }
-
-    #[test]
-    fn bg_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.bg_color(), Color32::from_rgb(0x1E, 0x1E, 0x2E));
-    }
-
-    #[test]
-    fn border_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.border_color(), Color32::from_rgb(0x45, 0x47, 0x5A));
-    }
-
-    #[test]
-    fn upload_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.upload_color(), Color32::from_rgb(0xA6, 0xE3, 0xA1));
-    }
-
-    #[test]
-    fn download_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.download_color(), Color32::from_rgb(0x89, 0xB4, 0xFA));
-    }
-
-    #[test]
-    fn cpu_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.cpu_color(), Color32::from_rgb(0xF9, 0xE2, 0xAF));
-    }
-
-    #[test]
-    fn memory_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.memory_color(), Color32::from_rgb(0xF3, 0x8B, 0xA8));
-    }
-
-    #[test]
-    fn gpu_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.gpu_color(), Color32::from_rgb(0xCB, 0xA6, 0xF7));
-    }
-
-    #[test]
-    fn disk_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.disk_color(), Color32::from_rgb(0x94, 0xE2, 0xD5));
-    }
-
-    #[test]
-    fn label_color_matches_default_hex() {
-        let skin = SkinConfig::default();
-        assert_eq!(skin.label_color(), Color32::from_rgb(0xBA, 0xC2, 0xDE));
-    }
-
-    #[test]
     fn load_nonexistent_skin_returns_default() {
-        let skin = load_skin("this_skin_definitely_does_not_exist_12345");
+        let skin = SkinConfig::load("this_skin_definitely_does_not_exist_12345");
         let default = SkinConfig::default();
         assert_eq!(skin.width, default.width);
         assert_eq!(skin.height, default.height);
         assert_eq!(skin.background_color, default.background_color);
         assert_eq!(skin.font_size, default.font_size);
         assert_eq!(skin.upload_color, default.upload_color);
+    }
+
+    #[test]
+    fn parse_toml_partial() {
+        let content = "width = 300.0\nheight = 100.0\nfont_size = 15.0\nupload_color = \"00FF00\"\n";
+        let skin: SkinConfig = toml::from_str(content).unwrap();
+        assert_eq!(skin.width, 300.0);
+        assert_eq!(skin.height, 100.0);
+        assert_eq!(skin.font_size, 15.0);
+        assert_eq!(skin.upload_color, "00FF00");
+        // 未指定的字段用默认值
+        assert_eq!(skin.background_color, "#1E1E2E");
     }
 }

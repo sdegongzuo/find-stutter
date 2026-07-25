@@ -1,27 +1,10 @@
-use eframe::egui;
+//! find-stutter-ui 可执行入口
+//!
+//! 主要的 `find-stutter` CLI 见 `crates/bin`；这个 bin 仅在直接 cargo run 该 crate 时使用。
 
-mod app;
-mod overlay;
-mod skin;
-mod theme;
+use find_stutter_ui::run_overlay;
 
-fn main() -> eframe::Result<()> {
+fn main() -> anyhow::Result<()> {
     env_logger::init();
-
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_transparent(true)
-            .with_inner_size([280.0, 90.0])
-            .with_min_inner_size([200.0, 60.0])
-            .with_position([10.0, 10.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "find-stutter",
-        options,
-        Box::new(|cc| Ok(Box::new(app::MonitorApp::new(cc)))),
-    )
+    run_overlay()
 }

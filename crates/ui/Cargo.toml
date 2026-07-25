@@ -1,31 +1,45 @@
 [package]
 name = "find-stutter-ui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "System stutter monitor - UI overlay"
+description = "System stutter monitor - Slint UI overlay (replaces egui/eframe to fix transparent-window ghosting)"
+build = "build.rs"
 
 [dependencies]
 find-stutter-core = { path = "../core" }
-eframe = { version = "0.30", features = [
-    "default",
-    "glow",
-    "persistence",
+
+# Slint 1.x：retained-mode 渲染 + 原生窗口层，
+# 透明 overlay 移动时由 Slint 的 winit 后端处理，无 egui 即时模式逐帧 OuterPosition 更新导致的重影/闪烁
+slint = { version = "1.10", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "renderer-femtovg",
+    "renderer-software",
+    "raw-window-handle-06",
 ] }
-egui = "0.30"
-egui_extras = { version = "0.30", features = ["image"] }
-tray-icon = "0.19"
-muda = "0.15"
+
+# 纯数据皮肤配置（无 UI 框架依赖）
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# 后台线程与 UI 线程同步
+parking_lot = "0.12"
+
+# 错误类型
+anyhow = "1"
+
+# 日志
+log = "0.4"
+env_logger = "0.11"
+
+# 平台层（Windows 原生窗口句柄 + 点击穿透/置顶）
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
-    "Win32_System_LibraryLoader",
 ] }
-serde = { version = "1", features = ["derive"] }
-toml = "0.8"
-log = "0.4"
-env_logger = "0.11"
-sysinfo = "0.33"
-crossbeam-channel = "0.5"
-chrono = { version = "0.4", features = ["serde"] }
 raw-window-handle = "0.6"
+
+[build-dependencies]
+slint-build = "1.10"

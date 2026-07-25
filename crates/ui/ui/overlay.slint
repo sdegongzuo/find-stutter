@@ -1,0 +1,343 @@
+// overlay.slint — 透明置顶悬浮窗
+// 通过 slint::include_modules! 编译进二进制（需 build.rs 中 slint_build::compile）。
+//
+// 设计目标：
+//   - no-frame + 透明背景 + 圆角矩形作为可视容器
+//   - TouchArea 覆盖整个窗口，左右键分别走 drag / context-menu
+//   - 拖动由 Rust 端跟踪鼠标偏移并调用 Window::set_position，
+//     仅在用户实际拖动时更新（不是每帧），避免 egui 即时模式的重影
+//   - 右键菜单用 in-window 弹层（Rectangle + TouchArea 组合），不依赖 OS 菜单
+//   - 闪烁边框通过 border-flash-alpha 切换 border-color 与 border-width
+//   - 键盘事件通过 FocusScope 捕获（Window 自身没有 key_pressed 回调）
+//
+// Slint 1.17.1 注意点：
+//   - color/border-color/background 期望 brush 类型，不能直接用 string
+//   - length 算术需要 * 1px 显式标注
+//   - PointerEvent 没有 position 字段；用 TouchArea 的 mouse_x/mouse_y 拿当前坐标
+
+export component Overlay inherits Window {
+    // ===== 实时文本（Rust 1Hz 刷新） =====
+    in property <string> upload: "↑ 0 B/s";
+    in property <string> download: "↓ 0 B/s";
+    in property <string> cpu: "CPU: 0.0%";
+    in property <string> memory: "内存: 0.0%";
+    in property <string> gpu: "GPU: --";
+    in property <string> disk: "硬盘: --";
+
+    // ===== 详情面板（展开时显示） =====
+    in property <string> detail_daily: "";
+    in property <string> detail_cpu: "";
+    in property <string> detail_memory: "";
+    in property <string> detail_gpu: "";
+    in property <string> detail_disk: "";
+    in property <string> detail_temp: "";
+    in property <string> detail_count: "";
+    in property <string> detail_proc: "";
+    in property <bool> show_gpu_detail: false;
+    in property <bool> show_temp_detail: false;
+
+    // ===== 视觉 =====
+    in property <brush> bg-color: #1E1E2E;
+    in property <brush> border-color: #45475A;
+    in property <brush> border-flash: #FF4646;
+    in property <float> border-flash-alpha: 0.0;
+    in property <float> border-radius: 8.0;
+    in property <float> font-size: 13.0;
+    in property <brush> upload-color: #A6E3A1;
+    in property <brush> download-color: #89B4FA;
+    in property <brush> cpu-color: #F9E2AF;
+    in property <brush> memory-color: #F38BA8;
+    in property <brush> gpu-color: #CBA6F7;
+    in property <brush> disk-color: #94E2D5;
+    in property <brush> label-color: #BAC2DE;
+    in property <brush> hint-color: #FFD078;
+    in property <brush> menu-bg: #2A2A3C;
+    in property <brush> menu-hover: #3A3A4C;
+    in property <brush> menu-quit-hover: #4A2A2C;
+    in property <brush> menu-quit-text: #FF8888;
+    in property <brush> separator-color: #45475A;
+    in property <brush> shadow-color: #00000080;
+
+    // ===== 状态 =====
+    in property <bool> expanded: false;
+    in property <bool> click-through: false;
+    in property <bool> menu-open: false;
+    in property <bool> paused: false;
+    in property <float> menu-y: 0.0;
+
+    // ===== 回调（Rust 端实现） =====
+    callback drag-start(float, float);  // 记录起点 (mouse_x, mouse_y) in logical px
+    callback drag-move(float, float);  // (mouse_x, mouse_y) in logical px
+    callback drag-end();
+    callback expand-toggle();
+    callback context-menu();
+    callback menu-pause();
+    callback menu-click-through();
+    callback menu-quit();
+    callback menu-close();
+    callback key-toggle-click-through();
+
+    // ===== 窗口属性 =====
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+    default-font-family: "Microsoft YaHei";
+
+    width: 280px;
+    height: root.expanded ? 200px : 90px;
+
+    // FocusScope 让 key-pressed 回调能拿到 T 键
+    // （Window 本身没有 key_pressed 回调）
+    forward-focus: fs;
+
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+
+        key-pressed(event) => {
+            if (event.text == "T" || event.text == "t") {
+                root.key-toggle-click-through();
+                return accept;
+            }
+            return reject;
+        }
+
+        // 背景圆角矩形（容器）
+        container := Rectangle {
+            background: root.bg-color;
+            border-color: root.border-flash-alpha > 0 ? root.border-flash : root.border-color;
+            border-width: root.border-flash-alpha > 0 ? 3px : 1px;
+            border-radius: root.border-radius * 1px;
+            clip: true;
+
+            // 整窗口触控区域
+            touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: pointer;
+
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                        root.drag-start(touch.mouse_x / 1px, touch.mouse_y / 1px);
+                    } else if (event.kind == PointerEventKind.move) {
+                        // mouse_x / mouse_y 是 length，需要除以 1px 转为 float
+                        root.drag-move(touch.mouse_x / 1px, touch.mouse_y / 1px);
+                    } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                        root.drag-end();
+                    } else if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                        root.context-menu();
+                    }
+                }
+
+                // 单击空白：展开/收起（纯点击不触发 drag-move，避免误触）
+                clicked => {
+                    root.expand-toggle();
+                }
+            }
+
+            // 主体内容
+            VerticalLayout {
+                padding: 10px;
+                spacing: 2px;
+
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 12px;
+                    Text {
+                        text: root.upload;
+                        color: root.upload-color;
+                        font-size: root.font-size * 1px;
+                    }
+                    Text {
+                        text: root.download;
+                        color: root.download-color;
+                        font-size: root.font-size * 1px;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 12px;
+                    Text {
+                        text: root.cpu;
+                        color: root.cpu-color;
+                        font-size: root.font-size * 1px;
+                    }
+                    Text {
+                        text: root.memory;
+                        color: root.memory-color;
+                        font-size: root.font-size * 1px;
+                    }
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 12px;
+                    Text {
+                        text: root.gpu;
+                        color: root.gpu-color;
+                        font-size: root.font-size * 1px;
+                    }
+                    Text {
+                        text: root.disk;
+                        color: root.disk-color;
+                        font-size: root.font-size * 1px;
+                    }
+                }
+
+                // 详情面板（仅展开时渲染）
+                if root.expanded: VerticalLayout {
+                    spacing: 1px;
+                    Rectangle { height: 1px; background: root.separator-color; }
+                    Text {
+                        text: root.detail_daily;
+                        color: root.label-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    Text {
+                        text: root.detail_cpu;
+                        color: root.cpu-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    Text {
+                        text: root.detail_memory;
+                        color: root.memory-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    if (root.show_gpu_detail): Text {
+                        text: root.detail_gpu;
+                        color: root.gpu-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    Text {
+                        text: root.detail_disk;
+                        color: root.disk-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    if (root.show_temp_detail): Text {
+                        text: root.detail_temp;
+                        color: root.cpu-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    Rectangle { height: 1px; background: root.separator-color; }
+                    Text {
+                        text: root.detail_count;
+                        color: root.label-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                    Text {
+                        text: root.detail_proc;
+                        color: root.label-color;
+                        font-size: (root.font-size - 2.0) * 1px;
+                    }
+                }
+
+                if root.click-through: Text {
+                    text: "穿透模式 · 按 T 退出";
+                    color: root.hint-color;
+                    font-size: (root.font-size - 4.0) * 1px;
+                }
+            }
+
+            // 右键弹层菜单
+            if root.menu-open: Rectangle {
+                x: 0;
+                y: root.menu-y * 1px;
+                width: 140px;
+                height: 120px;
+                background: root.menu-bg;
+                border-color: root.border-color;
+                border-width: 1px;
+                border-radius: 4px;
+                drop-shadow-color: root.shadow-color;
+                drop-shadow-blur: 6px;
+                drop-shadow-offset-x: 0px;
+                drop-shadow-offset-y: 2px;
+
+                menu-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                }
+
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 0;
+
+                    Rectangle {
+                        height: 28px;
+                        background: item1.has-hover ? root.menu-hover : transparent;
+                        item1 := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.menu-pause();
+                                root.menu-close();
+                            }
+                        }
+                        Text {
+                            text: root.paused ? "▶  恢复监控" : "⏸  暂停监控";
+                            color: root.label-color;
+                            font-size: 12px;
+                            x: 12px;
+                            y: 7px;
+                        }
+                    }
+                    Rectangle {
+                        height: 28px;
+                        background: item2.has-hover ? root.menu-hover : transparent;
+                        item2 := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.expand-toggle();
+                                root.menu-close();
+                            }
+                        }
+                        Text {
+                            text: "↕  展开/收起详情";
+                            color: root.label-color;
+                            font-size: 12px;
+                            x: 12px;
+                            y: 7px;
+                        }
+                    }
+                    Rectangle {
+                        height: 28px;
+                        background: item3.has-hover ? root.menu-hover : transparent;
+                        item3 := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.menu-click-through();
+                                root.menu-close();
+                            }
+                        }
+                        Text {
+                            text: root.click-through ? "✕  退出点击穿透" : "→  进入点击穿透";
+                            color: root.label-color;
+                            font-size: 12px;
+                            x: 12px;
+                            y: 7px;
+                        }
+                    }
+                    Rectangle {
+                        height: 28px;
+                        background: item4.has-hover ? root.menu-quit-hover : transparent;
+                        item4 := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.menu-quit();
+                            }
+                        }
+                        Text {
+                            text: "✕  退出";
+                            color: root.menu-quit-text;
+                            font-size: 12px;
+                            x: 12px;
+                            y: 7px;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

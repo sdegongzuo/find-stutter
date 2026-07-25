@@ -46,8 +46,8 @@
 - [ ] **Windows 服务改造** — 服务只做采集+写库，不负责 GUI（~30 行，`windows-service` crate 已声明）
 - [ ] **GUI 改为只读模式** — GUI 从 stutter.db 轮询读取最新数据，不再自行采集（WAL 模式已就绪，可并发读）
 - [ ] **服务健康检测** — GUI 检测服务是否运行，断开时提示"服务已停止"
-- [ ] **开机自启** — 通过服务安装实现
-- [ ] **Installer 打包** — NSIS 或 WiX 安装包
+
+
 
 ### P4 — 代码质量
 - [x] **移除 unused warnings** — 清理 `crates/core/src/logger.rs` 未使用的 `DateTime` 导入、`crates/ui/src/overlay.rs` 未使用的 `Duration` 导入；release 构建现已零警告
