@@ -47,6 +47,14 @@ impl Logger {
                 severity TEXT NOT NULL,
                 causes TEXT NOT NULL,
                 snapshot TEXT NOT NULL
+            );
+            -- P3：服务心跳表。Service 每次 tick 更新 timestamp，
+            -- GUI 用此探活：超过 N 秒未更新即视为服务停止。
+            -- 单行表，PRIMARY KEY 固定为 1，UPSERT 语义。
+            CREATE TABLE IF NOT EXISTS service_heartbeat (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                timestamp TEXT NOT NULL,
+                pid INTEGER NOT NULL
             );",
         )?;
         Ok(Self {
@@ -226,6 +234,91 @@ impl Logger {
         )?;
         Ok(count)
     }
+
+    // --- P3: 服务写心跳、GUI 读心跳 + 最近 sample ---
+
+    /// 服务调用：每 tick 写一次心跳（UPSERT 到 id=1 的单行）。
+    /// GUI 用 [`Self::latest_heartbeat`] 探活：返回 None 即数据库从未被服务写入过。
+    pub fn touch_heartbeat(&self) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO service_heartbeat (id, timestamp, pid) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET timestamp = excluded.timestamp, pid = excluded.pid",
+            params![Utc::now().to_rfc3339(), std::process::id() as i64],
+        )?;
+        Ok(())
+    }
+
+    /// 读最新心跳时间戳（RFC3339）。从未被服务写入过返回 None。
+    /// GUI 用此判断服务是否仍在运行。
+    pub fn latest_heartbeat(&self) -> anyhow::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT timestamp, pid FROM service_heartbeat WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 读最新一条 sample 的时间戳（GUI 健康检测的辅助信号）。
+    /// 如果连 samples 表都空，说明服务从未启动过。
+    pub fn latest_sample_timestamp(&self) -> anyhow::Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT timestamp FROM samples ORDER BY id DESC LIMIT 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(row.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// 读最新一条 sample（GUI 启动时立刻有数据可显示）。
+    /// 返回 (timestamp_rfc3339, cpu_usage, mem_available_mb, net_sent_bps, net_recv_bps,
+    ///       disk_read_bps, disk_write_bps, gpu_usage, cpu_temp)
+    /// 行不存在返回 None。
+    pub fn latest_sample_summary(&self) -> anyhow::Result<Option<LatestSampleSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, cpu_usage, mem_available_mb, net_sent_bps, net_recv_bps,
+                    disk_read_bps, disk_write_bps, gpu_usage, cpu_temp
+             FROM samples ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(LatestSampleSummary {
+                timestamp: row.get(0)?,
+                cpu_usage: row.get::<_, Option<f32>>(1)?.unwrap_or(0.0),
+                mem_available_mb: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
+                net_sent_bps: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                net_recv_bps: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                disk_read_bps: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                disk_write_bps: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                gpu_usage: row.get::<_, Option<f32>>(7)?,
+                cpu_temp: row.get::<_, Option<f32>>(8)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// P3：GUI 只读模式读到的最新一条 sample 的精简视图。
+/// 完整 `Sample` 含 `cpu_per_core` 数组（序列化到 TEXT）反序列化成本高，
+/// GUI 只需显示几个关键指标，用专用结构体省一次 JSON roundtrip。
+#[derive(Debug, Clone)]
+pub struct LatestSampleSummary {
+    pub timestamp: String, // RFC3339
+    pub cpu_usage: f32,
+    pub mem_available_mb: u64,
+    pub net_sent_bps: u64,
+    pub net_recv_bps: u64,
+    pub disk_read_bps: u64,
+    pub disk_write_bps: u64,
+    pub gpu_usage: Option<f32>,
+    pub cpu_temp: Option<f32>,
 }
 
 #[cfg(test)]
