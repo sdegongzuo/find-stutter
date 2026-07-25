@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/target2
 /fsbuild
 
 # Runtime / project data
@@ -9,3 +10,12 @@ stutter.db
 # OS / editor noise
 .DS_Store
 Thumbs.db
+
+# PowerShell scripts
+*.ps1
+
+# CSV data files
+*.csv
+
+# Build documentation
+BUILD.md
