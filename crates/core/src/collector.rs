@@ -4,6 +4,111 @@ use log::warn;
 use std::collections::HashMap;
 use sysinfo::{Networks, System};
 use wmi::{COMLibrary, Variant, WMIConnection};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::System::Performance::{
+    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
+    PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE,
+};
+
+/// Windows PDH-based disk I/O sampler.
+///
+/// Holds the PDH query + counter handles for the `_Total` physical-disk
+/// read/write bytes-per-second counters. The query is opened once and the
+/// counters are sampled every tick so the values are always fresh (the old
+/// WMI approach only ran every 5 ticks AND matched the wrong variant type,
+/// which is why disk always showed `0 B/s`). In the windows 0.58 crate PDH
+/// handles are plain `isize`.
+struct DiskPdh {
+    query: isize,
+    read_counter: isize,
+    write_counter: isize,
+}
+
+impl DiskPdh {
+    fn new() -> Option<Self> {
+        unsafe {
+            let mut query: isize = 0;
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
+                warn!("PdhOpenQueryW failed");
+                return None;
+            }
+
+            let mut read_counter: isize = 0;
+            let mut write_counter: isize = 0;
+
+            let read_path = w!(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
+            let write_path = w!(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");
+
+            if PdhAddEnglishCounterW(query, read_path, 0, &mut read_counter) != ERROR_SUCCESS.0 {
+                warn!("PdhAddEnglishCounterW (read) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            if PdhAddEnglishCounterW(query, write_path, 0, &mut write_counter) != ERROR_SUCCESS.0 {
+                warn!("PdhAddEnglishCounterW (write) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+
+            // Prime the query so the first real collect has a baseline for the
+            // "bytes/sec" rate counter.
+            PdhCollectQueryData(query);
+
+            Some(Self {
+                query,
+                read_counter,
+                write_counter,
+            })
+        }
+    }
+
+    /// Collect the current read/write bytes-per-second. Returns `(read_bps, write_bps)`.
+    fn sample(&self) -> (u64, u64) {
+        unsafe {
+            if PdhCollectQueryData(self.query) != ERROR_SUCCESS.0 {
+                return (0, 0);
+            }
+
+            let mut read_val: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut write_val: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+
+            if PdhGetFormattedCounterValue(self.read_counter, PDH_FMT_LARGE, None, &mut read_val)
+                != ERROR_SUCCESS.0
+            {
+                return (0, 0);
+            }
+            if PdhGetFormattedCounterValue(self.write_counter, PDH_FMT_LARGE, None, &mut write_val)
+                != ERROR_SUCCESS.0
+            {
+                return (0, 0);
+            }
+
+            // CStatus == 0 means valid data. The large value is an i64; clamp
+            // negatives to 0 before casting to u64.
+            let read = if read_val.CStatus == 0 {
+                read_val.Anonymous.largeValue.max(0) as u64
+            } else {
+                0
+            };
+            let write = if write_val.CStatus == 0 {
+                write_val.Anonymous.largeValue.max(0) as u64
+            } else {
+                0
+            };
+
+            (read, write)
+        }
+    }
+}
+
+impl Drop for DiskPdh {
+    fn drop(&mut self) {
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
 
 pub struct Collector {
     sys: System,
@@ -11,6 +116,7 @@ pub struct Collector {
     prev_net_sent: u64,
     prev_net_recv: u64,
     tick: u32,
+    disk_pdh: Option<DiskPdh>,
 }
 
 impl Collector {
@@ -26,12 +132,15 @@ impl Collector {
             prev_net_recv += data.total_received();
         }
 
+        let disk_pdh = DiskPdh::new();
+
         Self {
             sys,
             networks,
             prev_net_sent,
             prev_net_recv,
             tick: 0,
+            disk_pdh,
         }
     }
 
@@ -78,13 +187,20 @@ impl Collector {
 
         let process_count = self.sys.processes().len();
 
-        // Slow channel (every 5 ticks): CPU freq, GPU usage, temperature, disk I/O via WMI.
-        // BUG: disk is only sampled every 5 ticks (shows 0 for 4/5 of the time), and the
-        // disk/GPU WMI queries below are broken (see collect_wmi_slow).
-        let (cpu_freq, gpu_usage, cpu_temp, disk_read_bps, disk_write_bps) = if tick % 5 == 0 {
+        // Disk I/O: sampled every tick via PDH (accurate, never 0 due to the
+        // old every-5-tick WMI bug).
+        let (disk_read_bps, disk_write_bps) = match &self.disk_pdh {
+            Some(d) => d.sample(),
+            None => (0, 0),
+        };
+
+        // Slow channel (every 5 ticks): CPU freq, GPU usage, temperature via WMI.
+        // These are expensive/rarely-changing, so leaving them on the slow
+        // channel is fine.
+        let (cpu_freq, gpu_usage, cpu_temp) = if tick % 5 == 0 {
             self.collect_wmi_slow()
         } else {
-            (None, None, None, 0, 0)
+            (None, None, None)
         };
 
         Sample {
@@ -111,19 +227,19 @@ impl Collector {
         }
     }
 
-    fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>, u64, u64) {
+    fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>) {
         let com = match COMLibrary::new() {
             Ok(c) => c,
             Err(e) => {
                 warn!("COM library init failed: {}", e);
-                return (None, None, None, 0, 0);
+                return (None, None, None);
             }
         };
         let wmi_con = match WMIConnection::new(com) {
             Ok(c) => c,
             Err(e) => {
                 warn!("WMI connection failed: {}", e);
-                return (None, None, None, 0, 0);
+                return (None, None, None);
             }
         };
 
@@ -139,37 +255,31 @@ impl Collector {
                 }
             });
 
-        // BUG: the class `Win32_PerfFormattedData_GPUPerformanceCounters` does not exist,
-        // so this query returns no rows -> gpu_usage stays None (UI shows "--").
+        // Fixed: the correct class is Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine.
+        // It has multiple rows (one per GPU engine), so we sum UtilizationPercentage
+        // across all rows and cap at 100%.
         let gpu_usage = wmi_con
-            .raw_query("SELECT UtilizationPercentage FROM Win32_PerfFormattedData_GPUPerformanceCounters")
-            .ok()
-            .and_then(|r: Vec<HashMap<String, Variant>>| r.first().cloned())
-            .and_then(|row| {
-                if let Some(Variant::UI8(v)) = row.get("UtilizationPercentage") {
-                    Some((*v as f32).min(100.0))
-                } else {
-                    None
-                }
-            });
-
-        // BUG: DiskReadBytesPerSec / DiskWriteBytesPerSec are uint64 (UI8), but we only
-        // match UI4, so the values always fall through to 0 (UI shows "0 B/s").
-        let (disk_read_bps, disk_write_bps) = wmi_con
             .raw_query(
-                "SELECT DiskReadBytesPerSec, DiskWriteBytesPerSec \
-                 FROM Win32_PerfFormattedData_PerfDisk_PhysicalDisk WHERE Name='_Total'",
+                "SELECT UtilizationPercentage \
+                 FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine",
             )
             .ok()
-            .and_then(|r: Vec<HashMap<String, Variant>>| r.first().cloned())
-            .map(|row| {
-                let read =
-                    if let Some(Variant::UI4(v)) = row.get("DiskReadBytesPerSec") { *v as u64 } else { 0 };
-                let write =
-                    if let Some(Variant::UI4(v)) = row.get("DiskWriteBytesPerSec") { *v as u64 } else { 0 };
-                (read, write)
-            })
-            .unwrap_or((0, 0));
+            .and_then(|r: Vec<HashMap<String, Variant>>| {
+                let mut sum = 0u64;
+                for row in &r {
+                    let v = match row.get("UtilizationPercentage") {
+                        Some(Variant::UI8(v)) => *v,
+                        Some(Variant::UI4(v)) => *v as u64,
+                        _ => 0,
+                    };
+                    sum = sum.saturating_add(v);
+                }
+                if r.is_empty() {
+                    None
+                } else {
+                    Some((sum as f32).min(100.0))
+                }
+            });
 
         let cpu_temp = wmi_con
             .raw_query("SELECT CurrentTemperature FROM Win32_PerfFormattedData_ThermalZoneInformation")
@@ -183,7 +293,7 @@ impl Collector {
                 }
             });
 
-        (cpu_freq, gpu_usage, cpu_temp, disk_read_bps, disk_write_bps)
+        (cpu_freq, gpu_usage, cpu_temp)
     }
 }
 

@@ -20,7 +20,6 @@ pub struct MonitorApp {
     dragging: bool,
     drag_offset: Vec2,
     initialized: bool,
-    hwnd_configured: bool,
 }
 
 impl MonitorApp {
@@ -86,7 +85,6 @@ impl MonitorApp {
             dragging: false,
             drag_offset: Vec2::ZERO,
             initialized: false,
-            hwnd_configured: false,
         }
     }
 
@@ -122,28 +120,6 @@ impl MonitorApp {
         ctx.set_fonts(fonts);
     }
 
-    /// Configure the Win32 window for proper transparency (eliminates drag ghosting)
-    fn configure_layered_window(&self, _ctx: &egui::Context) {
-        #[cfg(target_os = "windows")]
-        {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                FindWindowW, GetWindowLongW, SetWindowLongW, GWL_EXSTYLE, WS_EX_LAYERED,
-                WS_EX_TOPMOST,
-            };
-
-            // Find our window by title
-            let title: Vec<u16> = "find-stutter\0".encode_utf16().collect();
-            unsafe {
-                if let Ok(hwnd) = FindWindowW(None, windows::core::PCWSTR(title.as_ptr())) {
-                    // Set WS_EX_LAYERED | WS_EX_TOPMOST
-                    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
-                    let new_ex_style =
-                        ex_style | WS_EX_LAYERED.0 as i32 | WS_EX_TOPMOST.0 as i32;
-                    SetWindowLongW(hwnd, GWL_EXSTYLE, new_ex_style);
-                }
-            }
-        }
-    }
 }
 
 impl eframe::App for MonitorApp {
@@ -159,11 +135,6 @@ impl eframe::App for MonitorApp {
         if !self.initialized {
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(self.window_pos));
             self.initialized = true;
-        }
-
-        if !self.hwnd_configured {
-            self.configure_layered_window(ctx);
-            self.hwnd_configured = true;
         }
 
         // Force full-window repaint during drag
