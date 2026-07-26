@@ -1,109 +1,15 @@
 //! find-stutter-ui 集成测试
 //!
-//! 覆盖：纯函数（格式化/颜色解析）、皮肤配置、OverlayState 状态默认值。
+//! P3：覆盖 reader 健康检测 + 皮肤配置 + OverlayState 默认值。
+//!
+//! 不再测试 `format_bytes/format_rate/parse_color`（P3 重构中由 Slint typed
+//! setter 替代了原本的字符串格式化函数）。
 
 use find_stutter_ui::overlay::{self, OverlayState};
+use find_stutter_ui::reader::{DbReader, ServiceHealth};
 use find_stutter_ui::skin::SkinConfig;
-use find_stutter_core::Severity;
-use std::time::Instant;
 
-// ========== Overlay 格式化 ==========
-
-#[test]
-fn format_bytes_zero() {
-    assert_eq!(overlay::format_bytes(0), "0 B");
-}
-
-#[test]
-fn format_bytes_one_kb() {
-    assert_eq!(overlay::format_bytes(1024), "1.0 KB");
-}
-
-#[test]
-fn format_bytes_one_mb() {
-    assert_eq!(overlay::format_bytes(1_048_576), "1.0 MB");
-}
-
-#[test]
-fn format_bytes_one_gb() {
-    assert_eq!(overlay::format_bytes(1_073_741_824), "1.00 GB");
-}
-
-#[test]
-fn format_bytes_large_values() {
-    assert_eq!(overlay::format_bytes(5_368_709_120), "5.00 GB");
-}
-
-#[test]
-fn format_rate_zero() {
-    assert_eq!(overlay::format_rate(0), "0 B/s");
-}
-
-#[test]
-fn format_rate_one_kbps() {
-    assert_eq!(overlay::format_rate(1024), "1.0 KB/s");
-}
-
-#[test]
-fn format_rate_one_mbps() {
-    assert_eq!(overlay::format_rate(1_048_576), "1.0 MB/s");
-}
-
-#[test]
-fn format_rate_one_gbps() {
-    assert_eq!(overlay::format_rate(1_073_741_824), "1.0 GB/s");
-}
-
-#[test]
-fn format_rate_partial_values() {
-    let result = overlay::format_rate(1536);
-    assert!(result.contains("1.5"));
-    assert!(result.contains("KB/s"));
-}
-
-// ========== 颜色解析 ==========
-
-#[test]
-fn parse_color_red() {
-    let c = overlay::parse_color("#FF0000");
-    assert_eq!(c.red(), 255);
-    assert_eq!(c.green(), 0);
-    assert_eq!(c.blue(), 0);
-}
-
-#[test]
-fn parse_color_green() {
-    let c = overlay::parse_color("#00FF00");
-    assert_eq!(c.red(), 0);
-    assert_eq!(c.green(), 255);
-    assert_eq!(c.blue(), 0);
-}
-
-#[test]
-fn parse_color_blue() {
-    let c = overlay::parse_color("#0000FF");
-    assert_eq!(c.red(), 0);
-    assert_eq!(c.green(), 0);
-    assert_eq!(c.blue(), 255);
-}
-
-#[test]
-fn parse_color_no_hash() {
-    let c = overlay::parse_color("FF00FF");
-    assert_eq!(c.red(), 255);
-    assert_eq!(c.green(), 0);
-    assert_eq!(c.blue(), 255);
-}
-
-#[test]
-fn parse_color_invalid_returns_white() {
-    let c = overlay::parse_color("#XYZ");
-    assert_eq!(c.red(), 255);
-    assert_eq!(c.green(), 255);
-    assert_eq!(c.blue(), 255);
-}
-
-// ========== 皮肤 ==========
+// ========== 皮肤配置（保留 P2 的）==========
 
 #[test]
 fn skin_default_dimensions() {
@@ -129,23 +35,6 @@ fn skin_default_colors() {
 }
 
 #[test]
-fn skin_custom_colors() {
-    let mut skin = SkinConfig::default();
-    skin.upload_color = "FF0000".into();
-    skin.download_color = "00FF00".into();
-
-    let upload = overlay::parse_color(&skin.upload_color);
-    assert_eq!(upload.red(), 255);
-    assert_eq!(upload.green(), 0);
-    assert_eq!(upload.blue(), 0);
-
-    let download = overlay::parse_color(&skin.download_color);
-    assert_eq!(download.red(), 0);
-    assert_eq!(download.green(), 255);
-    assert_eq!(download.blue(), 0);
-}
-
-#[test]
 fn skin_load_nonexistent_returns_default() {
     let skin = SkinConfig::load("nonexistent_skin_12345");
     assert_eq!(skin.width, 260.0);
@@ -164,29 +53,123 @@ fn skin_toml_parse_from_string() {
     assert_eq!(parsed.background_color, "#1E1E2E");
 }
 
-// ========== OverlayState ==========
+// ========== OverlayState（P3 新字段）==========
 
 #[test]
 fn overlay_state_defaults() {
-    let state = OverlayState::default();
-    assert_eq!(state.sent_total, 0);
-    assert_eq!(state.recv_total, 0);
-    assert_eq!(state.stutter_count, 0);
-    assert!(state.last_stutter_severity.is_none());
+    let state = OverlayState::new(SkinConfig::default());
+    assert_eq!(state.today_event_count, 0);
+    assert_eq!(state.service_health, ServiceHealth::NoDatabase);
+    assert!(state.last_summary.is_none());
+    assert!(state.last_event_at.is_none());
+    assert!(state.last_heartbeat.is_none());
+    assert!(!state.paused);
 }
 
 #[test]
 fn overlay_state_clone() {
-    let state = OverlayState {
-        sent_total: 1024,
-        recv_total: 2048,
-        stutter_count: 3,
-        last_stutter_severity: Some(Severity::Major),
-        flash_until: Instant::now(),
-    };
+    let mut state = OverlayState::new(SkinConfig::default());
+    state.today_event_count = 5;
+    state.paused = true;
     let cloned = state.clone();
-    assert_eq!(cloned.sent_total, 1024);
-    assert_eq!(cloned.recv_total, 2048);
-    assert_eq!(cloned.stutter_count, 3);
-    assert_eq!(cloned.last_stutter_severity, Some(Severity::Major));
+    assert_eq!(cloned.today_event_count, 5);
+    assert!(cloned.paused);
+}
+
+// ========== 服务健康格式化 ==========
+
+#[test]
+fn format_service_status_includes_chinese_label() {
+    let (text, _) = overlay::format_service_status(ServiceHealth::Running);
+    assert!(text.as_str().contains("服务运行中"));
+    let (text, _) = overlay::format_service_status(ServiceHealth::Stale);
+    assert!(text.as_str().contains("服务卡顿"));
+    let (text, _) = overlay::format_service_status(ServiceHealth::Stopped);
+    assert!(text.as_str().contains("服务已停止"));
+    let (text, _) = overlay::format_service_status(ServiceHealth::NoDatabase);
+    assert!(text.as_str().contains("未注册"));
+}
+
+// ========== DbReader 健康检测（端到端）==========
+
+#[test]
+fn reader_poll_no_database_path() {
+    let reader = DbReader::new("D:/__definitely_missing__/nope.db");
+    let r = reader.poll();
+    assert_eq!(r.health, ServiceHealth::NoDatabase);
+    assert!(r.summary.is_none());
+    assert_eq!(r.today_event_count, 0);
+}
+
+#[test]
+fn reader_poll_picks_up_running_service() {
+    use find_stutter_core::logger::Logger;
+    use find_stutter_core::{Sample, StorageConfig};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db = std::env::temp_dir()
+        .join(format!("fs_int_{}.db", nanos))
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cfg = StorageConfig {
+        db_path: db.clone(),
+        retention_days: 30,
+    };
+    let mut logger = Logger::new(&cfg).unwrap();
+    logger.touch_heartbeat().unwrap();
+    let mut s = Sample::default();
+    s.cpu_usage = 30.0;
+    logger.write_sample(&s).unwrap();
+    logger.flush().unwrap();
+    drop(logger);
+
+    let reader = DbReader::new(&db);
+    let r = reader.poll();
+    assert_eq!(r.health, ServiceHealth::Running);
+    assert!(r.summary.is_some());
+    assert!(r.last_heartbeat.is_some());
+    assert_eq!(r.today_event_count, 0);
+
+    std::fs::remove_file(&db).ok();
+}
+
+#[test]
+fn reader_poll_stopped_when_no_heartbeat() {
+    use find_stutter_core::logger::Logger;
+    use find_stutter_core::{Sample, StorageConfig};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db = std::env::temp_dir()
+        .join(format!("fs_int_stopped_{}.db", nanos))
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cfg = StorageConfig {
+        db_path: db.clone(),
+        retention_days: 30,
+    };
+    let mut logger = Logger::new(&cfg).unwrap();
+    // 只写 sample，不写心跳
+    let mut s = Sample::default();
+    s.cpu_usage = 10.0;
+    logger.write_sample(&s).unwrap();
+    logger.flush().unwrap();
+    drop(logger);
+
+    let reader = DbReader::new(&db);
+    let r = reader.poll();
+    assert_eq!(r.health, ServiceHealth::Stopped);
+    assert!(r.summary.is_some());
+    assert!(r.last_heartbeat.is_none());
+
+    std::fs::remove_file(&db).ok();
 }

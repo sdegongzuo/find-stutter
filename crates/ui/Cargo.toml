@@ -18,6 +18,15 @@ slint = { version = "1.10", default-features = false, features = [
     "raw-window-handle-06",
 ] }
 
+# P3：UI 只读模式直连 stutter.db
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# P3：时间戳解析（service heartbeat + stutter event timestamp）
+chrono = "0.4"
+
+# P3：stutter event snapshot 解析
+serde_json = "1"
+
 # 纯数据皮肤配置（无 UI 框架依赖）
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

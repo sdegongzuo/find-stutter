@@ -1333,12 +1333,15 @@ name = "find-stutter-ui"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "env_logger",
  "find-stutter-core",
  "log",
  "parking_lot",
  "raw-window-handle",
+ "rusqlite",
  "serde",
+ "serde_json",
  "slint",
  "slint-build",
  "toml 0.8.2",
