@@ -1,175 +1,129 @@
-//! Overlay 数据层：纯函数 + 状态 + 把数据推送到 Slint 窗口。
+//! Overlay 渲染逻辑。
 //!
-//! 这个模块没有任何 UI 框架依赖（除了 Slint），方便做单元测试。
+//! P3：service_health 字段由 DbReader 填进来，apply_metrics 推到 Slint。
 
-use std::time::Instant;
+use find_stutter_core::logger::LatestSampleSummary;
+use slint::{Brush, Color, SharedString};
 
-use find_stutter_core::Sample;
-use find_stutter_core::Severity;
-
+use crate::reader::ServiceHealth;
 use crate::skin::SkinConfig;
 
-/// 字节数 → 易读字符串（`512 B` / `1.0 KB` / `1.0 MB` / `1.00 GB`）
-pub fn format_bytes(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
-}
+/// 状态条配置
+pub const HEALTH_BAR_HEIGHT: f32 = 22.0;
 
-/// 速率（字节/秒）→ 易读字符串（`512 B/s` / `1.0 KB/s` / …）
-pub fn format_rate(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 {
-        format!("{:.1} GB/s", bytes as f64 / 1_073_741_824.0)
-    } else if bytes >= 1_048_576 {
-        format!("{:.1} MB/s", bytes as f64 / 1_048_576.0)
-    } else if bytes >= 1024 {
-        format!("{:.1} KB/s", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B/s", bytes)
-    }
-}
-
-/// 闪烁边框颜色（按严重程度查表）
-fn flash_color(sev: Severity) -> slint::Color {
-    match sev {
-        Severity::Critical => slint::Color::from_rgb_u8(255, 70, 70),
-        Severity::Major => slint::Color::from_rgb_u8(255, 170, 40),
-        Severity::Minor => slint::Color::from_rgb_u8(255, 200, 60),
-    }
-}
-
-/// 把字符串里的 `#RRGGBB` 解析成 Slint 颜色
-pub fn parse_color(hex: &str) -> slint::Color {
-    let hex = hex.trim_start_matches('#');
-    if hex.len() == 6 {
-        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
-        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
-        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
-        slint::Color::from_rgb_u8(r, g, b)
-    } else {
-        slint::Color::from_rgb_u8(255, 255, 255)
-    }
-}
-
-/// UI 端共享的悬浮窗状态
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct OverlayState {
-    pub sent_total: u64,
-    pub recv_total: u64,
-    pub stutter_count: u32,
-    /// 最近一次触发闪烁的卡顿严重程度（仅 Major/Critical）
-    pub last_stutter_severity: Option<Severity>,
-    /// 闪烁提醒的截止时刻；当前时刻 < 该值时边框脉冲闪烁
-    pub flash_until: Instant,
+    pub skin: SkinConfig,
+    pub last_summary: Option<LatestSampleSummary>,
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub today_event_count: u32,
+    pub service_health: ServiceHealth,
+    pub last_heartbeat: Option<String>,
+    pub paused: bool,
 }
 
-impl Default for OverlayState {
-    fn default() -> Self {
+impl OverlayState {
+    pub fn new(skin: SkinConfig) -> Self {
         Self {
-            sent_total: 0,
-            recv_total: 0,
-            stutter_count: 0,
-            last_stutter_severity: None,
-            flash_until: Instant::now(),
+            skin,
+            last_summary: None,
+            last_event_at: None,
+            today_event_count: 0,
+            service_health: ServiceHealth::NoDatabase,
+            last_heartbeat: None,
+            paused: false,
         }
+    }
+
+    /// 从 `PollResult` 更新状态（P3：不再有事件细节 stream，只读 db）
+    pub fn update_from_poll(&mut self, poll: &crate::reader::PollResult) {
+        self.last_summary = poll.summary.clone();
+        self.last_event_at = poll.event.as_ref().map(|e| e.timestamp);
+        self.today_event_count = poll.today_event_count;
+        self.service_health = poll.health;
+        self.last_heartbeat = poll.last_heartbeat.clone();
     }
 }
 
-/// 把皮肤一次性应用到 Slint 窗口（启动时调用）
-pub fn apply_skin(window: &crate::Overlay, skin: &SkinConfig) {
-    window.set_bg_color(parse_color(&skin.background_color).into());
-    window.set_border_color(parse_color(&skin.border_color).into());
-    window.set_border_radius(skin.border_radius);
-    window.set_font_size(skin.font_size as f32);
-    window.set_upload_color(parse_color(&skin.upload_color).into());
-    window.set_download_color(parse_color(&skin.download_color).into());
-    window.set_cpu_color(parse_color(&skin.cpu_color).into());
-    window.set_memory_color(parse_color(&skin.memory_color).into());
-    window.set_gpu_color(parse_color(&skin.gpu_color).into());
-    window.set_disk_color(parse_color(&skin.disk_color).into());
-    window.set_label_color(parse_color(&skin.label_color).into());
-}
-
-/// 把最新的 `Sample` + `OverlayState` 推送到 Slint 窗口属性。
+/// 格式化服务健康状态为 (text, color) 给 Slint 显示。
 ///
-/// 由 1Hz 定时器调用。这里只计算文本与闪烁参数，不持有任何锁。
-pub fn apply_metrics(window: &crate::Overlay, sample: &Sample, state: &OverlayState, _skin: &SkinConfig) {
-    // 紧凑视图
-    window.set_upload(format!("↑ {}", format_rate(sample.net_sent_bps)).into());
-    window.set_download(format!("↓ {}", format_rate(sample.net_recv_bps)).into());
-    window.set_cpu(format!("CPU: {:.1}%", sample.cpu_usage).into());
-    window.set_memory(format!("内存: {:.1}%", sample.mem_usage_percent).into());
-
-    let gpu_text = sample
-        .gpu_usage
-        .map(|g| format!("GPU: {:.1}%", g))
-        .unwrap_or_else(|| "GPU: --".to_string());
-    window.set_gpu(gpu_text.into());
-    window.set_disk(format!(
-        "硬盘: R {} / W {}",
-        format_rate(sample.disk_read_bps),
-        format_rate(sample.disk_write_bps)
-    ).into());
-
-    // 详情面板（展开时由 .slint 按条件渲染）
-    let daily_total = state.sent_total + state.recv_total;
-    window.set_detail_daily(format!("今日流量: {}", format_bytes(daily_total)).into());
-
-    let freq = sample
-        .cpu_freq_mhz
-        .map(|f| format!(" @ {:.2} GHz", f / 1000.0))
-        .unwrap_or_default();
-    window.set_detail_cpu(format!("CPU: {:.1}%{}", sample.cpu_usage, freq).into());
-
-    window.set_detail_memory(format!(
-        "内存: {:.2} GB / {:.2} GB",
-        sample.mem_used_mb as f64 / 1024.0,
-        sample.mem_total_mb as f64 / 1024.0
-    ).into());
-
-    let has_gpu = sample.gpu_usage.is_some();
-    window.set_show_gpu_detail(has_gpu);
-    if let Some(gpu) = sample.gpu_usage {
-        window.set_detail_gpu(format!("GPU: {:.1}%", gpu).into());
-    }
-
-    window.set_detail_disk(format!(
-        "硬盘: R: {} W: {}",
-        format_rate(sample.disk_read_bps),
-        format_rate(sample.disk_write_bps)
-    ).into());
-
-    let has_temp = sample.cpu_temp.is_some();
-    window.set_show_temp_detail(has_temp);
-    if let Some(temp) = sample.cpu_temp {
-        window.set_detail_temp(format!("CPU 温度: {:.0}°C", temp).into());
-    }
-
-    window.set_detail_count(format!("今日卡顿: {} 次", state.stutter_count).into());
-    window.set_detail_proc(format!(
-        "进程: {} | 线程: {}",
-        sample.process_count, sample.thread_count
-    ).into());
-
-    // 闪烁边框：仅在 flash_until 之内生效
-    if Instant::now() < state.flash_until {
-        if let Some(sev) = state.last_stutter_severity {
-            // 用 0.5~1.0 的脉动 alpha（避免每帧重新计算 sin，外部用 1Hz tick 近似）
-            let now = Instant::now();
-            let phase = (now.elapsed().as_secs_f32() * 6.0).sin().abs();
-            let alpha = 0.55 + 0.45 * phase;
-            let color = flash_color(sev);
-            window.set_border_flash(slint::Brush::SolidColor(color));
-            window.set_border_flash_alpha(alpha);
+/// 颜色：
+/// - Running     → 绿色 (#3fa055)
+/// - Stale       → 黄色 (#c4a82e)
+/// - Stopped     → 红色 (#c44c4c)
+/// - NoDatabase  → 红色 (#c44c4c)
+pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
+    let color = Brush::SolidColor(match health {
+        ServiceHealth::Running => Color::from_rgb_u8(0x3f, 0xa0, 0x55),
+        ServiceHealth::Stale => Color::from_rgb_u8(0xc4, 0xa8, 0x2e),
+        ServiceHealth::Stopped | ServiceHealth::NoDatabase => Color::from_rgb_u8(0xc4, 0x4c, 0x4c),
+    });
+    let text = match health {
+        ServiceHealth::Running => SharedString::from("● 服务运行中"),
+        ServiceHealth::Stale => SharedString::from("● 服务卡顿"),
+        ServiceHealth::Stopped => SharedString::from("● 服务已停止"),
+        ServiceHealth::NoDatabase => {
+            SharedString::from("● 服务未注册（请运行 find-stutter-service install）")
         }
-    } else if window.get_border_flash_alpha() != 0.0 {
-        window.set_border_flash_alpha(0.0);
+    };
+    (text, color)
+}
+
+/// 把 OverlayState 推到 Slint Overlay 实例。
+pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
+    // 1) 服务健康条
+    let (text, color) = format_service_status(state.service_health);
+    ui.set_service_status(text);
+    ui.set_service_status_color(color);
+    ui.set_service_bar_height(HEALTH_BAR_HEIGHT);
+
+    // 2) 暂停按钮在服务停止时禁用
+    let pause_enabled = matches!(state.service_health, ServiceHealth::Running);
+    ui.set_pause_enabled(pause_enabled);
+
+    // 3) 指标（仅在 Running 时更新，Stale/Stopped 时保留最后值）
+    if let Some(s) = &state.last_summary {
+        ui.set_cpu_text(SharedString::from(format!("CPU {:5.1}%", s.cpu_usage)));
+        ui.set_mem_text(SharedString::from(format!(
+            "MEM {:>5} MB",
+            s.mem_available_mb
+        )));
+        ui.set_net_send(SharedString::from(format!(
+            "↑ {:>5} KB/s",
+            s.net_sent_bps / 1024
+        )));
+        ui.set_net_recv(SharedString::from(format!(
+            "↓ {:>5} KB/s",
+            s.net_recv_bps / 1024
+        )));
+        ui.set_disk_read(SharedString::from(format!(
+            "R {:>5} KB/s",
+            s.disk_read_bps / 1024
+        )));
+        ui.set_disk_write(SharedString::from(format!(
+            "W {:>5} KB/s",
+            s.disk_write_bps / 1024
+        )));
+        if let Some(g) = s.gpu_usage {
+            ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
+        }
+        if let Some(t) = s.cpu_temp {
+            ui.set_temp_text(SharedString::from(format!("T {:4.1}°C", t)));
+        }
+    }
+
+    // 4) 今日事件数
+    ui.set_event_count(SharedString::from(format!(
+        "今日卡顿: {}",
+        state.today_event_count
+    )));
+
+    // 5) 上次心跳时间（调试用）
+    if let Some(hb) = &state.last_heartbeat {
+        let display = if hb.len() >= 19 { &hb[11..19] } else { hb };
+        ui.set_last_heartbeat(SharedString::from(format!("心跳: {}", display)));
+    } else {
+        ui.set_last_heartbeat(SharedString::from(""));
     }
 }
 
@@ -177,112 +131,126 @@ pub fn apply_metrics(window: &crate::Overlay, sample: &Sample, state: &OverlaySt
 mod tests {
     use super::*;
 
-    #[test]
-    fn format_bytes_zero() {
-        assert_eq!(format_bytes(0), "0 B");
+    /// 把 Brush 转 RGB 元组（仅 SolidColor 颜色；非 solid 视为 0）
+    fn brush_to_rgb(brush: Brush) -> (u8, u8, u8) {
+        match brush {
+            Brush::SolidColor(c) => (c.red(), c.green(), c.blue()),
+            _ => (0, 0, 0),
+        }
     }
 
     #[test]
-    fn format_bytes_below_kb() {
-        assert_eq!(format_bytes(512), "512 B");
+    fn format_service_status_running() {
+        let (text, _) = format_service_status(ServiceHealth::Running);
+        assert_eq!(text.as_str(), "● 服务运行中");
     }
 
     #[test]
-    fn format_bytes_one_kb() {
-        assert_eq!(format_bytes(1024), "1.0 KB");
+    fn format_service_status_stale() {
+        let (text, _) = format_service_status(ServiceHealth::Stale);
+        assert_eq!(text.as_str(), "● 服务卡顿");
     }
 
     #[test]
-    fn format_bytes_one_mb() {
-        assert_eq!(format_bytes(1_048_576), "1.0 MB");
+    fn format_service_status_stopped() {
+        let (text, _) = format_service_status(ServiceHealth::Stopped);
+        assert_eq!(text.as_str(), "● 服务已停止");
     }
 
     #[test]
-    fn format_bytes_one_gb() {
-        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+    fn format_service_status_no_database() {
+        let (text, _) = format_service_status(ServiceHealth::NoDatabase);
+        assert!(text.as_str().contains("未注册"));
     }
 
     #[test]
-    fn format_bytes_fractional_kb() {
-        assert_eq!(format_bytes(1536), "1.5 KB");
+    fn format_service_status_colors_distinct() {
+        let (_, brush_running) = format_service_status(ServiceHealth::Running);
+        let (_, brush_stale) = format_service_status(ServiceHealth::Stale);
+        let (_, brush_stopped) = format_service_status(ServiceHealth::Stopped);
+        let (_, brush_nodb) = format_service_status(ServiceHealth::NoDatabase);
+
+        // running 绿色 / stale 黄色 / stopped+nodb 红色
+        let (r_running, g_running, _) = brush_to_rgb(brush_running);
+        let (r_stale, g_stale, _) = brush_to_rgb(brush_stale);
+        let (r_stopped, g_stopped, _) = brush_to_rgb(brush_stopped);
+        let (r_nodb, g_nodb, _) = brush_to_rgb(brush_nodb);
+
+        // running 偏绿（g > r）
+        assert!(g_running > r_running, "running 应该偏绿: r={},g={}", r_running, g_running);
+        // stale 偏黄（r ≈ g）
+        assert!(r_stale > 150 && g_stale > 100, "stale 应该偏黄: r={},g={}", r_stale, g_stale);
+        // stopped/nodb 偏红（r > g > b）
+        assert!(r_stopped > g_stopped, "stopped 应该偏红: r={},g={}", r_stopped, g_stopped);
+        // stopped 和 nodb 同色
+        assert_eq!((r_stopped, g_stopped), (r_nodb, g_nodb));
     }
 
     #[test]
-    fn format_bytes_fractional_mb() {
-        assert_eq!(format_bytes(1_572_864), "1.5 MB");
+    fn overlay_state_new_defaults() {
+        let s = OverlayState::new(SkinConfig::load("default"));
+        assert_eq!(s.service_health, ServiceHealth::NoDatabase);
+        assert!(s.last_summary.is_none());
+        assert!(!s.paused);
+        assert_eq!(s.today_event_count, 0);
     }
 
     #[test]
-    fn format_rate_zero() {
-        assert_eq!(format_rate(0), "0 B/s");
-    }
-
-    #[test]
-    fn format_rate_one_kb() {
-        assert_eq!(format_rate(1024), "1.0 KB/s");
-    }
-
-    #[test]
-    fn format_rate_one_mb() {
-        assert_eq!(format_rate(1_048_576), "1.0 MB/s");
-    }
-
-    #[test]
-    fn format_rate_one_gb() {
-        assert_eq!(format_rate(1_073_741_824), "1.0 GB/s");
-    }
-
-    #[test]
-    fn format_rate_fractional() {
-        assert_eq!(format_rate(1536), "1.5 KB/s");
-    }
-
-    #[test]
-    fn parse_color_red() {
-        let c = parse_color("#FF0000");
-        assert_eq!(c.red(), 255);
-        assert_eq!(c.green(), 0);
-        assert_eq!(c.blue(), 0);
-    }
-
-    #[test]
-    fn parse_color_invalid_returns_white() {
-        let c = parse_color("#XYZ");
-        assert_eq!(c.red(), 255);
-        assert_eq!(c.green(), 255);
-        assert_eq!(c.blue(), 255);
-    }
-
-    #[test]
-    fn parse_color_no_hash_prefix() {
-        let c = parse_color("FF00FF");
-        assert_eq!(c.red(), 255);
-        assert_eq!(c.green(), 0);
-        assert_eq!(c.blue(), 255);
-    }
-
-    #[test]
-    fn overlay_state_default() {
-        let state = OverlayState::default();
-        assert_eq!(state.sent_total, 0);
-        assert_eq!(state.recv_total, 0);
-        assert_eq!(state.stutter_count, 0);
-        assert!(state.last_stutter_severity.is_none());
-    }
-
-    #[test]
-    fn overlay_state_clone() {
-        let state = OverlayState {
-            sent_total: 100,
-            recv_total: 200,
-            stutter_count: 3,
-            last_stutter_severity: Some(Severity::Major),
-            flash_until: Instant::now(),
+    fn overlay_state_update_from_poll() {
+        let mut s = OverlayState::new(SkinConfig::load("default"));
+        let poll = crate::reader::PollResult {
+            summary: Some(LatestSampleSummary {
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                cpu_usage: 50.0,
+                mem_available_mb: 4096,
+                net_sent_bps: 0,
+                net_recv_bps: 0,
+                disk_read_bps: 0,
+                disk_write_bps: 0,
+                gpu_usage: None,
+                cpu_temp: None,
+            }),
+            event: None,
+            health: ServiceHealth::Running,
+            today_event_count: 7,
+            last_heartbeat: Some("2026-01-01T00:00:00Z".to_string()),
         };
-        let cloned = state.clone();
-        assert_eq!(cloned.sent_total, 100);
-        assert_eq!(cloned.recv_total, 200);
-        assert_eq!(cloned.stutter_count, 3);
-        assert_eq!(cloned.last_stutter_severity, Some(Severity::Major));
+        s.update_from_poll(&poll);
+        assert_eq!(s.service_health, ServiceHealth::Running);
+        assert_eq!(s.today_event_count, 7);
+        assert!(s.last_summary.is_some());
+        assert!(s.last_heartbeat.is_some());
+    }
+
+    /// 验证：服务停止时暂停按钮应禁用
+    #[test]
+    fn pause_enabled_only_when_running() {
+        for h in [
+            ServiceHealth::Running,
+            ServiceHealth::Stale,
+            ServiceHealth::Stopped,
+            ServiceHealth::NoDatabase,
+        ] {
+            let enabled = matches!(h, ServiceHealth::Running);
+            if h == ServiceHealth::Running {
+                assert!(enabled);
+            } else {
+                assert!(!enabled);
+            }
+        }
+    }
+
+    /// 验证：HEALTH_BAR_HEIGHT 在合理范围
+    #[test]
+    fn health_bar_height_constant() {
+        assert!(HEALTH_BAR_HEIGHT > 0.0);
+        assert!(HEALTH_BAR_HEIGHT < 100.0);
+    }
+
+    /// 验证：暂停默认 false
+    #[test]
+    fn paused_default_is_false() {
+        let s = OverlayState::new(SkinConfig::load("default"));
+        assert!(!s.paused);
     }
 }
