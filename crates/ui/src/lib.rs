@@ -21,6 +21,7 @@
 //! - `Stopped` / `NoDatabase` → 红色 "● 服务已停止"
 //! - 暂停按钮在非 Running 时禁用
 
+pub mod auto_start;
 pub mod overlay;
 pub mod reader;
 pub mod skin;
@@ -54,6 +55,14 @@ pub fn run() -> anyhow::Result<()> {
         "find-stutter overlay (P3 read-only) starting, db={}",
         config.storage.db_path
     );
+
+    // 0) P3+：自动检测 + 启动后台服务（不影响 GUI 启动，失败只记日志）
+    let auto = auto_start::ensure_service_running();
+    if auto.is_ok() {
+        log::info!("后台服务: {}", auto.message());
+    } else {
+        log::warn!("后台服务: {}", auto.message());
+    }
 
     // 1) 加载皮肤
     let skin_cfg = skin::SkinConfig::load("default");

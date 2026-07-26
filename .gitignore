@@ -22,3 +22,5 @@ BUILD.md
 build.log
 test.log
 test_*.log
+final_test.log
+test2.log
