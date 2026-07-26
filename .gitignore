@@ -21,3 +21,4 @@ Thumbs.db
 BUILD.md
 build.log
 test.log
+test_*.log

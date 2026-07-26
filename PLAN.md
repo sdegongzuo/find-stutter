@@ -217,6 +217,28 @@ detect_ui_freeze = true
 ### 阶段四：服务与打包
 1. **Day 19-21**: Windows 服务模式实现 (`windows-service`)；服务与 GUI 的互斥逻辑。
 2. **Day 22-23**: Installer 制作，开机自启注册。
+
+---
+
+## 8. P3 实际实现备注（2026-07）
+
+原 PLAN §1.1 设想的服务模式用 **Named Pipe + GUI 客户端模式**（服务主动 push 事件）。
+实际 P3 改造采用了**更轻量的 SQLite WAL 轮询**：
+
+| 原方案 | 实际方案 | 优点 |
+| --- | --- | --- |
+| Named Pipe 推流 | SQLite WAL 读视图 | 无需定义 IPC 协议；服务崩溃 GUI 自动"断流" |
+| 互斥检测（服务在跑则 GUI 切客户端） | 始终只读（无自采） | 行为确定；单进程不再双模式 |
+| IPC 心跳 | `service_heartbeat` 单行 UPSERT | GUI 1Hz 轮询心跳表 → Running/Stale/Stopped/NoDatabase |
+
+代码侧：
+- `crates/service/`（独立 crate） — Windows service + 6 个 CLI 子命令
+- `crates/core/src/logger.rs` — 加 `service_heartbeat` 表 + `touch_heartbeat()` / `latest_heartbeat()` / `latest_sample_summary()`
+- `crates/ui/src/reader.rs` — `DbReader` 1Hz 轮询
+- `crates/ui/ui/overlay.slint` — 顶部加服务健康状态条
+
+测试：111 个全过（core 65 + service 16 + ui 30）。
+
 ---
 ## 7. 关键代码片段参考
 ### 磁盘速率采集 (PDH API)

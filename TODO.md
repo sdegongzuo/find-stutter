@@ -29,6 +29,7 @@
 - [x] **点击穿透模式** — `FindWindowW` 按标题取 HWND，`SetWindowLongPtrW` 切换 `WS_EX_TRANSPARENT`；右键菜单开关 + `T` 键兜底退出 + 穿透时显示提示文字 — `crates/ui/src/app.rs`
 - [x] **config.toml 注释完善** — 所有字段加中文注释说明 — `config.toml`
 - [x] **README.md** — 项目说明、构建/运行、CLI 子命令、交互说明、配置、目录结构、已知限制 — `README.md`
+- [x] **P3 服务化重构** — 拆出独立 `find-stutter-service` crate（Windows 服务，6 个 CLI 子命令），GUI 改为 1Hz SQLite 轮询只读（`DbReader` + `ServiceHealth`），WAL 并发读写，111 个测试全过 — `crates/service/` + `crates/ui/src/reader.rs`
 
 ## 未完成
 
@@ -43,9 +44,11 @@
 - [ ] **通知弹窗** — Windows 原生 toast 通知（检测到 Major/Critical 时弹出）
 
 ### P3 — 服务与部署（服务化架构重构）
-- [ ] **Windows 服务改造** — 服务只做采集+写库，不负责 GUI（~30 行，`windows-service` crate 已声明）
-- [ ] **GUI 改为只读模式** — GUI 从 stutter.db 轮询读取最新数据，不再自行采集（WAL 模式已就绪，可并发读）
-- [ ] **服务健康检测** — GUI 检测服务是否运行，断开时提示"服务已停止"
+- [x] **Windows 服务改造** — 独立 `find-stutter-service` crate（`crates/service/`），用 `windows-service` 0.8 注册 SCM 服务；服务循环：每秒 `collect → detect → touch_heartbeat → write_sample`，提供 `run` / `install` / `uninstall` / `start` / `stop` / `status` CLI 子命令；SCM 名 `FindStutter`
+- [x] **GUI 改为只读模式** — `crates/ui/src/reader.rs` 新增 `DbReader`，1Hz 轮询 `stutter.db`（`latest_sample_summary` / `latest_heartbeat` / `latest_event` / `event_count_today`）；删除 `spawn_collector` 和 `Collector` 实例；UI 只跑只读连接
+- [x] **服务健康检测** — `Logger::touch_heartbeat`（id=1 单行 UPSERT）+ `DbReader::poll` 推算 `ServiceHealth` (`Running` / `Stale` / `Stopped` / `NoDatabase`)；UI 顶部状态条：绿/黄/红配色 + 文字；暂停按钮在非 `Running` 时禁用
+- [x] **WAL 并发读写** — `Logger` 端 `PRAGMA journal_mode=WAL` + `Reader` 端 `SQLITE_OPEN_READ_ONLY` + `PRAGMA journal_mode=WAL`，服务写、GUI 读互不阻塞
+- [x] **P3 测试** — `find-stutter-service` 16 测试 + `find-stutter-ui` 30 测试（reader 健康检测 + overlay 格式化 + integration reader 端到端），全部通过
 
 
 
