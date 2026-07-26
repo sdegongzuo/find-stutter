@@ -49,6 +49,7 @@
 - [x] **服务健康检测** — `Logger::touch_heartbeat`（id=1 单行 UPSERT）+ `DbReader::poll` 推算 `ServiceHealth` (`Running` / `Stale` / `Stopped` / `NoDatabase`)；UI 顶部状态条：绿/黄/红配色 + 文字；暂停按钮在非 `Running` 时禁用
 - [x] **WAL 并发读写** — `Logger` 端 `PRAGMA journal_mode=WAL` + `Reader` 端 `SQLITE_OPEN_READ_ONLY` + `PRAGMA journal_mode=WAL`，服务写、GUI 读互不阻塞
 - [x] **P3 测试** — `find-stutter-service` 16 测试 + `find-stutter-ui` 30 测试（reader 健康检测 + overlay 格式化 + integration reader 端到端），全部通过
+- [x] **GUI 自动启动服务** — `crates/ui/src/auto_start.rs` 启动 GUI 时检测后台服务：复用 `find-stutter-service status` / `start` 子命令；找不到 exe / 未注册 / 启动失败 都不阻塞 GUI 启动，仅写日志；7 个新单元测试，总测试数 118 — `crates/ui/src/auto_start.rs`
 
 
 
