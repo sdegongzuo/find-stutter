@@ -81,23 +81,45 @@ target/release/find-stutter.exe
 # 1. 构建
 cargo build --release
 
-# 2. 注册为 Windows 服务（需管理员权限）
+# 2. 注册为 Windows 服务（需管理员权限；只第一次需要）
 target/release/find-stutter-service.exe install
 
-# 3. 启动服务（也可通过服务管理器 / sc start FindStutter）
-target/release/find-stutter-service.exe start
-
-# 4. 启动 GUI（只读库）
+# 3. 启动 GUI（普通用户即可；后台服务会自动检测 + 启动）
 target/release/find-stutter.exe
+```
 
-# 5. 查询服务状态
-target/release/find-stutter-service.exe status
+GUI 启动时**自动**做的事（在 `crates/ui/src/auto_start.rs`）：
+
+1. 在 GUI exe 同目录 / CWD / PATH 里找 `find-stutter-service.exe`
+2. 调 `status` 子命令查 SCM（退出码 0 = 在跑）
+3. 没在跑就调 `start` 子命令尝试启动
+4. 失败也不阻塞 GUI 启动，只在日志 + 顶部状态条提示
+
+| 自动启动结果 | GUI 表现 |
+| --- | --- |
+| `AlreadyRunning` | 1 秒后状态条变绿「● 服务运行中」 |
+| `Started` | 1 秒后状态条变绿「● 服务运行中」 |
+| `NotRegistered` | 状态条变红「● 服务未注册（请运行 find-stutter-service install）」 |
+| `ExeNotFound` | 状态条变红「● 服务未注册（请运行 find-stutter-service install）」（先构建 service crate） |
+| `StartFailed` | 状态条变红「● 服务已停止」，日志提示手动 `start` |
+
+如果自动 `start` 失败（最常见：当前用户无 admin 权限），**手动启动**：
+
+```bash
+# 用管理员身份打开 cmd，cd 到 target/release
+find-stutter-service.exe start
+
+# 或
+sc start FindStutter
+
+# 查询
+find-stutter-service.exe status
 # 输出：Running (运行中) (FindStutter)
 # 退出码 0 = 在跑，非 0 = 未运行/未注册
 
-# 6. 停止 / 卸载
-target/release/find-stutter-service.exe stop
-target/release/find-stutter-service.exe uninstall
+# 停止 / 卸载
+find-stutter-service.exe stop
+find-stutter-service.exe uninstall
 ```
 
 **SCM 服务名**：`FindStutter`，显示名 `Find Stutter Monitor`。
