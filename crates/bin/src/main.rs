@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        _ => find_stutter_ui::run_overlay()?,
+        _ => find_stutter_ui::run()?,
     }
     Ok(())
 }
