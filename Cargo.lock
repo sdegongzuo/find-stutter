@@ -914,6 +914,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0b1fab2ae45819af2d0731d60f2afe17227ebb1a1538a236da84c93e9a60162"
+dependencies = [
+ "dispatch2",
+ "nix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cursor-icon"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1003,6 +1014,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e0e367e4e7da84520dedcac1901e4da967309406d1e51017ae1abfb97adbd38"
 dependencies = [
  "bitflags 2.13.1",
+ "block2 0.6.2",
+ "libc",
  "objc2 0.6.4",
 ]
 
@@ -1326,6 +1339,22 @@ dependencies = [
  "windows 0.58.0",
  "windows-service",
  "wmi",
+]
+
+[[package]]
+name = "find-stutter-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger",
+ "find-stutter-core",
+ "log",
+ "tempfile",
+ "thiserror 1.0.69",
+ "windows 0.58.0",
+ "windows-service",
 ]
 
 [[package]]
