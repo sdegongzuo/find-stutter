@@ -25,6 +25,7 @@ slint = { version = "1", default-features = false, features = [
     "renderer-software",
     "raw-window-handle-06",
     "backend-winit",
+    "system-testing",
 ] }
 
 # P3：UI 只读模式直连 stutter.db
@@ -76,3 +77,6 @@ raw-window-handle = "0.6"
 
 [build-dependencies]
 slint-build = "1.12"
+
+[dev-dependencies]
+i-slint-backend-testing = "1.17"

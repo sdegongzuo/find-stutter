@@ -92,31 +92,31 @@ pub fn apply_taskbar_metrics(ui: &crate::Taskbar, state: &OverlayState) {
     let skin = &state.skin;
     ui.set_skin_bg(Brush::SolidColor(
         crate::overlay::parse_color(&skin.background_color)
-            .unwrap_or(slint::Color::from_argb_u8(0xcc, 0, 0, 0)),
+            .unwrap_or(slint::Color::from_rgb_u8(0xf5, 0xf5, 0xf7)),
     ));
     ui.set_cpu_color(
         crate::overlay::parse_color(&skin.cpu_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0xff, 0xff, 0xff)),
+            .unwrap_or(slint::Color::from_rgb_u8(0x37, 0x47, 0x4f)),
     );
     ui.set_mem_color(
         crate::overlay::parse_color(&skin.memory_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0xcc, 0xe0, 0xff)),
+            .unwrap_or(slint::Color::from_rgb_u8(0x6a, 0x1b, 0x9a)),
     );
     ui.set_gpu_color(
         crate::overlay::parse_color(&skin.gpu_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0xaa, 0xff, 0xaa)),
+            .unwrap_or(slint::Color::from_rgb_u8(0x00, 0x69, 0x5c)),
     );
     ui.set_net_color(
         crate::overlay::parse_color(&skin.download_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0x88, 0xcc, 0xff)),
+            .unwrap_or(slint::Color::from_rgb_u8(0x15, 0x65, 0xc0)),
     );
     ui.set_disk_color(
         crate::overlay::parse_color(&skin.disk_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0xdd, 0xaa, 0xff)),
+            .unwrap_or(slint::Color::from_rgb_u8(0xad, 0x14, 0x57)),
     );
     ui.set_event_color(
         crate::overlay::parse_color(&skin.label_color)
-            .unwrap_or(slint::Color::from_rgb_u8(0xff, 0xa0, 0xa0)),
+            .unwrap_or(slint::Color::from_rgb_u8(0x54, 0x6e, 0x7a)),
     );
     ui.set_text_size(skin.font_size as f32);
 

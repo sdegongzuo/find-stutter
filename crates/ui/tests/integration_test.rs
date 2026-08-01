@@ -14,8 +14,8 @@ use find_stutter_ui::skin::SkinConfig;
 #[test]
 fn skin_default_dimensions() {
     let skin = SkinConfig::default();
-    assert_eq!(skin.width, 260.0);
-    assert_eq!(skin.height, 80.0);
+    assert_eq!(skin.width, 360.0);
+    assert_eq!(skin.height, 78.0);
     assert_eq!(skin.font_size, 13.0);
     assert_eq!(skin.border_radius, 8.0);
 }
@@ -23,22 +23,22 @@ fn skin_default_dimensions() {
 #[test]
 fn skin_default_colors() {
     let skin = SkinConfig::default();
-    assert_eq!(skin.background_color, "#1E1E2E");
-    assert_eq!(skin.border_color, "#45475A");
-    assert_eq!(skin.upload_color, "#A6E3A1");
-    assert_eq!(skin.download_color, "#89B4FA");
-    assert_eq!(skin.cpu_color, "#F9E2AF");
-    assert_eq!(skin.memory_color, "#F38BA8");
-    assert_eq!(skin.gpu_color, "#CBA6F7");
-    assert_eq!(skin.disk_color, "#94E2D5");
-    assert_eq!(skin.label_color, "#BAC2DE");
+    assert_eq!(skin.background_color, "#F5F5F7");
+    assert_eq!(skin.border_color, "#C0C0C8");
+    assert_eq!(skin.upload_color, "#2E7D32");
+    assert_eq!(skin.download_color, "#1565C0");
+    assert_eq!(skin.cpu_color, "#37474F");
+    assert_eq!(skin.memory_color, "#6A1B9A");
+    assert_eq!(skin.gpu_color, "#00695C");
+    assert_eq!(skin.disk_color, "#AD1457");
+    assert_eq!(skin.label_color, "#546E7A");
 }
 
 #[test]
 fn skin_load_nonexistent_returns_default() {
     let skin = SkinConfig::load("nonexistent_skin_12345");
-    assert_eq!(skin.width, 260.0);
-    assert_eq!(skin.height, 80.0);
+    assert_eq!(skin.width, 360.0);
+    assert_eq!(skin.height, 78.0);
 }
 
 #[test]
@@ -50,7 +50,7 @@ fn skin_toml_parse_from_string() {
     assert_eq!(parsed.font_size, 15.0);
     assert_eq!(parsed.upload_color, "00FF00");
     // 未指定字段用默认值
-    assert_eq!(parsed.background_color, "#1E1E2E");
+    assert_eq!(parsed.background_color, "#F5F5F7");
 }
 
 // ========== OverlayState（P3 新字段）==========

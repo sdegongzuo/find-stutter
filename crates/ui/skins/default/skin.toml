@@ -1,15 +1,15 @@
-# 默认皮肤（与 SkinConfig 扁平结构一致，直接解析）
+# 默认皮肤（浅色主题，与 SkinConfig 扁平结构一致，直接解析）
 # 颜色格式 #RRGGBB；opacity 仅当 UI 支持时生效（当前版本保留字段）
-width = 260.0
-height = 80.0
-background_color = "#1E1E2E"
-border_color = "#45475A"
+width = 360.0
+height = 78.0
+background_color = "#F5F5F7"
+border_color = "#C0C0C8"
 border_radius = 8.0
 font_size = 13.0
-upload_color = "#A6E3A1"
-download_color = "#89B4FA"
-cpu_color = "#F9E2AF"
-memory_color = "#F38BA8"
-gpu_color = "#CBA6F7"
-disk_color = "#94E2D5"
-label_color = "#BAC2DE"
+upload_color = "#2E7D32"
+download_color = "#1565C0"
+cpu_color = "#37474F"
+memory_color = "#6A1B9A"
+gpu_color = "#00695C"
+disk_color = "#AD1457"
+label_color = "#546E7A"

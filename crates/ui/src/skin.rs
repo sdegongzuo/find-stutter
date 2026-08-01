@@ -37,36 +37,36 @@ pub struct SkinConfig {
     pub label_color: String,
 }
 
-fn default_width() -> f32 { 260.0 }
-fn default_height() -> f32 { 80.0 }
-fn default_bg() -> String { "#1E1E2E".into() }
-fn default_border() -> String { "#45475A".into() }
+fn default_width() -> f32 { 360.0 }
+fn default_height() -> f32 { 78.0 }
+fn default_bg() -> String { "#F5F5F7".into() }
+fn default_border() -> String { "#C0C0C8".into() }
 fn default_radius() -> f32 { 8.0 }
 fn default_font_size() -> f32 { 13.0 }
-fn default_upload_color() -> String { "#A6E3A1".into() }
-fn default_download_color() -> String { "#89B4FA".into() }
-fn default_cpu_color() -> String { "#F9E2AF".into() }
-fn default_memory_color() -> String { "#F38BA8".into() }
-fn default_gpu_color() -> String { "#CBA6F7".into() }
-fn default_disk_color() -> String { "#94E2D5".into() }
-fn default_label_color() -> String { "#BAC2DE".into() }
+fn default_upload_color() -> String { "#2E7D32".into() }
+fn default_download_color() -> String { "#1565C0".into() }
+fn default_cpu_color() -> String { "#37474F".into() }
+fn default_memory_color() -> String { "#6A1B9A".into() }
+fn default_gpu_color() -> String { "#00695C".into() }
+fn default_disk_color() -> String { "#AD1457".into() }
+fn default_label_color() -> String { "#546E7A".into() }
 
 impl Default for SkinConfig {
     fn default() -> Self {
         Self {
-            width: 260.0,
-            height: 80.0,
-            background_color: "#1E1E2E".into(),
-            border_color: "#45475A".into(),
+            width: 360.0,
+            height: 78.0,
+            background_color: "#F5F5F7".into(),
+            border_color: "#C0C0C8".into(),
             border_radius: 8.0,
             font_size: 13.0,
-            upload_color: "#A6E3A1".into(),
-            download_color: "#89B4FA".into(),
-            cpu_color: "#F9E2AF".into(),
-            memory_color: "#F38BA8".into(),
-            gpu_color: "#CBA6F7".into(),
-            disk_color: "#94E2D5".into(),
-            label_color: "#BAC2DE".into(),
+            upload_color: "#2E7D32".into(),
+            download_color: "#1565C0".into(),
+            cpu_color: "#37474F".into(),
+            memory_color: "#6A1B9A".into(),
+            gpu_color: "#00695C".into(),
+            disk_color: "#AD1457".into(),
+            label_color: "#546E7A".into(),
         }
     }
 }
@@ -119,19 +119,19 @@ mod tests {
     #[test]
     fn default_field_values() {
         let skin = SkinConfig::default();
-        assert_eq!(skin.width, 260.0);
-        assert_eq!(skin.height, 80.0);
-        assert_eq!(skin.background_color, "#1E1E2E");
-        assert_eq!(skin.border_color, "#45475A");
+        assert_eq!(skin.width, 360.0);
+        assert_eq!(skin.height, 78.0);
+        assert_eq!(skin.background_color, "#F5F5F7");
+        assert_eq!(skin.border_color, "#C0C0C8");
         assert_eq!(skin.border_radius, 8.0);
         assert_eq!(skin.font_size, 13.0);
-        assert_eq!(skin.upload_color, "#A6E3A1");
-        assert_eq!(skin.download_color, "#89B4FA");
-        assert_eq!(skin.cpu_color, "#F9E2AF");
-        assert_eq!(skin.memory_color, "#F38BA8");
-        assert_eq!(skin.gpu_color, "#CBA6F7");
-        assert_eq!(skin.disk_color, "#94E2D5");
-        assert_eq!(skin.label_color, "#BAC2DE");
+        assert_eq!(skin.upload_color, "#2E7D32");
+        assert_eq!(skin.download_color, "#1565C0");
+        assert_eq!(skin.cpu_color, "#37474F");
+        assert_eq!(skin.memory_color, "#6A1B9A");
+        assert_eq!(skin.gpu_color, "#00695C");
+        assert_eq!(skin.disk_color, "#AD1457");
+        assert_eq!(skin.label_color, "#546E7A");
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(skin.font_size, 15.0);
         assert_eq!(skin.upload_color, "00FF00");
         // 未指定的字段用默认值
-        assert_eq!(skin.background_color, "#1E1E2E");
+        assert_eq!(skin.background_color, "#F5F5F7");
     }
 
     /// 仓库内自带 default 皮肤必须能被 load（修复：原实现路径/结构不匹配，
@@ -180,6 +180,6 @@ mod tests {
         // 优先命中 CWD 的真实皮肤，所以这里只验证 toml::from_str 的 fallback 路径）
         let content = "width = not-a-number\n";
         let skin: SkinConfig = toml::from_str(content).unwrap_or_default();
-        assert_eq!(skin.width, 260.0);
+        assert_eq!(skin.width, 360.0);
     }
 }
