@@ -66,7 +66,16 @@ fn config_save_and_reload_roundtrip() {
     let loaded = Config::load(path).unwrap();
     assert_eq!(loaded.sampling.interval_ms, config.sampling.interval_ms);
     assert_eq!(loaded.detection.cpu_threshold, config.detection.cpu_threshold);
-    assert_eq!(loaded.storage.db_path, config.storage.db_path);
+    // Config::load 有意把相对 db_path 解析为「配置所在目录」下的绝对路径
+    // （防止 SCM 服务把数据库写到 C:\Windows\System32），所以 roundtrip 后
+    // db_path 应是 tmp 目录下的绝对路径，而非原始相对路径。
+    let expected = tmp.parent().unwrap().join("stutter.db");
+    assert_eq!(
+        std::path::Path::new(&loaded.storage.db_path),
+        expected,
+        "load 后 db_path 应被解析为绝对路径"
+    );
+    assert!(std::path::Path::new(&loaded.storage.db_path).is_absolute());
     std::fs::remove_file(path).ok();
 }
 

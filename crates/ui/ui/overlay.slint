@@ -1,23 +1,55 @@
-// find-stutter overlay (P3 read-only mode)
-// 顶部加服务健康状态条 + 指标行 + 暂停按钮（服务停止时禁用）
+// find-stutter overlay (沉浸模式)
+//
+// 布局（P3+）：
+//   ┌────────────────────────────────────────┐
+//   │  CPU  XX%       GPU  XX%        ● 绿    │  ← 指标 + 服务角标（无独立状态条）
+//   │  MEM  XX%       ↑ ↓  R W               │  ← 网速/磁盘行
+//   │  今日卡顿: 0     T   XX°C          ▶ 暂停 │  ← 操作收敛到右下
+//   └────────────────────────────────────────┘
+//
+// 沉浸感要点：
+//   - 整窗无 border / 无分割 Rectangle，所有元素共享统一半透背景
+//   - 服务健康状态缩成右上角小角标（● + 状态文字），不占独立高度
+//   - 暂停按钮也下移到底部，不顶在指标中段
+//   - 窗口高度从 90px 收到 78px（去掉独立状态条）
+//
+// 皮肤：所有颜色/字号/尺寸均为 in property（由 Rust 端按 skin.toml 注入），
+// 默认值与 skins/default/skin.toml 保持一致。
 
-import { Button } from "std-widgets.slint";
+import { Button, LineEdit, ListView, StandardListView } from "std-widgets.slint";
 
 export component Overlay inherits Window {
-    width: 360px;
-    height: 90px;
+    width: root.skin-width;
+    height: root.skin-height;
     always-on-top: true;
     title: "find-stutter";
+    // 去掉 Windows 原生窗口装饰（标题栏 + 右上角最小化/最大化/关闭按钮 + resize 边框）
+    // — overlay 是悬浮窗，不要 app 框架干扰沉浸感
+    no-frame: true;
     background: transparent;
 
-    // === P3: 服务健康状态条 ===
-    in property <string> service-status: "● 服务状态检测中";
+    // === 皮肤（Rust 端注入）===
+    in property <length> skin-width: 360px;
+    in property <length> skin-height: 78px;
+    in property <brush> skin-bg: #000000cc;
+    in property <color> cpu-color: #ffffff;
+    in property <color> mem-color: #cce0ff;
+    in property <color> event-color: #ffa0a0;
+    in property <color> gpu-color: #aaffaa;
+    in property <color> temp-color: #ffcc88;
+    in property <color> net-color: #88ccff;
+    in property <color> disk-color: #ddaaff;
+    in property <color> hb-color: #666;
+    in property <length> text-size: 13px;
+
+    // === P3: 服务健康状态（角标模式：● + 文字，融进主区）===
+    in property <string> service-status: "● 检测中";
     in property <brush> service-status-color: #888;
-    in property <float> service-bar-height: 22.0;
+    in property <float> service-bar-height: 0.0;
 
     // === 指标 ===
     in property <string> cpu-text: "CPU  --";
-    in property <string> mem-text: "MEM  --";
+    in property <string> mem-text: "内存  --";
     in property <string> gpu-text: "GPU  --";
     in property <string> temp-text: "T  --";
     in property <string> net-send: "↑  --";
@@ -32,94 +64,539 @@ export component Overlay inherits Window {
     in-out property <bool> paused: false;
     callback toggle-pause();
 
-    // === 拖动 ===
+    // === 拖动 + 右键菜单 ===
+    // no-frame 模式下去掉了 Windows 原生 HTCAPTION，必须自己接管拖动。
+    // TouchArea.moved 在鼠标按下并移动时触发，self.mouse-x/y - self.pressed-x/y
+    // 是相对按下点的偏移。把偏移传给 Rust 端调 window.set_position()。
+    //
+    // 右键：pointer-event 检测 `PointerEventButton.right` + `Down`，
+    // 把窗口内坐标发给 Rust 端，由 Rust 用 Win32 原生 TrackPopupMenu
+    // 在鼠标位置弹系统菜单（可超出悬浮窗区域，不受窗口大小限制）。
+    callback drag-moved(length, length);
+    callback menu-requested(length, length);
     TouchArea {
         z: 100;
         moved => {
-            self.x += self.mouse-x - self.pressed-x;
-            self.y += self.mouse-y - self.pressed-y;
+            root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.menu-requested(self.mouse-x, self.mouse-y);
+            }
         }
     }
 
-    VerticalLayout {
+    // === 单一半透背板（无 border，无分割）===
+    Rectangle {
         width: 100%;
         height: 100%;
-        padding: 0;
-        spacing: 0;
+        background: root.skin-bg;
 
-        // 1) 服务健康条
-        Rectangle {
-            width: 100%;
-            height: service-bar-height * 1px;
-            background: #1a1a1a;
-            border-color: service-status-color;
-            border-width: 1px;
-            Text {
-                text: service-status;
-                color: service-status-color;
-                font-size: 12px;
-                vertical-alignment: center;
-                horizontal-alignment: left;
-                x: 8px;
-                width: parent.width - 16px;
+        // 指标网格
+        HorizontalLayout {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            height: parent.height;
+            padding: 6px;
+            spacing: 8px;
+
+            // 左列
+            VerticalLayout {
+                spacing: 1px;
+                width: 50%;
+                Text { text: cpu-text; color: root.cpu-color; font-size: root.text-size; }
+                Text { text: mem-text; color: root.mem-color; font-size: root.text-size; }
+                Text { text: event-count; color: root.event-color; font-size: max(10px, root.text-size - 3px); }
             }
-            Text {
-                text: last-heartbeat;
-                color: #888;
-                font-size: 10px;
-                vertical-alignment: center;
-                horizontal-alignment: right;
-                x: 8px;
-                width: parent.width - 16px;
+
+            // 右列
+            VerticalLayout {
+                spacing: 1px;
+                width: 50%;
+                Text { text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text { text: net-send; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
+                    Text { text: net-recv; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
+                    Text { text: disk-read; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
+                    Text { text: disk-write; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
+                }
+                Text { text: temp-text; color: root.temp-color; font-size: max(12px, root.text-size - 1px); }
             }
         }
 
-        // 2) 指标行
-        Rectangle {
-            width: 100%;
-            height: (parent.height - service-bar-height * 1px);
-            background: #000000cc;
+        // 服务健康角标（右上角，无背景框）
+        Text {
+            x: parent.width - self.width - 6px;
+            y: 4px;
+            text: service-status;
+            color: service-status-color;
+            font-size: max(10px, root.text-size - 3px);
+        }
 
-            HorizontalLayout {
-                width: 100%;
-                height: 100%;
-                padding: 6px;
-                spacing: 8px;
+        // 服务心跳时间（紧贴服务状态下方，右上角）
+        Text {
+            x: parent.width - self.width - 6px;
+            y: 16px;
+            text: last-heartbeat;
+            color: root.hb-color;
+            font-size: max(9px, root.text-size - 4px);
+        }
 
-                VerticalLayout {
-                    spacing: 2px;
-                    width: 50%;
-                    Text { text: cpu-text; color: #ffffff; font-size: 13px; }
-                    Text { text: mem-text; color: #cce0ff; font-size: 13px; }
-                    Text { text: event-count; color: #ffa0a0; font-size: 11px; }
+        // 暂停按钮（右下角，缩小）
+        Button {
+            x: parent.width - 56px;
+            y: parent.height - 22px;
+            width: 50px;
+            height: 16px;
+            text: paused ? "▶" : "⏸";
+            enabled: pause-enabled;
+            clicked => {
+                paused = !paused;
+                root.toggle-pause();
+            }
+        }
+    }
+}
+
+// ================================================================
+// P2：伪任务栏窗口（横向窄条，显示在屏幕底部，可拖到任务栏位置）
+// ================================================================
+
+export component Taskbar inherits Window {
+    width: 340px;
+    height: 28px;
+    always-on-top: true;
+    title: "find-stutter-taskbar";
+    no-frame: true;
+    background: transparent;
+
+    // 皮肤注入（与 Overlay 一致）
+    in property <brush> skin-bg: #000000cc;
+    in property <color> cpu-color: #ffffff;
+    in property <color> mem-color: #cce0ff;
+    in property <color> gpu-color: #aaffaa;
+    in property <color> net-color: #88ccff;
+    in property <color> disk-color: #ddaaff;
+    in property <color> event-color: #ffa0a0;
+    in property <length> text-size: 11px;
+
+    // 指标文本（单行横向）
+    in property <string> cpu-text: "CPU --";
+    in property <string> mem-text: "内存 --";
+    in property <string> gpu-text: "GPU --";
+    in property <string> net-text: "↑-- ↓--";
+    in property <string> disk-text: "R-- W--";
+    in property <string> event-text: "卡顿 0";
+    in property <string> service-text: "● 检测中";
+    in property <brush> service-color: #888;
+
+    // 拖动（与 Overlay 相同机制）
+    callback drag-moved(length, length);
+    TouchArea {
+        z: 100;
+        moved => {
+            root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+        }
+    }
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.skin-bg;
+        border-radius: 6px;
+
+        HorizontalLayout {
+            padding: 4px;
+            spacing: 10px;
+            Text { text: root.cpu-text; color: root.cpu-color; font-size: root.text-size; }
+            Text { text: root.mem-text; color: root.mem-color; font-size: root.text-size; }
+            Text { text: root.gpu-text; color: root.gpu-color; font-size: root.text-size; }
+            Text { text: root.net-text; color: root.net-color; font-size: root.text-size; }
+            Text { text: root.disk-text; color: root.disk-color; font-size: root.text-size; }
+            Text { text: root.event-text; color: root.event-color; font-size: root.text-size; }
+            Text { text: root.service-text; color: root.service-color; font-size: root.text-size; }
+        }
+    }
+}
+
+// ================================================================
+// P2：进程详情列表窗口（右键菜单「进程详情」打开）
+// 独立的置顶窗口，显示 sysinfo 采集的进程快照（CPU 降序）。
+// 白色背景 + 深色文字；拖动仅限标题栏（避免全窗口 TouchArea
+// 拦截按钮点击；也避免 TrackPopupMenu 模态后窗口被误拖）。
+// 多列自绘表格（ListView + 每行组件），列宽固定、超出截断 +
+// Tooltip 悬浮详情；右下角 resize 手柄可缩放窗口。
+// ================================================================
+
+// 进程表一行数据（Rust 端按此结构填充 model）
+struct ProcessRowData {
+    pid: int,
+    name: string,          // 显示名（截断；聚合父节点为 "name (N)"）
+    name-full: string,     // 完整名（悬浮详情）
+    group-key: string,     // 聚合键（原始进程名；非聚合行 = 空）
+    cpu: string,           // "45.2%"（归一化后）
+    mem: string,           // "512 MB"
+    disk: string,          // "R 12K/s W 3K/s"（速率）
+    disk-full: string,     // 磁盘完整详情
+    net: string,           // 网络速率 "1.2M/s"
+    net-full: string,      // 网络速率完整详情
+    net-total: string,     // 累计网络传输量 "3.5G"
+    net-total-full: string, // 累计网络完整详情
+    status: string,        // 运行状态（中文）
+    is-group: bool,        // 是否为聚合父节点
+    child-count: int,      // 聚合的子进程数（非聚合 = 0）
+}
+
+component ProcessRow inherits Rectangle {
+    in property <ProcessRowData> data;
+    callback group-toggle(string);
+    callback context-menu(int, length, length);
+    height: 26px;
+
+    // 行分隔线
+    Rectangle {
+        y: parent.height - 1px;
+        width: 100%;
+        height: 1px;
+        background: #e0e0e0;
+    }
+
+    // 整行点击：聚合父节点展开/收起；右键弹菜单
+    TouchArea {
+        clicked => {
+            if (root.data.is-group) {
+                root.group-toggle(root.data.group-key);
+            }
+        }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
+                root.context-menu(root.data.pid, self.mouse-x, self.mouse-y);
+            }
+        }
+    }
+
+    HorizontalLayout {
+        height: 26px;
+        padding-left: 6px;
+        spacing: 4px;
+
+        // PID（固定宽，超出截断 + 悬浮）
+        Text {
+            width: 60px;
+            height: 100%;
+            text: root.data.is-group ? "" : root.data.pid;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行）
+        Text {
+            width: 150px;
+            height: 100%;
+            text: root.data.is-group ? (root.data.child-count > 0 ? "▼ " : "▶ ") + root.data.name : root.data.name;
+            color: root.data.is-group ? #1e88e5 : #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+            Tooltip { text: @markdown("\{root.data.name-full}"); }
+        }
+
+        // CPU
+        Text {
+            width: 62px;
+            height: 100%;
+            text: data.cpu;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // 内存
+        Text {
+            width: 76px;
+            height: 100%;
+            text: data.mem;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // 磁盘（超出截断 + 悬浮完整）
+        Text {
+            width: 96px;
+            height: 100%;
+            text: data.disk;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+            Tooltip { text: @markdown("\{data.disk-full}"); }
+        }
+
+        // 网络（速率）
+        Text {
+            width: 60px;
+            height: 100%;
+            text: data.net;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+            Tooltip { text: @markdown("\{data.net-full}"); }
+        }
+
+        // 累计网络传输量
+        Text {
+            width: 64px;
+            height: 100%;
+            text: data.net-total;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+            Tooltip { text: @markdown("\{data.net-total-full}"); }
+        }
+
+        // 状态
+        Text {
+            width: 56px;
+            height: 100%;
+            text: data.status;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+    }
+}
+
+export component ProcessList inherits Window {
+    width: 660px;
+    height: 420px;
+    always-on-top: true;
+    title: "find-stutter - 进程详情";
+    no-frame: true;
+    background: transparent;
+
+    in property <[ProcessRowData]> process-model: [];
+    in property <string> header-text: "进程详情（1Hz 实时刷新）";
+    in property <string> search-text: "";
+    // 排序列 + 方向（Rust 端维护，用于列头箭头显示）
+    in property <string> sort-column: "cpu";
+    in property <bool> sort-ascending: false;
+    callback close-requested();
+    callback refresh-requested();
+    callback search-changed(string);
+    callback sort-requested(string);
+    // 聚合父节点展开/收起（传 group-key）
+    callback group-toggle(string);
+    // 行右键菜单（pid, 窗口内逻辑坐标）
+    callback row-context-menu(int, length, length);
+    // 右下角 resize 手柄：传 dx/dy（逻辑像素）
+    callback resize-requested(length, length);
+
+    // 标题栏拖动（仅标题栏区域接收拖动事件）
+    callback drag-moved(length, length);
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #ffffff;
+        border-radius: 8px;
+        border-width: 1px;
+        border-color: #c0c0c0;
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 6px;
+
+            // 标题栏：标题 + 搜索 + 刷新 + 关闭（TouchArea 只覆盖标题栏）
+            Rectangle {
+                height: 30px;
+                TouchArea {
+                    z: 0;
+                    moved => {
+                        root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                    }
                 }
+                HorizontalLayout {
+                    z: 1;
+                    height: 30px;
+                    spacing: 8px;
 
-                VerticalLayout {
-                    spacing: 2px;
-                    width: 50%;
-                    Text { text: gpu-text; color: #aaffaa; font-size: 12px; }
-                    Text { text: temp-text; color: #ffcc88; font-size: 12px; }
-                    HorizontalLayout {
-                        spacing: 6px;
-                        Text { text: net-send; color: #88ccff; font-size: 11px; }
-                        Text { text: net-recv; color: #88ccff; font-size: 11px; }
+                    Text {
+                        text: root.header-text;
+                        color: #1e1e2e;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle { width: 1px; height: 100%; background: #d0d0d0; }
+
+                    // 搜索框
+                    LineEdit {
+                        width: 200px;
+                        text: root.search-text;
+                        placeholder-text: "搜索进程名 / PID...";
+                        edited(text) => { root.search-changed(text); }
+                    }
+
+                    Rectangle { width: 1px; height: 100%; background: #d0d0d0; }
+
+                    Button {
+                        text: "刷新";
+                        clicked => { root.refresh-requested(); }
+                    }
+
+                    Button {
+                        text: "关闭";
+                        clicked => { root.close-requested(); }
                     }
                 }
             }
 
-            // 暂停按钮
-            Button {
-                x: parent.width - 64px;
-                y: parent.height - 28px;
-                width: 56px;
+            // 列头（点击排序；箭头显示当前排序列与方向）
+            HorizontalLayout {
                 height: 22px;
-                text: paused ? "▶ 恢复" : "⏸ 暂停";
-                enabled: pause-enabled;
-                clicked => {
-                    paused = !paused;
-                    root.toggle-pause();
+                padding-left: 6px;
+                spacing: 4px;
+
+                // 每个列头：Text + TouchArea + 排序箭头
+                Rectangle {
+                    width: 60px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("pid"); } }
+                    Text {
+                        text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 150px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("name"); } }
+                    Text {
+                        text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 62px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("cpu"); } }
+                    Text {
+                        text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 76px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("mem"); } }
+                    Text {
+                        text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 96px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("disk"); } }
+                    Text {
+                        text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 60px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("net"); } }
+                    Text {
+                        text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 64px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("nettotal"); } }
+                    Text {
+                        text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 56px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("status"); } }
+                    Text {
+                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 44px;
+                    height: 100%;
+                    Text {
+                        text: "操作";
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
                 }
             }
+
+            // 进程列表（自绘多列，超出截断 + Tooltip；聚合行点击展开/收起，右键弹菜单）
+            ListView {
+                for row in root.process-model : ProcessRow {
+                    data: row;
+                    group-toggle(key) => { root.group-toggle(key); }
+                    context-menu(pid, x, y) => { root.row-context-menu(pid, x, y); }
+                }
+            }
+        }
+    }
+
+    // 右下角 resize 手柄
+    Rectangle {
+        x: parent.width - 16px;
+        y: parent.height - 16px;
+        width: 16px;
+        height: 16px;
+        TouchArea {
+            moved => {
+                root.resize-requested(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+            }
+        }
+        // 斜纹指示
+        Text {
+            text: "╲";
+            color: #909090;
+            font-size: 12px;
+            x: 2px;
+            y: 0px;
         }
     }
 }

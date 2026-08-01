@@ -27,8 +27,12 @@ pub fn set_click_through_for(window: &Overlay, enable: bool) -> Result<(), Strin
 }
 
 fn extract_hwnd(window: &Overlay) -> Option<HWND> {
-    let slint_window = window.window();
-    let handle = slint_window.window_handle();
+    extract_hwnd_from(window.window())
+}
+
+/// 从任意 Slint 组件提取 HWND（Overlay / ProcessList / Taskbar 通用）。
+pub fn extract_hwnd_from(win: &slint::Window) -> Option<HWND> {
+    let handle = win.window_handle();
     use raw_window_handle::RawWindowHandle;
     let raw = handle.window_handle().ok()?;
     match raw.as_raw() {
@@ -37,11 +41,155 @@ fn extract_hwnd(window: &Overlay) -> Option<HWND> {
     }
 }
 
+/// 右键菜单项 ID（TrackPopupMenu 返回的命令码）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeMenuCmd {
+    /// 暂停/恢复监控
+    TogglePause = 1,
+    /// 点击穿透
+    ToggleClickThrough = 2,
+    /// 退出
+    Quit = 3,
+    /// 显示进程详情列表（P2）
+    ProcessList = 4,
+}
+
+/// 在鼠标位置弹出 Windows 原生右键菜单（`TrackPopupMenu`）。
+///
+/// - `x_logical` / `y_logical`：Slint 窗口内的**逻辑**坐标（来自 TouchArea
+///   pointer-event 的 mouse-x/mouse-y）；内部换算成**屏幕物理坐标**后弹出，
+///   因此菜单可以超出悬浮窗区域（不受 Slint 窗口大小限制）。
+/// - `paused`：当前暂停状态，决定菜单项显示「暂停监控」还是「恢复监控」。
+///
+/// 返回用户选择的菜单项；用户点击空白处 / 按 Esc 返回 `None`。
+///
+/// 注意：`TrackPopupMenu` 是**模态阻塞**调用（TPM_RETURNCMD 等用户选择后
+/// 才返回），需在 UI 线程调用；Slint callback 里调用即可。
+pub fn show_context_menu(
+    window: &Overlay,
+    x_logical: f32,
+    y_logical: f32,
+    paused: bool,
+) -> Option<NativeMenuCmd> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_NONOTIFY,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    let hwnd = extract_hwnd(window)?;
+    let scale = window.window().scale_factor();
+
+    unsafe {
+        let hmenu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("CreatePopupMenu 失败: {}", e);
+                return None;
+            }
+        };
+
+        let toggle_text = if paused { "恢复监控" } else { "暂停监控" };
+        let _ = AppendMenuW(hmenu, MF_STRING, NativeMenuCmd::TogglePause as usize, wide(toggle_text));
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            NativeMenuCmd::ToggleClickThrough as usize,
+            wide("点击穿透"),
+        );
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            NativeMenuCmd::ProcessList as usize,
+            wide("进程详情"),
+        );
+        let _ = AppendMenuW(hmenu, MF_STRING, NativeMenuCmd::Quit as usize, wide("退出"));
+
+        // 屏幕坐标 = 窗口物理位置 + 逻辑坐标 × 缩放
+        let pos = window.window().position();
+        let screen_x = pos.x + (x_logical * scale) as i32;
+        let screen_y = pos.y + (y_logical * scale) as i32;
+
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            screen_x,
+            screen_y,
+            0,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(hmenu);
+
+        match cmd.0 as u32 {
+            1 => Some(NativeMenuCmd::TogglePause),
+            2 => Some(NativeMenuCmd::ToggleClickThrough),
+            3 => Some(NativeMenuCmd::Quit),
+            4 => Some(NativeMenuCmd::ProcessList),
+            _ => None,
+        }
+    }
+}
+
+/// 行右键菜单（进程详情列表）：仅「停止进程」。
+/// 返回 `true` = 用户选择了停止。坐标同为窗口内逻辑坐标，换算屏幕坐标弹出。
+pub fn show_row_kill_menu(window: &slint::Window, x_logical: f32, y_logical: f32) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_NONOTIFY,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    let Some(hwnd) = extract_hwnd_from(window) else {
+        return false;
+    };
+    let scale = window.scale_factor();
+
+    unsafe {
+        let hmenu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("CreatePopupMenu 失败: {}", e);
+                return false;
+            }
+        };
+        let _ = AppendMenuW(hmenu, MF_STRING, 1, wide("停止进程"));
+
+        let pos = window.position();
+        let screen_x = pos.x + (x_logical * scale) as i32;
+        let screen_y = pos.y + (y_logical * scale) as i32;
+
+        let cmd = TrackPopupMenu(
+            hmenu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
+            screen_x,
+            screen_y,
+            0,
+            hwnd,
+            None,
+        );
+        let _ = DestroyMenu(hmenu);
+        cmd.0 as u32 == 1
+    }
+}
+
+#[cfg(windows)]
+fn wide(s: &str) -> windows::core::PCWSTR {
+    // 需要一个存活到调用结束的缓冲区；这里用 Box 泄漏避免生命周期问题
+    // （PCWSTR 只是指针，AppendMenuW 是同步调用，调用完即可丢弃）。
+    // 由于 unsafe 生命周期约束，用静态 Vec 缓存最近一个字符串最稳妥。
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::sync::Mutex<Vec<u16>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    let mut buf = cache.lock().unwrap();
+    buf.clear();
+    buf.extend(s.encode_utf16());
+    buf.push(0);
+    windows::core::PCWSTR(buf.as_ptr())
+}
+
 fn apply_click_through(hwnd: HWND, enable: bool) {
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let flag = WS_EX_TRANSPARENT.0 as isize;
-        let new_style = if enable { style | flag } else { style & !flag };
+        let new_style = toggle_transparent_style(style, enable);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         // 触发重绘使样式生效
         let _ = SetWindowPos(
@@ -56,8 +204,92 @@ fn apply_click_through(hwnd: HWND, enable: bool) {
     }
 }
 
+/// 计算切换 `WS_EX_TRANSPARENT` 后的扩展样式（纯位运算，可单测）。
+///
+/// - `enable=true`  → 置位（穿透）
+/// - `enable=false` → 清位（取消穿透）
+fn toggle_transparent_style(style: isize, enable: bool) -> isize {
+    let flag = WS_EX_TRANSPARENT.0 as isize;
+    if enable {
+        style | flag
+    } else {
+        style & !flag
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    // 纯函数逻辑（无 HWND 也能跑的部分）已在 overlay.rs / skin.rs 中覆盖。
-    // 本模块强依赖 Slint Window 实例，无法在无窗口环境测试。
+    use super::*;
+
+    /// WS_EX_TRANSPARENT = 0x00000020
+    const TRANSPARENT: isize = 0x20;
+
+    #[test]
+    fn enable_sets_bit() {
+        let style = 0x1000; // 一些已有扩展样式
+        let new = toggle_transparent_style(style, true);
+        assert_eq!(new, style | TRANSPARENT);
+        assert_ne!(new & TRANSPARENT, 0);
+        // 不破坏原有 bit
+        assert_ne!(new & 0x1000, 0);
+    }
+
+    #[test]
+    fn disable_clears_bit() {
+        let style = 0x1000 | TRANSPARENT;
+        let new = toggle_transparent_style(style, false);
+        assert_eq!(new & TRANSPARENT, 0);
+        // 不破坏原有 bit
+        assert_ne!(new & 0x1000, 0);
+    }
+
+    #[test]
+    fn idempotent() {
+        // 重复开启 / 重复关闭不改变结果
+        let style = 0x20;
+        assert_eq!(toggle_transparent_style(style, true), style);
+        assert_eq!(toggle_transparent_style(0x1000, false), 0x1000);
+    }
+
+    #[test]
+    fn zero_style_works() {
+        assert_eq!(toggle_transparent_style(0, true), TRANSPARENT);
+        assert_eq!(toggle_transparent_style(TRANSPARENT, false), 0);
+    }
+
+    // ===== NativeMenuCmd（右键原生菜单命令）=====
+
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3）
+    #[test]
+    fn native_menu_cmd_ids_stable() {
+        assert_eq!(NativeMenuCmd::TogglePause as u32, 1);
+        assert_eq!(NativeMenuCmd::ToggleClickThrough as u32, 2);
+        assert_eq!(NativeMenuCmd::Quit as u32, 3);
+        assert_eq!(NativeMenuCmd::ProcessList as u32, 4);
+    }
+
+    #[test]
+    fn native_menu_cmd_eq_and_debug() {
+        assert_eq!(NativeMenuCmd::Quit, NativeMenuCmd::Quit);
+        assert_ne!(NativeMenuCmd::TogglePause, NativeMenuCmd::ToggleClickThrough);
+        assert!(!format!("{:?}", NativeMenuCmd::TogglePause).is_empty());
+    }
+
+    /// 验证：命令码到枚举的映射（show_context_menu 的返回逻辑）
+    #[test]
+    fn native_menu_cmd_from_trackpopup_value() {
+        let map = |v: u32| match v {
+            1 => Some(NativeMenuCmd::TogglePause),
+            2 => Some(NativeMenuCmd::ToggleClickThrough),
+            3 => Some(NativeMenuCmd::Quit),
+            4 => Some(NativeMenuCmd::ProcessList),
+            _ => None,
+        };
+        assert_eq!(map(1), Some(NativeMenuCmd::TogglePause));
+        assert_eq!(map(2), Some(NativeMenuCmd::ToggleClickThrough));
+        assert_eq!(map(3), Some(NativeMenuCmd::Quit));
+        assert_eq!(map(4), Some(NativeMenuCmd::ProcessList));
+        assert_eq!(map(0), None); // 用户取消
+        assert_eq!(map(99), None);
+    }
 }

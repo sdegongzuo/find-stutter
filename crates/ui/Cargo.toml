@@ -10,12 +10,21 @@ find-stutter-core = { path = "../core" }
 
 # Slint 1.x：retained-mode 渲染 + 原生窗口层，
 # 透明 overlay 移动时由 Slint 的 winit 后端处理，无 egui 即时模式逐帧 OuterPosition 更新导致的重影/闪烁
-slint = { version = "1.10", default-features = false, features = [
+#
+# Features 说明：
+# - `default-features = false`：slint 的 default 包含 `backend-default` → 在编译时
+#   根据 target 自动选 backend（Windows=winit, Linux=x11/wayland, Mac=winit）。
+#   这会引入 GTK/X11 等平台依赖，且我们只发布 Windows。
+#   所以关掉 default，改用下面的精确 features。
+# - `backend-winit`：Windows 桌面平台 backend（也是 macOS 的 backend）。
+#   必须显式启用，否则运行时 "No default Slint platform was selected" 报错。
+slint = { version = "1", default-features = false, features = [
     "std",
     "compat-1-2",
     "renderer-femtovg",
     "renderer-software",
     "raw-window-handle-06",
+    "backend-winit",
 ] }
 
 # P3：UI 只读模式直连 stutter.db
@@ -26,6 +35,9 @@ chrono = "0.4"
 
 # P3：stutter event snapshot 解析
 serde_json = "1"
+
+# P2：进程详情列表（右键菜单「进程详情」按需采集一次快照，不写库）
+sysinfo = "0.33"
 
 # 纯数据皮肤配置（无 UI 框架依赖）
 serde = { version = "1", features = ["derive"] }
@@ -41,12 +53,25 @@ anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
 
-# 平台层（Windows 原生窗口句柄 + 点击穿透/置顶）
+# 配置 / 皮肤热加载（监听 config.toml 和 skins/ 目录变更）
+notify = "6.1"
+
+# P1：系统托盘图标 + 右键菜单
+# tray-icon 0.19 配套 muda 0.15（注意：slint 的 winit 后端会带入 muda 0.19，
+# 两个版本共存无冲突，tray-icon 内部用自己的 0.15）。
+tray-icon = "0.19"
+muda = "0.15"
+
+# 平台层（Windows 原生窗口句柄 + 点击穿透/置顶 + UAC 提权）
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_Services",
 ] }
 raw-window-handle = "0.6"
 

@@ -16,10 +16,14 @@ pub struct OverlayState {
     pub skin: SkinConfig,
     pub last_summary: Option<LatestSampleSummary>,
     pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 上一次已弹通知的事件时间戳（P2：用于事件去重，防止重复弹 toast）
+    pub last_notified_at: Option<chrono::DateTime<chrono::Utc>>,
     pub today_event_count: u32,
     pub service_health: ServiceHealth,
     pub last_heartbeat: Option<String>,
     pub paused: bool,
+    /// 点击穿透模式（右键菜单切换；窗口鼠标事件完全穿透）
+    pub click_through: bool,
 }
 
 impl OverlayState {
@@ -28,10 +32,12 @@ impl OverlayState {
             skin,
             last_summary: None,
             last_event_at: None,
+            last_notified_at: None,
             today_event_count: 0,
             service_health: ServiceHealth::NoDatabase,
             last_heartbeat: None,
             paused: false,
+            click_through: false,
         }
     }
 
@@ -69,8 +75,46 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
     (text, color)
 }
 
+/// 解析 `#RRGGBB` / `#RRGGBBAA` / `RRGGBB` 颜色字符串为 `slint::Color`。
+/// 解析失败返回 `None`（调用方 fallback 到默认色）。
+///
+/// 历史上此函数存在于 overlay.rs，P3 重构时被删除；皮肤接线需要它，已恢复。
+pub fn parse_color(s: &str) -> Option<Color> {
+    let hex = s.trim().trim_start_matches('#');
+    if hex.len() != 6 && hex.len() != 8 {
+        return None;
+    }
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    let r = ((v >> 16) & 0xFF) as u8;
+    let g = ((v >> 8) & 0xFF) as u8;
+    let b = (v & 0xFF) as u8;
+    if hex.len() == 8 {
+        let a = ((v >> 24) & 0xFF) as u8;
+        Some(Color::from_argb_u8(a, r, g, b))
+    } else {
+        Some(Color::from_rgb_u8(r, g, b))
+    }
+}
+
 /// 把 OverlayState 推到 Slint Overlay 实例。
 pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
+    // 0) 皮肤：颜色 / 字号 / 尺寸注入（修复：P3 后皮肤名存实亡，从未接线）
+    let skin = &state.skin;
+    ui.set_skin_width(skin.width as f32);
+    ui.set_skin_height(skin.height as f32);
+    ui.set_text_size(skin.font_size as f32);
+    ui.set_skin_bg(Brush::SolidColor(
+        parse_color(&skin.background_color).unwrap_or(Color::from_argb_u8(0xcc, 0, 0, 0)),
+    ));
+    ui.set_cpu_color(parse_color(&skin.cpu_color).unwrap_or(Color::from_rgb_u8(0xff, 0xff, 0xff)));
+    ui.set_mem_color(parse_color(&skin.memory_color).unwrap_or(Color::from_rgb_u8(0xcc, 0xe0, 0xff)));
+    ui.set_event_color(parse_color(&skin.label_color).unwrap_or(Color::from_rgb_u8(0xff, 0xa0, 0xa0)));
+    ui.set_gpu_color(parse_color(&skin.gpu_color).unwrap_or(Color::from_rgb_u8(0xaa, 0xff, 0xaa)));
+    ui.set_temp_color(parse_color(&skin.label_color).unwrap_or(Color::from_rgb_u8(0xff, 0xcc, 0x88)));
+    ui.set_net_color(parse_color(&skin.download_color).unwrap_or(Color::from_rgb_u8(0x88, 0xcc, 0xff)));
+    ui.set_disk_color(parse_color(&skin.disk_color).unwrap_or(Color::from_rgb_u8(0xdd, 0xaa, 0xff)));
+    ui.set_hb_color(parse_color("#666666").unwrap_or(Color::from_rgb_u8(0x66, 0x66, 0x66)));
+
     // 1) 服务健康条
     let (text, color) = format_service_status(state.service_health);
     ui.set_service_status(text);
@@ -85,8 +129,8 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
     if let Some(s) = &state.last_summary {
         ui.set_cpu_text(SharedString::from(format!("CPU {:5.1}%", s.cpu_usage)));
         ui.set_mem_text(SharedString::from(format!(
-            "MEM {:>5} MB",
-            s.mem_available_mb
+            "内存 {:4.1}%",
+            s.mem_usage_percent
         )));
         ui.set_net_send(SharedString::from(format!(
             "↑ {:>5} KB/s",
@@ -202,6 +246,7 @@ mod tests {
             summary: Some(LatestSampleSummary {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
                 cpu_usage: 50.0,
+                mem_usage_percent: 65.0,
                 mem_available_mb: 4096,
                 net_sent_bps: 0,
                 net_recv_bps: 0,
@@ -247,10 +292,50 @@ mod tests {
         assert!(HEALTH_BAR_HEIGHT < 100.0);
     }
 
+    // ===== parse_color（皮肤接线恢复）=====
+
+    #[test]
+    fn parse_color_rgb_6digit() {
+        let c = parse_color("#F9E2AF").unwrap();
+        assert_eq!((c.red(), c.green(), c.blue()), (0xF9, 0xE2, 0xAF));
+    }
+
+    #[test]
+    fn parse_color_without_hash() {
+        let c = parse_color("89B4FA").unwrap();
+        assert_eq!((c.red(), c.green(), c.blue()), (0x89, 0xB4, 0xFA));
+    }
+
+    #[test]
+    fn parse_color_argb_8digit() {
+        let c = parse_color("#80FF0000").unwrap(); // 半透明红
+        assert_eq!((c.red(), c.green(), c.blue(), c.alpha()), (0xFF, 0, 0, 0x80));
+    }
+
+    #[test]
+    fn parse_color_invalid_lengths() {
+        assert!(parse_color("#FFF").is_none());
+        assert!(parse_color("#FF").is_none());
+        assert!(parse_color("").is_none());
+    }
+
+    #[test]
+    fn parse_color_invalid_hex() {
+        assert!(parse_color("#GGGGGG").is_none());
+        assert!(parse_color("#12345Z").is_none());
+    }
+
     /// 验证：暂停默认 false
     #[test]
     fn paused_default_is_false() {
         let s = OverlayState::new(SkinConfig::load("default"));
         assert!(!s.paused);
+    }
+
+    /// 验证：click_through 默认关闭（右键菜单切换前的初始状态）
+    #[test]
+    fn click_through_default_off() {
+        let s = OverlayState::new(SkinConfig::load("default"));
+        assert!(!s.click_through);
     }
 }

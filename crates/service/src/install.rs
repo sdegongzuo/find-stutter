@@ -33,11 +33,24 @@ pub type ScmResult<T> = Result<T, ScmError>;
 ///
 /// 启动类型：自动（开机自启）
 /// 失败码：normal
+///
+/// ## 升级行为（关键：避免无谓 stop+start）
+///
+/// 1. **首次注册**（`create_service` 成功）→ 立即 `start` 启动
+/// 2. **服务已注册 + binary 一致** → 啥都不做（service 已经在用最新 binary）
+///    - 如果 service 是 Stopped，启动它
+/// 3. **服务已注册 + binary 不一致**（升级路径）
+///    - `change_config` 更新 binary path
+///    - 如果 service 在 Running → `stop + start` 让 SCM 用新 binary 重启
+///
+/// 关键：`change_config` 单独**不会**让正在跑的进程重读代码，必须 stop+start。
+/// 但我们只在 binary 真的不一致时升级，避免每次 GUI 启动都中断 service。
 pub fn install() -> ScmResult<()> {
     #[cfg(windows)]
     {
+        use std::time::Duration;
         use windows_service::service::{
-            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType,
+            ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState,
         };
         use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -45,7 +58,7 @@ pub fn install() -> ScmResult<()> {
 
         let manager = ServiceManager::local_computer(
             None::<&str>,
-            ServiceManagerAccess::CREATE_SERVICE,
+            ServiceManagerAccess::CREATE_SERVICE | ServiceManagerAccess::CONNECT,
         )?;
 
         let info = ServiceInfo {
@@ -54,19 +67,108 @@ pub fn install() -> ScmResult<()> {
             service_type: windows_service::service::ServiceType::OWN_PROCESS,
             start_type: ServiceStartType::AutoStart,
             error_control: ServiceErrorControl::Normal,
-            executable_path: exe_path,
+            executable_path: exe_path.clone(),
             launch_arguments: vec![],
             dependencies: vec![],
             account_name: None,
             account_password: None,
         };
 
-        let _service = manager.create_service(&info, ServiceAccess::CHANGE_CONFIG)?;
-        Ok(())
+        match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG) {
+            Ok(_s) => {
+                log::info!(
+                    "service 已首次注册: {} (path={})",
+                    SERVICE_NAME,
+                    exe_path.display()
+                );
+                // 首次注册后立即 start
+                let start_handle =
+                    manager.open_service(SERVICE_NAME, ServiceAccess::START)?;
+                start_handle.start(&[] as &[&str])?;
+                log::info!("service 已启动");
+                Ok(())
+            }
+            Err(e) => {
+                if !is_service_exists_error(&e) {
+                    return Err(e.into());
+                }
+
+                // 服务已存在：query 当前 binary path 决定是否升级
+                let existing = manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::CHANGE_CONFIG
+                        | ServiceAccess::QUERY_CONFIG
+                        | ServiceAccess::QUERY_STATUS
+                        | ServiceAccess::START
+                        | ServiceAccess::STOP,
+                )?;
+
+                let current_cfg = existing.query_config()?;
+                let current_path = current_cfg.executable_path.clone();
+                let need_upgrade = !paths_equal(&current_path, &exe_path);
+
+                if need_upgrade {
+                    log::info!(
+                        "service binary 需升级: {} → {}",
+                        current_path.display(),
+                        exe_path.display()
+                    );
+                    existing.change_config(&info)?;
+
+                    let status = existing.query_status()?;
+                    if matches!(status.current_state, ServiceState::Running) {
+                        log::info!("service 在跑，重启以应用新 binary");
+                        let _ = existing.stop();
+                        // 等待 stop 完成（最多 ~5s）
+                        for _ in 0..10 {
+                            std::thread::sleep(Duration::from_millis(500));
+                            let s = existing.query_status()?;
+                            if matches!(s.current_state, ServiceState::Stopped) {
+                                break;
+                            }
+                        }
+                        existing.start(&[] as &[&str])?;
+                        log::info!("service 已用新 binary 重启");
+                    } else {
+                        existing.start(&[] as &[&str])?;
+                    }
+                } else {
+                    log::info!(
+                        "service binary 已是最新: {} — 跳过升级",
+                        current_path.display()
+                    );
+                    // binary 一致：确保在跑
+                    let status = existing.query_status()?;
+                    if !matches!(status.current_state, ServiceState::Running) {
+                        log::info!("service 没在跑，start");
+                        existing.start(&[] as &[&str])?;
+                    }
+                }
+                Ok(())
+            }
+        }
     }
     #[cfg(not(windows))]
     {
         Err(ScmError::NotWindows)
+    }
+}
+
+/// 比较两条路径是否指向同一文件（Windows 上 case-insensitive、UNC 标准化）
+#[cfg(windows)]
+fn paths_equal(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a_norm = a.to_string_lossy().to_lowercase().replace('/', "\\");
+    let b_norm = b.to_string_lossy().to_lowercase().replace('/', "\\");
+    a_norm == b_norm
+}
+
+#[cfg(windows)]
+fn is_service_exists_error(e: &windows_service::Error) -> bool {
+    use windows_service::Error;
+    if let Error::Winapi(io_err) = e {
+        io_err.raw_os_error() == Some(1073) // ERROR_SERVICE_EXISTS
+    } else {
+        false
     }
 }
 

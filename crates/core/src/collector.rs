@@ -265,20 +265,15 @@ impl Collector {
             )
             .ok()
             .and_then(|r: Vec<HashMap<String, Variant>>| {
-                let mut sum = 0u64;
-                for row in &r {
-                    let v = match row.get("UtilizationPercentage") {
-                        Some(Variant::UI8(v)) => *v,
-                        Some(Variant::UI4(v)) => *v as u64,
-                        _ => 0,
-                    };
-                    sum = sum.saturating_add(v);
-                }
-                if r.is_empty() {
-                    None
-                } else {
-                    Some((sum as f32).min(100.0))
-                }
+                let per_engine: Vec<Option<u64>> = r
+                    .iter()
+                    .map(|row| match row.get("UtilizationPercentage") {
+                        Some(Variant::UI8(v)) => Some(*v),
+                        Some(Variant::UI4(v)) => Some(*v as u64),
+                        _ => None,
+                    })
+                    .collect();
+                aggregate_gpu_utilization(&per_engine)
             });
 
         let cpu_temp = wmi_con
@@ -295,6 +290,22 @@ impl Collector {
 
         (cpu_freq, gpu_usage, cpu_temp)
     }
+}
+
+/// 聚合各 GPU 引擎的利用率：累加并封顶 100%。
+///
+/// - 无引擎（空数组）→ `None`（无法从 WMI 拿到数据）
+/// - 单引擎 → 该引擎值（封顶 100）
+/// - 多引擎 → 求和（封顶 100），兼容 UI8 / UI4 混用
+/// - 某引擎取不到值（`None`）→ 视作 0 参与累加，不丢弃其它引擎
+pub fn aggregate_gpu_utilization(per_engine: &[Option<u64>]) -> Option<f32> {
+    if per_engine.is_empty() {
+        return None;
+    }
+    let sum: u64 = per_engine
+        .iter()
+        .fold(0u64, |acc, v| acc.saturating_add(v.unwrap_or(0)));
+    Some((sum as f32).min(100.0))
 }
 
 #[cfg(test)]
@@ -335,5 +346,56 @@ mod tests {
         for usage in &sample.cpu_per_core {
             assert!(*usage >= 0.0 && *usage <= 100.0);
         }
+    }
+
+    // ===== aggregate_gpu_utilization（P2 GPU 采集，纯逻辑）=====
+
+    #[test]
+    fn gpu_empty_returns_none() {
+        assert_eq!(aggregate_gpu_utilization(&[]), None);
+    }
+
+    #[test]
+    fn gpu_single_engine() {
+        assert_eq!(aggregate_gpu_utilization(&[Some(42)]), Some(42.0));
+    }
+
+    #[test]
+    fn gpu_multi_engine_sum() {
+        // 两个引擎 30 + 40 = 70
+        assert_eq!(aggregate_gpu_utilization(&[Some(30), Some(40)]), Some(70.0));
+    }
+
+    #[test]
+    fn gpu_caps_at_100() {
+        // 三个引擎 50 + 40 + 30 = 120 → 封顶 100
+        assert_eq!(
+            aggregate_gpu_utilization(&[Some(50), Some(40), Some(30)]),
+            Some(100.0)
+        );
+    }
+
+    #[test]
+    fn gpu_missing_engine_treated_as_zero() {
+        // 一个引擎取不到值（None）视作 0，不丢弃其它引擎
+        assert_eq!(
+            aggregate_gpu_utilization(&[Some(30), None, Some(40)]),
+            Some(70.0)
+        );
+    }
+
+    #[test]
+    fn gpu_all_missing_returns_zero() {
+        // 全部取不到值 → 0%（有引擎但无数据）
+        assert_eq!(aggregate_gpu_utilization(&[None, None]), Some(0.0));
+    }
+
+    #[test]
+    fn gpu_overflow_saturates() {
+        // u64 溢出用 saturating 语义 → 封顶 100
+        assert_eq!(
+            aggregate_gpu_utilization(&[Some(u64::MAX), Some(u64::MAX)]),
+            Some(100.0)
+        );
     }
 }

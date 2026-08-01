@@ -115,7 +115,7 @@ impl DbReader {
         // 2) 读 summary（最新 sample）
         let summary = conn
             .query_row(
-                "SELECT timestamp, cpu_usage, mem_available_mb, \
+                "SELECT timestamp, cpu_usage, mem_usage_percent, mem_available_mb, \
                         net_sent_bps, net_recv_bps, disk_read_bps, disk_write_bps, \
                         gpu_usage, cpu_temp \
                  FROM samples ORDER BY id DESC LIMIT 1",
@@ -123,16 +123,18 @@ impl DbReader {
                 |row| {
                     let ts: String = row.get(0)?;
                     let cpu: f32 = row.get::<_, Option<f32>>(1)?.unwrap_or(0.0);
-                    let mem: i64 = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
-                    let ns: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
-                    let nr: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
-                    let dr: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
-                    let dw: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
-                    let gpu: Option<f32> = row.get(7)?;
-                    let temp: Option<f32> = row.get(8)?;
+                    let mem_pct: f32 = row.get::<_, Option<f32>>(2)?.unwrap_or(0.0);
+                    let mem: i64 = row.get::<_, Option<i64>>(3)?.unwrap_or(0);
+                    let ns: i64 = row.get::<_, Option<i64>>(4)?.unwrap_or(0);
+                    let nr: i64 = row.get::<_, Option<i64>>(5)?.unwrap_or(0);
+                    let dr: i64 = row.get::<_, Option<i64>>(6)?.unwrap_or(0);
+                    let dw: i64 = row.get::<_, Option<i64>>(7)?.unwrap_or(0);
+                    let gpu: Option<f32> = row.get(8)?;
+                    let temp: Option<f32> = row.get(9)?;
                     Ok(LatestSampleSummary {
                         timestamp: ts,
                         cpu_usage: cpu,
+                        mem_usage_percent: mem_pct,
                         mem_available_mb: mem as u64,
                         net_sent_bps: ns as u64,
                         net_recv_bps: nr as u64,
@@ -263,13 +265,21 @@ mod tests {
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
-        logger.write_sample(&Sample::default()).unwrap();
+        // 写入带 mem_usage_percent 的 sample，验证 GUI 读到的百分比正确
+        let mut s = Sample::default();
+        s.cpu_usage = 30.0;
+        s.mem_usage_percent = 62.5;
+        s.mem_available_mb = 4096;
+        logger.write_sample(&s).unwrap();
         logger.flush().unwrap();
 
         let reader = DbReader::new(&db);
         let r = reader.poll();
         assert_eq!(r.health, ServiceHealth::Running);
-        assert!(r.summary.is_some());
+        let summary = r.summary.expect("应有 summary");
+        assert_eq!(summary.cpu_usage, 30.0);
+        assert_eq!(summary.mem_usage_percent, 62.5);
+        assert_eq!(summary.mem_available_mb, 4096);
         assert!(r.last_heartbeat.is_some());
 
         std::fs::remove_file(&db).ok();
@@ -315,7 +325,7 @@ mod tests {
             db_path: db.clone(),
             retention_days: 30,
         };
-        let mut logger = Logger::new(&cfg).unwrap();
+        let logger = Logger::new(&cfg).unwrap();
         // 写一个 2 小时前的心跳
         let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let conn = Connection::open(&db).unwrap();

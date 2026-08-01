@@ -36,12 +36,12 @@
 > **P0（核心功能）已全部完成**，见上方"已完成"列表。以下为 P1–P4 待办（本会话已补齐 P1 右键菜单/点击穿透、P2 卡顿闪烁、P3 WAL 基础、P4 文档）。
 
 ### P1 — 交互功能
-- [ ] **系统托盘图标** — 最小化到托盘 + 托盘右键菜单（`tray-icon` + `muda`）。需与 eframe 事件循环集成，沙箱内无法可视化验证运行时行为，暂缓实现。窗口内右键菜单已可用作替代。
+- [x] **系统托盘图标** — `tray-icon` 0.19 + `muda` 0.15：后台线程建托盘 + 最小 win32 消息循环（`GetMessageW`），菜单事件经 `MenuEvent::receiver()` 轮询后由 UI 1Hz tick 消费；菜单项：显示/隐藏悬浮窗、暂停/恢复、退出；左键单击托盘图标 = 显示/隐藏。启动失败不阻塞 GUI — `crates/ui/src/tray.rs`
 
 ### P2 — 高级功能
-- [ ] **任务栏嵌入** — 伪任务栏窗口（无边框透明，手动拖到任务栏位置）
-- [ ] **配置热加载** — `notify` crate 监听 config.toml 变更并热更新采集/显示配置
-- [ ] **通知弹窗** — Windows 原生 toast 通知（检测到 Major/Critical 时弹出）
+- [x] **任务栏嵌入** — 伪任务栏窗口（PLAN §3.5 Phase 1 方案）：Slint 第二个窗口 `Taskbar` 组件（横向窄条，无边框透明置顶），默认定位工作区底部中央（`SystemParametersInfoW(SPI_GETWORKAREA)`），可拖动到任务栏位置；`config.toml [ui] taskbar = true` 启用 — `crates/ui/src/taskbar.rs`
+- [x] **配置热加载** — `notify` 6.1 监听 config.toml（父目录非递归）+ skins/ 目录（递归，缺目录兜底 `crates/ui/skins`）；事件经 `classify_change` 分类、150ms 防抖；UI tick 消费：config.toml 变更 → 重载配置（皮肤名变化时重载皮肤），skin.toml 变更 → 重载当前皮肤 — `crates/ui/src/hotreload.rs` + `crates/ui/src/lib.rs`
+- [x] **通知弹窗** — Windows 原生气泡通知（`Shell_NotifyIconW` NIF_INFO，无需 AUMID/manifest）；`should_notify` 纯逻辑：开关 + 严重程度门槛（未知等级按最严格）+ 事件时间戳去重；检测到新的 Major/Critical 事件时弹出 — `crates/ui/src/notify.rs`
 
 ### P3 — 服务与部署（服务化架构重构）
 - [x] **Windows 服务改造** — 独立 `find-stutter-service` crate（`crates/service/`），用 `windows-service` 0.8 注册 SCM 服务；服务循环：每秒 `collect → detect → touch_heartbeat → write_sample`，提供 `run` / `install` / `uninstall` / `start` / `stop` / `status` CLI 子命令；SCM 名 `FindStutter`
@@ -50,6 +50,7 @@
 - [x] **WAL 并发读写** — `Logger` 端 `PRAGMA journal_mode=WAL` + `Reader` 端 `SQLITE_OPEN_READ_ONLY` + `PRAGMA journal_mode=WAL`，服务写、GUI 读互不阻塞
 - [x] **P3 测试** — `find-stutter-service` 16 测试 + `find-stutter-ui` 30 测试（reader 健康检测 + overlay 格式化 + integration reader 端到端），全部通过
 - [x] **GUI 自动启动服务** — `crates/ui/src/auto_start.rs` 启动 GUI 时检测后台服务：复用 `find-stutter-service status` / `start` 子命令；找不到 exe / 未注册 / 启动失败 都不阻塞 GUI 启动，仅写日志；7 个新单元测试，总测试数 118 — `crates/ui/src/auto_start.rs`
+- [x] **GUI 启动时 UAC 自动提权安装/启动** — `crates/ui/src/elevate.rs` 新增 `ShellExecuteExW` + `"runas"` 同步提权调用；`auto_start.rs` 按 `status` 退出码（0=Running/1=Stopped/2=NotFound/3=Error）走不同路径，NotFound → 提权 `install-start` 一次完成 install+start，Stopped → 提权 `start`；UAC 拒绝/超时/shell 失败均不阻塞 GUI，仅写日志。`service` 端新增 `install-start` 子命令 + `status` 三档退出码 — `crates/ui/src/elevate.rs` + `crates/ui/src/auto_start.rs` + `crates/service/src/main.rs` + `crates/service/src/cli.rs`，UI 测试 30→38（+8）
 
 
 
@@ -57,3 +58,19 @@
 - [x] **移除 unused warnings** — 清理 `crates/core/src/logger.rs` 未使用的 `DateTime` 导入、`crates/ui/src/overlay.rs` 未使用的 `Duration` 导入；release 构建现已零警告
 - [x] **config.toml 示例完善** — 添加所有字段的注释说明
 - [x] **README.md** — 项目说明、使用方法、构建指南
+
+## 本会话修复的「标记完成但实现有问题」项（UT 核对）
+
+> 用户要求核对已标记完成功能的 UT 完备性。核对发现并修复如下：
+
+1. **皮肤系统名存实亡** — `skins/default/skin.toml` 是嵌套 TOML（`[skin]`/`[window]`/`[text]`），而 `SkinConfig` 是扁平结构 → `load()` 永远解析失败 fallback 默认；且 `apply_metrics` 从未把皮肤颜色接到 Slint（`overlay.slint` 颜色硬编码）。修复：skin.toml 改扁平结构、`SkinConfig::load` 支持 CWD / exe 同目录 / workspace 源码三处查找、恢复 `overlay::parse_color`、`overlay.slint` 全部颜色/字号/尺寸参数化并由 `apply_metrics` 注入（新增 5 个 parse_color 测试）。
+2. **`hotreload.rs` 未接入 lib.rs** — 代码含测试早已写好但从未编译（lib.rs 无 `pub mod hotreload;`）。修复：接入模块 + `run()` tick 消费事件 + `ConfigWatcher::disabled()` 降级构造 + skins 目录兜底；同时修掉首次编译暴露的 notify 6.1 API 错误（`Data(RenameMode)` → `Data(DataChange)`、`Path::to_ascii_lowercase` 不存在等）。
+3. **`config_save_and_reload_roundtrip` 集成测试失败** — `Config::load` 有意把相对 db_path 解析为配置所在目录的绝对路径（防 SCM 服务写 System32），测试却断言 roundtrip 相等。修复：测试断言改为「load 后是绝对路径且指向配置文件目录」（与实现契约一致）。
+5. **`window.rs` 无任何 UT** — 点击穿透的扩展样式位运算从未被测试。修复：抽 `toggle_transparent_style` 纯函数 + 4 个测试（置位/清位/幂等/零样式）。
+6. **collector GPU 聚合无 UT** — `aggregate_gpu_utilization` 内联在 WMI 查询里。修复：抽纯函数 + 7 个测试（空/单/多引擎求和/封顶 100/缺失视为 0/全缺失/溢出饱和）。
+7. **每次启动都弹 UAC（影响自动测试）** — GUI 启动必跑 `ensure_service_running`，服务未注册/停止时弹 UAC。修复：`FIND_STUTTER_SKIP_SERVICE` 环境变量（任意非空即跳过）+ `config.toml [ui] auto_start_service = false` 双重开关，命中时返回新变体 `AutoStartResult::Skipped`；env 相关测试用进程级 Mutex 串行化避免并发干扰。
+8. **服务永远起不来 → GUI 显示「服务已停止」+ 数据无变化** — 两个叠加 bug：
+   - `install.rs` 注册服务用 `launch_arguments: vec![]`（SCM 启动服务**不传任何参数**），但 `main.rs` 用 clap 必填 subcommand → SCM 无参拉起时 clap 报 usage 退出，服务进程瞬间死亡。修复：`Cli.command` 改 `Option`，无子命令 = SCM 服务模式 → `service::run_scm()`；diag log 的 `subcommand: None` 即此路径。
+   - `Config::load` fallback 只查 binary 同目录（`target/release/config.toml` 不存在，config 在项目根）→ SCM 服务 CWD=System32 时加载失败用默认配置，db 写错位置。修复：从 binary 目录**逐级向上**找 config（target/release → target → 项目根）。
+   - 顺带：主循环先 `collect()`（首次 WMI/COM 初始化卡数秒）再写心跳 → GUI 启动头几秒误判 Stopped/Stale。修复：心跳提到 `collect()` 之前写；`parse_with_base` 对相对 base 用 `current_dir` 绝对化（消除 "db_path 解析为绝对路径: stutter.db" 的假日志）。
+   - `ensure_service_when_exe_missing` 原是环境耦合测试（假设机器上无 service exe），服务注册后必失败。修复：拆出 `ensure_service_running_with_exe(exe, db)` 可注入版本，测试传 `None` 断言 `ExeNotFound`，与真实环境彻底隔离。

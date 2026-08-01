@@ -3,6 +3,8 @@ name = "find-stutter"
 version = "0.2.0"
 edition = "2021"
 description = "System stutter monitor CLI - Slint UI overlay"
+# 默认 cargo run / cargo install 跑这个（GUI 入口；export / stats 是子命令）
+default-run = "find-stutter"
 
 [[bin]]
 name = "find-stutter"

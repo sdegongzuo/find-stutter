@@ -42,6 +42,32 @@ pub const SERVICE_DISPLAY_NAME: &str = "Find Stutter Monitor";
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
+/// 追加一行到 binary 同目录的 `find-stutter-service.diag.log`（用于 SCM 启动调试）
+pub fn diag_log(msg: &str) {
+    use std::io::Write;
+    let dir = match std::env::current_exe() {
+        Ok(me) => me.parent().map(|p| p.to_path_buf()),
+        Err(_) => None,
+    };
+    let path = match dir {
+        Some(d) => d.join("find-stutter-service.diag.log"),
+        None => return,
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            f,
+            "[{}] [{}] {}",
+            chrono::Utc::now().to_rfc3339(),
+            std::process::id(),
+            msg
+        );
+    }
+}
+
 /// 前台运行服务循环（开发 / 调试 / `Run` 子命令）。
 ///
 /// 阻塞当前线程，按 `config.sampling.interval_ms` 周期采集。
@@ -50,14 +76,33 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         "find-stutter-service starting (interval={}ms, db={})",
         config.sampling.interval_ms, config.storage.db_path
     );
+    diag_log(&format!(
+        "run_foreground: starting, db={}, interval={}ms",
+        config.storage.db_path, config.sampling.interval_ms
+    ));
 
+    diag_log("run_foreground: creating Collector");
     let mut collector = Collector::new();
+    diag_log("run_foreground: Collector created");
     let mut detector = Detector::new(&config.detection);
-    let mut logger = Logger::new(&config.storage)?;
+    diag_log("run_foreground: Detector created");
+    let mut logger = match Logger::new(&config.storage) {
+        Ok(l) => {
+            diag_log(&format!("run_foreground: Logger created, db={}", config.storage.db_path));
+            l
+        }
+        Err(e) => {
+            diag_log(&format!("run_foreground: Logger::new FAILED: {}", e));
+            return Err(e);
+        }
+    };
 
     // 启动时立即写一次心跳，让 GUI 一启动就能看到「服务在跑」
     if let Err(e) = logger.touch_heartbeat() {
         warn!("initial touch_heartbeat failed: {}", e);
+        diag_log(&format!("run_foreground: initial touch_heartbeat failed: {}", e));
+    } else {
+        diag_log("run_foreground: initial touch_heartbeat ok");
     }
 
     let tick = Duration::from_millis(config.sampling.interval_ms);
@@ -65,13 +110,22 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
 
     while RUNNING.load(Ordering::SeqCst) {
         count += 1;
+        if count == 1 {
+            diag_log("run_foreground: entering main loop, count=1");
+        }
 
-        let sample = collector.collect();
-
-        // 心跳：每 tick 一次，GUI 探活用
+        // 心跳：每 tick 一次，GUI 探活用。
+        // 注意：必须在 collect() 之前写——首次 collect() 要初始化
+        // WMI/COM（慢通道），可能耗时数秒；若先 collect 再写心跳，
+        // GUI 启动后的前几秒会误判为 Stopped/Stale。
         if let Err(e) = logger.touch_heartbeat() {
             warn!("touch_heartbeat failed: {}", e);
+            if count <= 3 {
+                diag_log(&format!("run_foreground: tick={} touch_heartbeat failed: {}", count, e));
+            }
         }
+
+        let sample = collector.collect();
 
         if let Some(event) = detector.analyze(&sample) {
             info!(
@@ -86,11 +140,15 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
 
         if let Err(e) = logger.write_sample(&sample) {
             warn!("write_sample failed: {}", e);
+            if count <= 3 {
+                diag_log(&format!("run_foreground: tick={} write_sample failed: {}", count, e));
+            }
         }
 
         if count % 10 == 0 {
             if let Err(e) = logger.flush() {
                 warn!("flush failed: {}", e);
+                diag_log(&format!("run_foreground: tick={} flush failed: {}", count, e));
             }
         }
         if count % 3600 == 0 {
@@ -102,10 +160,13 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         std::thread::sleep(tick);
     }
 
+    diag_log(&format!("run_foreground: exiting main loop, count={}", count));
+
     // 退出前 flush + cleanup，保证数据不丢
     logger.flush()?;
     logger.cleanup()?;
     info!("find-stutter-service stopped");
+    diag_log("run_foreground: cleanup done, returning Ok");
     Ok(())
 }
 
@@ -123,8 +184,10 @@ define_windows_service!(ffi_service_main, scm_service_entry);
 
 #[cfg(windows)]
 fn scm_service_entry(_arguments: Vec<OsString>) {
+    diag_log("scm_service_entry: entered");
     if let Err(e) = scm_loop() {
         error!("SCM service entry failed: {}", e);
+        diag_log(&format!("scm_service_entry: FAILED: {}", e));
     }
 }
 
@@ -132,7 +195,9 @@ fn scm_service_entry(_arguments: Vec<OsString>) {
 /// 注册 control handler → 把状态推到 Running → 跑主循环 → Stop 时退出。
 #[cfg(windows)]
 fn scm_loop() -> anyhow::Result<()> {
+    diag_log("scm_loop: entering");
     let handler = service_control_handler::register(SERVICE_NAME, move |control_event| {
+        diag_log(&format!("scm_loop: control_event = {:?}", control_event));
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 info!("SCM Stop/Shutdown received");
@@ -156,10 +221,16 @@ fn scm_loop() -> anyhow::Result<()> {
 
     let config = Config::load("config.toml").unwrap_or_else(|e| {
         warn!("config load failed ({}), using defaults", e);
+        diag_log(&format!("scm_loop: config load failed: {}", e));
         Config::default()
     });
+    diag_log(&format!(
+        "scm_loop: config loaded, db={}, interval={}ms",
+        config.storage.db_path, config.sampling.interval_ms
+    ));
 
     let result = run_foreground(config);
+    diag_log(&format!("scm_loop: run_foreground returned: {:?}", result));
 
     // 把状态推到 Stopped
     handler.set_service_status(ServiceStatus {
@@ -258,6 +329,7 @@ mod tests {
         let mut logger = Logger::new(&config).unwrap();
         let mut s = Sample::default();
         s.cpu_usage = 42.5;
+        s.mem_usage_percent = 58.3;
         s.mem_available_mb = 8192;
         s.net_sent_bps = 1024;
         logger.write_sample(&s).unwrap();
@@ -267,6 +339,7 @@ mod tests {
         assert!(summary.is_some());
         let s = summary.unwrap();
         assert!((s.cpu_usage - 42.5).abs() < 0.01);
+        assert!((s.mem_usage_percent - 58.3).abs() < 0.01);
         assert_eq!(s.mem_available_mb, 8192);
         assert_eq!(s.net_sent_bps, 1024);
 

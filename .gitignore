@@ -24,3 +24,6 @@ test.log
 test_*.log
 final_test.log
 test2.log
+stutter.db-shm
+stutter.db-wal
+*.diag.log

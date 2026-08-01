@@ -1,15 +1,10 @@
-[skin]
-name = "Default"
-
-[window]
+# 默认皮肤（与 SkinConfig 扁平结构一致，直接解析）
+# 颜色格式 #RRGGBB；opacity 仅当 UI 支持时生效（当前版本保留字段）
 width = 260.0
 height = 80.0
 background_color = "#1E1E2E"
 border_color = "#45475A"
 border_radius = 8.0
-opacity = 0.92
-
-[text]
 font_size = 13.0
 upload_color = "#A6E3A1"
 download_color = "#89B4FA"

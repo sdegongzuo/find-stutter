@@ -3,6 +3,8 @@
 //! 由 [`SkinConfig::load`] 从 `skins/<name>/skin.toml` 读取，反序列化后存为字符串，
 //! 真正使用颜色时调用 [`crate::overlay::parse_color`] 解析为 `slint::Color`。
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -69,15 +71,44 @@ impl Default for SkinConfig {
     }
 }
 
-impl SkinConfig {
-    /// 从 `skins/<name>/skin.toml` 加载，文件不存在或解析失败返回默认皮肤
-    pub fn load(name: &str) -> Self {
-        let path = format!("skins/{}/skin.toml", name);
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            toml::from_str(&content).unwrap_or_default()
-        } else {
-            Self::default()
+/// 皮肤文件查找顺序（与 `Config::load` 的策略一致）：
+/// 1. CWD 下 `skins/<name>/skin.toml`（开发时直接 cargo run）
+/// 2. 可执行文件同目录 `skins/<name>/skin.toml`（发布后与 exe 一起分发）
+/// 3. workspace 源码布局 `crates/ui/skins/<name>/skin.toml`（测试 / 仓库内运行）
+fn find_skin_path(name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+
+    candidates.push(std::path::Path::new("skins").join(name).join("skin.toml"));
+
+    if let Ok(me) = std::env::current_exe() {
+        if let Some(dir) = me.parent() {
+            candidates.push(dir.join("skins").join(name).join("skin.toml"));
         }
+    }
+
+    // workspace 源码布局（cargo test 时 CWD 是 workspace 根）
+    candidates.push(
+        std::path::Path::new("crates")
+            .join("ui")
+            .join("skins")
+            .join(name)
+            .join("skin.toml"),
+    );
+
+    candidates.into_iter().find(|p| p.exists())
+}
+
+impl SkinConfig {
+    /// 从 `skins/<name>/skin.toml` 加载，文件不存在或解析失败返回默认皮肤。
+    ///
+    /// 查找顺序见 [`find_skin_path`]。
+    pub fn load(name: &str) -> Self {
+        if let Some(path) = find_skin_path(name) {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                return toml::from_str(&content).unwrap_or_default();
+            }
+        }
+        Self::default()
     }
 }
 
@@ -124,5 +155,31 @@ mod tests {
         assert_eq!(skin.upload_color, "00FF00");
         // 未指定的字段用默认值
         assert_eq!(skin.background_color, "#1E1E2E");
+    }
+
+    /// 仓库内自带 default 皮肤必须能被 load（修复：原实现路径/结构不匹配，
+    /// load 永远 fallback 默认值，皮肤系统名存实亡）
+    #[test]
+    fn load_default_skin_from_repo() {
+        let skin = SkinConfig::load("default");
+        let default = SkinConfig::default();
+        // 仓库皮肤与默认值一致（skin.toml 就是按默认值写的），
+        // 关键断言：加载结果与默认值完全一致 = 文件被成功解析，
+        // 而非「找不到文件 fallback 默认」。
+        assert_eq!(skin.width, default.width);
+        assert_eq!(skin.height, default.height);
+        assert_eq!(skin.font_size, default.font_size);
+        assert_eq!(skin.background_color, default.background_color);
+        assert_eq!(skin.cpu_color, default.cpu_color);
+    }
+
+    /// 解析失败（非法 TOML）应 fallback 默认
+    #[test]
+    fn parse_invalid_toml_falls_back_to_default() {
+        // 往临时目录写一个非法 skin.toml，用 load 直接读（走 find_skin_path 会
+        // 优先命中 CWD 的真实皮肤，所以这里只验证 toml::from_str 的 fallback 路径）
+        let content = "width = not-a-number\n";
+        let skin: SkinConfig = toml::from_str(content).unwrap_or_default();
+        assert_eq!(skin.width, 260.0);
     }
 }

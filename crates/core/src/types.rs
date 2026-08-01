@@ -168,7 +168,17 @@ pub struct UiConfig {
     pub show_temperature: bool,
     pub mouse_transparent: bool,
     pub click_through: bool,
+    /// 启动 GUI 时是否自动检测 + 启动后台服务（含 UAC 提权）。
+    /// 自动测试 / CI 环境建议关掉（或设环境变量 FIND_STUTTER_SKIP_SERVICE=1），
+    /// 避免每次启动都弹 UAC。
+    #[serde(default = "default_true")]
+    pub auto_start_service: bool,
+    /// P2：任务栏嵌入模式（伪任务栏窗口，显示在屏幕底部，可拖动到任务栏位置）
+    #[serde(default)]
+    pub taskbar: bool,
 }
+
+fn default_true() -> bool { true }
 
 impl Default for UiConfig {
     fn default() -> Self {
@@ -185,6 +195,8 @@ impl Default for UiConfig {
             show_temperature: false,
             mouse_transparent: false,
             click_through: false,
+            auto_start_service: true,
+            taskbar: false,
         }
     }
 }
@@ -244,9 +256,79 @@ impl Default for Config {
 }
 
 impl Config {
+    /// 加载配置文件。
+    ///
+    /// 查找顺序：
+    /// 1. 用户指定的 `path`（通常是 `config.toml`）
+    /// 2. **当前可执行文件所在目录**下的 `path`（关键！SCM 启动 service 时
+    ///    CWD 是 `C:\Windows\System32`，那里没 config.toml；fallback 到
+    ///    binary 同目录 `target\release\config.toml`）
+    /// 3. 从 binary 目录**逐级向上**查找 `path`（开发布局：binary 在
+    ///    `target/release/`，config.toml 在项目根；SCM 服务需要这个回退）
+    /// 4. 最后再尝试原路径返回原始错误
+    ///
+    /// 同时把 `db_path` 相对路径**解析为绝对路径**（基于 config 所在目录），
+    /// 避免 SCM service 写到 `C:\Windows\System32\stutter.db`。
     pub fn load(path: &str) -> anyhow::Result<Self> {
+        // 1) 尝试给定路径
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let base = std::path::Path::new(path)
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default();
+            return Self::parse_with_base(&content, &base);
+        }
+        // 2) fallback 到 binary 同目录 + 3) 逐级向上
+        if let Ok(me) = std::env::current_exe() {
+            if let Some(dir) = me.parent() {
+                // binary 同目录（如 target/release/config.toml）
+                let alt = dir.join(path);
+                if let Ok(content) = std::fs::read_to_string(&alt) {
+                    log::info!("config 加载自 binary 同目录: {}", alt.display());
+                    return Self::parse_with_base(&content, dir);
+                }
+                // 从 binary 目录逐级向上找（target/release → target → 项目根）
+                for ancestor in dir.ancestors().skip(1) {
+                    let candidate = ancestor.join(path);
+                    if let Ok(content) = std::fs::read_to_string(&candidate) {
+                        log::info!(
+                            "config 加载自 binary 上级目录: {}",
+                            candidate.display()
+                        );
+                        return Self::parse_with_base(&content, ancestor);
+                    }
+                }
+            }
+        }
+        // 4) 原路径再试一次让调用方看到原始错误
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        Self::parse_with_base(
+            &content,
+            std::path::Path::new(path)
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+    }
+
+    /// 解析 TOML 字符串并把 `db_path` 相对路径转为绝对路径。
+    fn parse_with_base(content: &str, base: &std::path::Path) -> anyhow::Result<Self> {
+        let mut config: Config = toml::from_str(content)?;
+        let p = std::path::Path::new(&config.storage.db_path);
+        if p.is_relative() {
+            // base 本身是相对路径（如 CWD 下的 "."）时，先转成绝对路径，
+            // 否则 base.join("stutter.db") 仍是相对的（日志里出现
+            // "db_path 解析为绝对路径: stutter.db" 就是这种情况）。
+            let base_abs = if base.is_absolute() {
+                base.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(base)
+            };
+            let abs = base_abs.join(p);
+            config.storage.db_path = abs.to_string_lossy().to_string();
+            log::info!("db_path 解析为绝对路径: {}", config.storage.db_path);
+        }
         Ok(config)
     }
 

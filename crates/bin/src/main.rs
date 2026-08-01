@@ -2,7 +2,8 @@ use clap::Parser;
 use find_stutter::{Cli, Commands};
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
+    // 日志由 find_stutter_ui::run() 内部 init（用 try_init 容忍重复），
+    // 这里不再 init，否则 lib.rs 二次 init 会 panic。
     let cli = Cli::parse();
 
     match cli.command {

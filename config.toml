@@ -45,6 +45,12 @@ show_temperature = false
 mouse_transparent = false
 # 点击穿透模式（已废弃，保留兼容；实际穿透请用右键菜单或按 T）
 click_through = false
+# 启动 GUI 时是否自动检测 + 启动后台服务（含 UAC 提权）。
+# 自动测试 / CI 环境建议设 false，或设环境变量 FIND_STUTTER_SKIP_SERVICE=1，
+# 避免每次启动都弹 UAC 授权。
+auto_start_service = true
+# P2: 任务栏嵌入模式（伪任务栏窗口，横向窄条显示在屏幕底部，可拖动到任务栏位置）
+taskbar = false
 
 [storage]
 # SQLite 数据库文件路径

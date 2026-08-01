@@ -277,13 +277,14 @@ impl Logger {
     }
 
     /// 读最新一条 sample（GUI 启动时立刻有数据可显示）。
-    /// 返回 (timestamp_rfc3339, cpu_usage, mem_available_mb, net_sent_bps, net_recv_bps,
-    ///       disk_read_bps, disk_write_bps, gpu_usage, cpu_temp)
+    /// 返回 (timestamp_rfc3339, cpu_usage, mem_usage_percent, mem_available_mb,
+    ///       net_sent_bps, net_recv_bps, disk_read_bps, disk_write_bps, gpu_usage, cpu_temp)
     /// 行不存在返回 None。
     pub fn latest_sample_summary(&self) -> anyhow::Result<Option<LatestSampleSummary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT timestamp, cpu_usage, mem_available_mb, net_sent_bps, net_recv_bps,
-                    disk_read_bps, disk_write_bps, gpu_usage, cpu_temp
+            "SELECT timestamp, cpu_usage, mem_usage_percent, mem_available_mb, \
+                    net_sent_bps, net_recv_bps, disk_read_bps, disk_write_bps, \
+                    gpu_usage, cpu_temp \
              FROM samples ORDER BY id DESC LIMIT 1",
         )?;
         let mut rows = stmt.query([])?;
@@ -291,13 +292,14 @@ impl Logger {
             Ok(Some(LatestSampleSummary {
                 timestamp: row.get(0)?,
                 cpu_usage: row.get::<_, Option<f32>>(1)?.unwrap_or(0.0),
-                mem_available_mb: row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u64,
-                net_sent_bps: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
-                net_recv_bps: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
-                disk_read_bps: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
-                disk_write_bps: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
-                gpu_usage: row.get::<_, Option<f32>>(7)?,
-                cpu_temp: row.get::<_, Option<f32>>(8)?,
+                mem_usage_percent: row.get::<_, Option<f32>>(2)?.unwrap_or(0.0),
+                mem_available_mb: row.get::<_, Option<i64>>(3)?.unwrap_or(0) as u64,
+                net_sent_bps: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as u64,
+                net_recv_bps: row.get::<_, Option<i64>>(5)?.unwrap_or(0) as u64,
+                disk_read_bps: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as u64,
+                disk_write_bps: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as u64,
+                gpu_usage: row.get::<_, Option<f32>>(8)?,
+                cpu_temp: row.get::<_, Option<f32>>(9)?,
             }))
         } else {
             Ok(None)
@@ -312,6 +314,8 @@ impl Logger {
 pub struct LatestSampleSummary {
     pub timestamp: String, // RFC3339
     pub cpu_usage: f32,
+    /// 内存使用率（0.0 ~ 100.0）
+    pub mem_usage_percent: f32,
     pub mem_available_mb: u64,
     pub net_sent_bps: u64,
     pub net_recv_bps: u64,

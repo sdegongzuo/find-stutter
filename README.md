@@ -15,6 +15,11 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 - **点击穿透模式**：窗口鼠标事件穿透（看得到点不到），按 `T` 退出穿透。
 - **SQLite 持久化**：采样与卡顿事件写入 `stutter.db`（WAL 模式，读写并发无锁）。
 - **P3 服务化架构**（已完成）：独立 Windows 服务做采集写库，GUI 只读 SQLite 轮询；服务停止时 UI 顶部状态条变红「● 服务已停止」并禁用暂停按钮。
+- **UAC 自动提权**（已完成）：首次双击 GUI 时若服务未注册 / 未运行，会自动弹 UAC 申请管理员权限完成 `install + start`，用户只需点「是」即可。
+- **系统托盘图标**（P1）：后台线程 + win32 消息循环，右键菜单「显示/隐藏悬浮窗 / 暂停/恢复 / 退出」，左键单击 = 显示/隐藏；失败不阻塞 GUI。
+- **配置 / 皮肤热加载**（P2）：`notify` 监听 `config.toml` 与 `skins/` 目录，保存即生效（皮肤名变更会重载皮肤，皮肤颜色/字号实时更新）。
+- **卡顿通知弹窗**（P2）：检测到新的 Major/Critical 卡顿时弹 Windows 原生系统通知（气泡 toast），`[notifications]` 配置开关与最低等级。
+- **任务栏嵌入**（P2）：`config.toml [ui] taskbar = true` 启用横向窄条伪任务栏窗口（默认底部中央，可拖到任务栏位置）。
 - **CLI 导出**：将卡顿记录导出为 CSV，或查询当日卡顿次数。
 
 ## 架构（P3 重构后）
@@ -95,10 +100,22 @@ GUI 启动时**自动**做的事（在 `crates/ui/src/auto_start.rs`）：
 3. 没在跑就调 `start` 子命令尝试启动
 4. 失败也不阻塞 GUI 启动，只在日志 + 顶部状态条提示
 
+> **自动测试 / CI 环境**：GUI 每次启动都会尝试检测服务，服务未注册/停止时
+> 会弹 UAC 授权。不想被弹窗打断时，二选一即可完全跳过自动启动：
+>
+> ```bash
+> # 方式 1：环境变量（推荐，不改配置）
+> set FIND_STUTTER_SKIP_SERVICE=1 && find-stutter.exe
+>
+> # 方式 2：配置文件
+> # config.toml → [ui] auto_start_service = false
+> ```
+
 | 自动启动结果 | GUI 表现 |
 | --- | --- |
 | `AlreadyRunning` | 1 秒后状态条变绿「● 服务运行中」 |
 | `Started` | 1 秒后状态条变绿「● 服务运行中」 |
+| `Skipped` | 服务自动启动已关闭（环境变量/配置），状态条显示服务状态 |
 | `NotRegistered` | 状态条变红「● 服务未注册（请运行 find-stutter-service install）」 |
 | `ExeNotFound` | 状态条变红「● 服务未注册（请运行 find-stutter-service install）」（先构建 service crate） |
 | `StartFailed` | 状态条变红「● 服务已停止」，日志提示手动 `start` |
@@ -147,9 +164,10 @@ target/release/find-stutter-service.exe run
 | `run` | 前台运行服务循环（开发/调试，不注册 SCM） |
 | `install` | 注册为 Windows 服务（需管理员权限） |
 | `uninstall` | 卸载 Windows 服务 |
-| `start` | 启动已注册的服务 |
-| `stop` | 停止已运行的服务 |
-| `status` | 打印服务当前状态（退出码 0 = 运行中） |
+| `start` | 启动已注册的服务（需管理员权限） |
+| `stop` | 停止已运行的服务（需管理员权限） |
+| `status` | 打印服务当前状态（退出码 0=Running / 1=Stopped·Pending / 2=NotFound / 3=Error，GUI 端按此协议走自动安装/启动逻辑） |
+| `install-start` | 一次完成 `install` + `start`（GUI 端 UAC 提权路径用，需管理员权限） |
 | `--config <path>` | 全局：指定配置文件路径（默认 `config.toml`） |
 
 #### `find-stutter.exe export / stats`（CLI 工具）
@@ -177,19 +195,25 @@ find-stutter.exe stats
 | --- | --- |
 | 拖动窗口 | 移动悬浮窗（原生拖拽，无重影） |
 | 单击窗口 | 展开 / 收起详情面板 |
-| 右键窗口 | 弹出菜单：暂停监控、展开详情、点击穿透、退出 |
+| **右键窗口** | **弹出菜单列表：暂停/恢复监控、点击穿透、退出** |
+| 右键托盘图标 | 托盘菜单：显示/隐藏悬浮窗、暂停/恢复、退出 |
+| 左键单击托盘图标 | 显示 / 隐藏悬浮窗 |
 | 按 `T` | 切换点击穿透模式（穿透时鼠标无效，用于「只看不挡」） |
 | 顶部状态条 | 显示「● 服务运行中（绿）/ 卡顿（黄）/ 已停止（红）」，服务断开时变红并禁用暂停按钮 |
+| 修改 config.toml / skin.toml | 保存后热加载（皮肤颜色/字号实时生效；db 路径等需重启生效） |
 
 ## 目录结构
 
 ```
 crates/
   core/      采集器、检测引擎、SQLite 日志、类型定义（含 P3 心跳表 + 只读接口）
-  service/   find-stutter-service: Windows 服务（run / install / uninstall / start / stop / status）
-  ui/        悬浮窗 UI、皮肤、DbReader（1Hz SQLite 轮询）、服务健康状态条
+  service/   find-stutter-service: Windows 服务（run / install / uninstall / start / stop / status / install-start）
+  ui/        悬浮窗 UI、皮肤、DbReader（1Hz SQLite 轮询）、服务健康状态条、
+             auto_start（GUI 启动时自动检测 + UAC 提权安装/启动）、
+             elevate（ShellExecuteExW + runas）、hotreload（notify 配置/皮肤监听）、
+             tray（系统托盘）、notify（卡顿气泡通知）、taskbar（伪任务栏窗口）
   bin/       CLI 入口（默认 UI / export / stats）
-config.toml  配置
+config.toml  配置（含 [ui] taskbar、[notifications] 开关）
 stutter.db   运行时生成的数据库
 ```
 
@@ -197,14 +221,16 @@ stutter.db   运行时生成的数据库
 
 ```bash
 cargo test --workspace
-# core:  52 unit + 13 integration
-# ui:    20 unit + 10 integration  (含 7 个 reader 健康检测 + 4 个 service_status 格式化)
-# service: 16 unit  (CLI 解析 + 心跳 roundtrip + 状态文本 + 状态机)
-# 合计 111 个测试
+# core:  59 unit + 13 integration
+# ui:    83 unit + 10 integration
+# service: 17 unit
+# bin:    5 cli tests
+# 合计 184 个测试（0 失败）
 ```
 
 ## 已知限制 / 后续计划
 
-- 系统托盘图标、原生 toast 通知、配置热加载、任务栏嵌入尚未实现。
+- 任务栏嵌入为「伪任务栏窗口」方案（可拖到任务栏位置）；DeskBand 原生注入（Win7/10/11 兼容成本高）未实现。
 - 点击穿透模式下窗口无法接收鼠标，退出穿透请用 `T` 键或先聚焦于窗口。
 - 服务模式下需要管理员权限 `install`（仅一次），之后运行无需管理员。
+- 通知弹窗用 `Shell_NotifyIconW` 气泡（非 WinRT toast）：无需 AUMID/installer，零配置可用；WinRT toast 需注册 shortcut，暂未采用。
