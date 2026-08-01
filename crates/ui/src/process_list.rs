@@ -613,6 +613,8 @@ pub struct ProcessListWindow {
     ui: crate::ProcessList,
     /// 最近一次采样的全量进程行缓存（渲染/搜索/展开直接用，避免反复采样）
     cache: Mutex<Vec<ProcessRow>>,
+    /// CPU 核数缓存（render 复用）
+    nb_cpus: Arc<Mutex<usize>>,
     /// 快照采集器（持有 CPU 基线 + IO 历史，供 1Hz 刷新）
     sampler: Arc<Mutex<ProcessSampler>>,
     /// 当前排序列 + 方向
@@ -641,6 +643,10 @@ impl ProcessListWindow {
         // 进程行缓存（采样一次，渲染/搜索/展开/排序复用）
         let cache: Arc<Mutex<Vec<ProcessRow>>> = Arc::new(Mutex::new(Vec::new()));
         let cache_tick = cache.clone();
+        // CPU 核数缓存（render 复用；sysinfo::System::new() 枚举硬件很贵）
+        let nb_cpus: Arc<Mutex<usize>> = Arc::new(Mutex::new(
+            sampler.lock().unwrap().cpu_count().max(1),
+        ));
 
         // 拖动允许标志：300ms 后置 true
         let drag_allowed = Arc::new(AtomicBool::new(false));
@@ -676,6 +682,7 @@ impl ProcessListWindow {
         let cache_sort = cache_tick.clone();
         let search_sort = search.clone();
         let expanded_sort = expanded.clone();
+        let nb_cpus_sort = nb_cpus.clone();
         ui.on_sort_requested(move |column: slint::SharedString| {
             {
                 let mut g = sort_for_cb.lock().unwrap();
@@ -688,7 +695,7 @@ impl ProcessListWindow {
                 log::info!("排序: {} {}", g.0, if g.1 { "升序" } else { "降序" });
             }
             if let Some(ui) = weak_sort_ui.upgrade() {
-                render(&ui, &cache_sort, &sort_for_cb, &search_sort, &expanded_sort);
+                render(&ui, &cache_sort, &sort_for_cb, &search_sort, &expanded_sort, *nb_cpus_sort.lock().unwrap());
             }
         });
 
@@ -698,10 +705,37 @@ impl ProcessListWindow {
         let cache_search = cache_tick.clone();
         let sort_search = sort.clone();
         let expanded_search = expanded.clone();
+        let nb_cpus_search = nb_cpus.clone();
         ui.on_search_changed(move |text: slint::SharedString| {
             *search_for_cb.lock().unwrap() = text.to_string();
             if let Some(ui) = weak_search.upgrade() {
-                render(&ui, &cache_search, &sort_search, &search_for_cb, &expanded_search);
+                render(&ui, &cache_search, &sort_search, &search_for_cb, &expanded_search, *nb_cpus_search.lock().unwrap());
+            }
+        });
+
+        // 刷新按钮 → 立即重采样 + 重绘
+        let weak_refresh = ui.as_weak();
+        let sampler_refresh = sampler.clone();
+        let cache_refresh = cache_tick.clone();
+        let sort_refresh = sort.clone();
+        let search_refresh = search.clone();
+        let expanded_refresh = expanded.clone();
+        let nb_cpus_refresh = nb_cpus.clone();
+        ui.on_refresh_requested(move || {
+            if let Some(ui) = weak_refresh.upgrade() {
+                let rows = {
+                    let mut s = sampler_refresh.lock().unwrap();
+                    s.sample()
+                };
+                *cache_refresh.lock().unwrap() = rows;
+                render(
+                    &ui,
+                    &cache_refresh,
+                    &sort_refresh,
+                    &search_refresh,
+                    &expanded_refresh,
+                    *nb_cpus_refresh.lock().unwrap(),
+                );
             }
         });
 
@@ -723,6 +757,7 @@ impl ProcessListWindow {
 
         // 聚合父节点点击 → 展开/收起 + 用缓存重绘
         let expanded_for_cb = expanded.clone();
+        let nb_cpus_expand = nb_cpus.clone();
         let weak_expand_ui = ui.as_weak();
         let cache_expand = cache_tick.clone();
         let sort_expand = sort.clone();
@@ -736,7 +771,7 @@ impl ProcessListWindow {
                 }
             }
             if let Some(ui) = weak_expand_ui.upgrade() {
-                render(&ui, &cache_expand, &sort_expand, &search_expand, &expanded_for_cb);
+                render(&ui, &cache_expand, &sort_expand, &search_expand, &expanded_for_cb, *nb_cpus_expand.lock().unwrap());
             }
         });
 
@@ -763,6 +798,7 @@ impl ProcessListWindow {
         let sort_tick = sort.clone();
         let search_tick = search.clone();
         let expanded_tick = expanded.clone();
+        let nb_cpus_tick = nb_cpus.clone();
         let tick_timer = slint::Timer::default();
         tick_timer.start(
             slint::TimerMode::Repeated,
@@ -781,6 +817,7 @@ impl ProcessListWindow {
                         &sort_tick,
                         &search_tick,
                         &expanded_tick,
+                        *nb_cpus_tick.lock().unwrap(),
                     );
                 }
             },
@@ -794,6 +831,7 @@ impl ProcessListWindow {
         Ok(Self {
             ui,
             cache: Mutex::new(Vec::new()),
+            nb_cpus,
             sampler,
             sort,
             search,
@@ -812,7 +850,7 @@ impl ProcessListWindow {
             let rows = s.sample();
             *self.cache.lock().unwrap() = rows;
         }
-        render(&self.ui, &self.cache, &self.sort, &self.search, &self.expanded);
+        render(&self.ui, &self.cache, &self.sort, &self.search, &self.expanded, *self.nb_cpus.lock().unwrap());
     }
 }
 
@@ -825,6 +863,7 @@ fn render(
     sort: &Mutex<(String, bool)>,
     search: &Mutex<String>,
     expanded: &Mutex<std::collections::HashSet<String>>,
+    nb_cpus: usize,
 ) {
     let rows = cache.lock().unwrap().clone();
 
@@ -851,7 +890,6 @@ fn render(
     let expanded_set = expanded.lock().unwrap().clone();
 
     // 构建显示列表：父节点（聚合）+ 展开的子进程 / 服务
-    let nb_cpus = sysinfo::System::new().cpus().len().max(1);
     let mut items: Vec<crate::ProcessRowData> = Vec::new();
     for g in &groups {
         if g.children.is_empty() && g.services.is_empty() {
@@ -1192,6 +1230,49 @@ mod tests {
         let mut groups = group_processes(&rows, &no_services());
         sort_groups(&mut groups, "name", true);
         assert_eq!(groups[0].name, "a.exe");
+    }
+
+    #[test]
+    fn sort_groups_by_mem() {
+        let rows = vec![
+            row(1, "a.exe", 10.0, 100),
+            row(2, "b.exe", 10.0, 900),
+            row(3, "c.exe", 10.0, 500),
+        ];
+        let mut groups = group_processes(&rows, &no_services());
+        sort_groups(&mut groups, "mem", false);
+        assert_eq!(groups[0].name, "b.exe"); // 内存大 → 降序在前
+        assert_eq!(groups[2].name, "a.exe");
+    }
+
+    #[test]
+    fn sort_groups_by_disk() {
+        let mut a = row(1, "a.exe", 10.0, 100);
+        a.disk_read_bps = 1000;
+        let mut b = row(2, "b.exe", 10.0, 100);
+        b.disk_write_bps = 5000;
+        let mut groups = group_processes(&[a, b], &no_services());
+        sort_groups(&mut groups, "disk", false);
+        assert_eq!(groups[0].name, "b.exe"); // 磁盘 R+W 大 → 降序在前
+    }
+
+    #[test]
+    fn sort_groups_by_net() {
+        let mut a = row(1, "a.exe", 10.0, 100);
+        a.net_bps = 3000;
+        let mut b = row(2, "b.exe", 10.0, 100);
+        b.net_bps = 1000;
+        let mut groups = group_processes(&[a, b], &no_services());
+        sort_groups(&mut groups, "net", false);
+        assert_eq!(groups[0].name, "a.exe"); // 网络速率大 → 降序在前
+    }
+
+    #[test]
+    fn sort_groups_by_pid() {
+        let rows = vec![row(300, "a.exe", 10.0, 100), row(100, "b.exe", 10.0, 100)];
+        let mut groups = group_processes(&rows, &no_services());
+        sort_groups(&mut groups, "pid", true);
+        assert_eq!(groups[0].name, "b.exe"); // PID 100 升序在前
     }
 
     #[test]
