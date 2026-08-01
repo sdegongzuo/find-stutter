@@ -3,7 +3,7 @@ use chrono::Utc;
 use log::warn;
 use std::collections::HashMap;
 use sysinfo::{Networks, System};
-use wmi::{COMLibrary, Variant, WMIConnection};
+use wmi::{Variant, WMIConnection};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Performance::{
@@ -228,14 +228,8 @@ impl Collector {
     }
 
     fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>) {
-        let com = match COMLibrary::new() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("COM library init failed: {}", e);
-                return (None, None, None);
-            }
-        };
-        let wmi_con = match WMIConnection::new(com) {
+        // wmi 0.18：WMIConnection::new() 自动初始化 COM，无需 COMLibrary
+        let wmi_con = match WMIConnection::new() {
             Ok(c) => c,
             Err(e) => {
                 warn!("WMI connection failed: {}", e);

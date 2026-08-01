@@ -12,7 +12,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Threading",
 ] }
-wmi = "0.14"
+wmi = "0.18"
 rusqlite = { version = "0.37", features = ["bundled"] }
 csv = "1.4"
 serde = { version = "1", features = ["derive"] }
