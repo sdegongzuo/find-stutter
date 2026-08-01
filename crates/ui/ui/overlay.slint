@@ -474,7 +474,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("pid"); } }
                     Text {
-                        text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -485,7 +485,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("name"); } }
                     Text {
-                        text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -496,7 +496,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("cpu"); } }
                     Text {
-                        text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -507,7 +507,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("mem"); } }
                     Text {
-                        text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -518,7 +518,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("disk"); } }
                     Text {
-                        text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -529,7 +529,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("net"); } }
                     Text {
-                        text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -540,7 +540,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("nettotal"); } }
                     Text {
-                        text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -551,7 +551,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("status"); } }
                     Text {
-                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : "");
+                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
