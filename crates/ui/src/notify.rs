@@ -113,7 +113,7 @@ fn show_balloon(title: &str, body: &str, severity: Severity) {
             0,
             0,
             0,
-            HWND_MESSAGE,
+            Some(HWND_MESSAGE),
             None,
             None,
             None,

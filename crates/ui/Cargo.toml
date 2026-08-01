@@ -28,7 +28,7 @@ slint = { version = "1", default-features = false, features = [
 ] }
 
 # P3：UI 只读模式直连 stutter.db
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 # P3：时间戳解析（service heartbeat + stutter event timestamp）
 chrono = "0.4"
@@ -37,11 +37,11 @@ chrono = "0.4"
 serde_json = "1"
 
 # P2：进程详情列表（右键菜单「进程详情」按需采集一次快照，不写库）
-sysinfo = "0.33"
+sysinfo = "0.39"
 
 # 纯数据皮肤配置（无 UI 框架依赖）
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "0.9"
 
 # 后台线程与 UI 线程同步
 parking_lot = "0.12"
@@ -64,7 +64,7 @@ muda = "0.15"
 
 # 平台层（Windows 原生窗口句柄 + 点击穿透/置顶 + UAC 提权）
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
@@ -76,4 +76,4 @@ windows = { version = "0.58", features = [
 raw-window-handle = "0.6"
 
 [build-dependencies]
-slint-build = "1.10"
+slint-build = "1.12"

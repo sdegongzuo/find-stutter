@@ -8,7 +8,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
-    PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE,
+    PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
 };
 
 /// Windows PDH-based disk I/O sampler.
@@ -18,24 +18,24 @@ use windows::Win32::System::Performance::{
 /// counters are sampled every tick so the values are always fresh (the old
 /// WMI approach only ran every 5 ticks AND matched the wrong variant type,
 /// which is why disk always showed `0 B/s`). In the windows 0.58 crate PDH
-/// handles are plain `isize`.
+/// windows 0.62 起 PDH 句柄是 `PDH_HQUERY(*mut c_void)` 结构体（不再是 isize）。
 struct DiskPdh {
-    query: isize,
-    read_counter: isize,
-    write_counter: isize,
+    query: PDH_HQUERY,
+    read_counter: PDH_HCOUNTER,
+    write_counter: PDH_HCOUNTER,
 }
 
 impl DiskPdh {
     fn new() -> Option<Self> {
         unsafe {
-            let mut query: isize = 0;
+            let mut query: PDH_HQUERY = PDH_HQUERY::default();
             if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
                 warn!("PdhOpenQueryW failed");
                 return None;
             }
 
-            let mut read_counter: isize = 0;
-            let mut write_counter: isize = 0;
+            let mut read_counter: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut write_counter: PDH_HCOUNTER = PDH_HCOUNTER::default();
 
             let read_path = w!(r"\PhysicalDisk(_Total)\Disk Read Bytes/sec");
             let write_path = w!(r"\PhysicalDisk(_Total)\Disk Write Bytes/sec");

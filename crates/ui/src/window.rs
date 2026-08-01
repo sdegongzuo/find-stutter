@@ -114,7 +114,7 @@ pub fn show_context_menu(
             TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             screen_x,
             screen_y,
-            0,
+            None,
             hwnd,
             None,
         );
@@ -162,7 +162,7 @@ pub fn show_row_kill_menu(window: &slint::Window, x_logical: f32, y_logical: f32
             TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
             screen_x,
             screen_y,
-            0,
+            None,
             hwnd,
             None,
         );
