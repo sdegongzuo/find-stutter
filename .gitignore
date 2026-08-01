@@ -27,3 +27,4 @@ test2.log
 stutter.db-shm
 stutter.db-wal
 *.diag.log
+target-svc-check/
