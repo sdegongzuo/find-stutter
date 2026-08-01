@@ -101,21 +101,21 @@ impl Logger {
                     core_str,
                     s.cpu_freq_mhz,
                     s.mem_usage_percent,
-                    s.mem_used_mb,
-                    s.mem_total_mb,
-                    s.mem_available_mb,
+                    s.mem_used_mb as i64,
+                    s.mem_total_mb as i64,
+                    s.mem_available_mb as i64,
                     s.swap_usage_percent,
-                    s.disk_read_bps,
-                    s.disk_write_bps,
-                    s.net_sent_bps,
-                    s.net_recv_bps,
-                    s.net_sent_total,
-                    s.net_recv_total,
+                    s.disk_read_bps as i64,
+                    s.disk_write_bps as i64,
+                    s.net_sent_bps as i64,
+                    s.net_recv_bps as i64,
+                    s.net_sent_total as i64,
+                    s.net_recv_total as i64,
                     s.gpu_usage,
                     s.cpu_temp,
                     s.gpu_temp,
-                    s.process_count as u64,
-                    s.thread_count as u64,
+                    s.process_count as i64,
+                    s.thread_count as i64,
                 ])?;
             }
         }
@@ -133,7 +133,7 @@ impl Logger {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 event.timestamp.to_rfc3339(),
-                event.duration_ms,
+                event.duration_ms as i64,
                 event.severity.to_string(),
                 causes,
                 snapshot,
@@ -525,7 +525,7 @@ mod tests {
             .unwrap();
         assert_eq!(cpu, 45.5);
 
-        let mem_avail: u64 = logger
+        let mem_avail: i64 = logger
             .conn
             .query_row(
                 "SELECT mem_available_mb FROM samples LIMIT 1",
