@@ -75,6 +75,24 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
     (text, color)
 }
 
+/// 把 bps 速率格式化为自适应单位的可读字符串：数字变大时自动升级
+/// B/s → KB/s → MB/s → GB/s，保持显示紧凑（数字部分右对齐 5 字符）。
+pub fn format_bps(bps: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let v = bps as f64;
+    if v >= GB {
+        format!("{:>5.1} GB/s", v / GB)
+    } else if v >= MB {
+        format!("{:>5.1} MB/s", v / MB)
+    } else if v >= KB {
+        format!("{:>5.1} KB/s", v / KB)
+    } else {
+        format!("{:>5} B/s", bps)
+    }
+}
+
 /// 解析 `#RRGGBB` / `#RRGGBBAA` / `RRGGBB` 颜色字符串为 `slint::Color`。
 /// 解析失败返回 `None`（调用方 fallback 到默认色）。
 ///
@@ -149,22 +167,10 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
             "内存 {:4.1}%",
             s.mem_usage_percent
         )));
-        ui.set_net_send(SharedString::from(format!(
-            "↑ {:>5} KB/s",
-            s.net_sent_bps / 1024
-        )));
-        ui.set_net_recv(SharedString::from(format!(
-            "↓ {:>5} KB/s",
-            s.net_recv_bps / 1024
-        )));
-        ui.set_disk_read(SharedString::from(format!(
-            "R {:>5} KB/s",
-            s.disk_read_bps / 1024
-        )));
-        ui.set_disk_write(SharedString::from(format!(
-            "W {:>5} KB/s",
-            s.disk_write_bps / 1024
-        )));
+        ui.set_net_send(SharedString::from(format!("↑ {}", format_bps(s.net_sent_bps))));
+        ui.set_net_recv(SharedString::from(format!("↓ {}", format_bps(s.net_recv_bps))));
+        ui.set_disk_read(SharedString::from(format!("R {}", format_bps(s.disk_read_bps))));
+        ui.set_disk_write(SharedString::from(format!("W {}", format_bps(s.disk_write_bps))));
         if let Some(g) = s.gpu_usage {
             ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
         }
@@ -222,6 +228,32 @@ mod tests {
     fn format_service_status_no_database() {
         let (text, _) = format_service_status(ServiceHealth::NoDatabase);
         assert!(text.as_str().contains("未注册"));
+    }
+
+    #[test]
+    fn format_bps_auto_upgrades_unit() {
+        // B/s 档：< 1024 不升级
+        assert_eq!(format_bps(0), "    0 B/s");
+        assert_eq!(format_bps(512), "  512 B/s");
+        assert_eq!(format_bps(1023), " 1023 B/s");
+        // KB/s 档：>= 1024 且 < 1024²
+        assert_eq!(format_bps(1024), "  1.0 KB/s");
+        assert_eq!(format_bps(1536), "  1.5 KB/s");
+        assert_eq!(format_bps(1024 * 1024 - 1), "1024.0 KB/s");
+        // MB/s 档：>= 1024² 且 < 1024³
+        assert_eq!(format_bps(1024 * 1024), "  1.0 MB/s");
+        assert_eq!(format_bps(5 * 1024 * 1024), "  5.0 MB/s");
+        // GB/s 档：>= 1024³
+        assert_eq!(format_bps(3 * 1024 * 1024 * 1024), "  3.0 GB/s");
+    }
+
+    #[test]
+    fn format_bps_monotonic() {
+        // 更大速率不会导致数字宽度爆炸（始终升级单位）
+        assert!(format_bps(1024).contains("KB/s"));
+        assert!(format_bps(1024 * 1024).contains("MB/s"));
+        assert!(format_bps(1024 * 1024 * 1024).contains("GB/s"));
+        assert!(format_bps(10 * 1024 * 1024 * 1024).contains("GB/s"));
     }
 
     #[test]
