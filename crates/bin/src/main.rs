@@ -40,7 +40,12 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        _ => find_stutter_ui::run()?,
+        _ => {
+            // release 下启动 GUI 前解除控制台关联（不弹黑框）；debug 保留控制台便于看日志。
+            // 只对 GUI 分支生效，export / stats 子命令仍需控制台输出，不受影响。
+            find_stutter_ui::window::hide_console_for_gui();
+            find_stutter_ui::run()?
+        }
     }
     Ok(())
 }

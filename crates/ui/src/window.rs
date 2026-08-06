@@ -41,6 +41,27 @@ pub fn extract_hwnd_from(win: &slint::Window) -> Option<HWND> {
     }
 }
 
+/// release 模式下隐藏 GUI 启动时的控制台黑框；debug 保留（方便看日志）。
+///
+/// 实现：`FreeConsole()` 解除当前进程与控制台的关联。选它而不是
+/// `ShowWindow(GetConsoleWindow(), SW_HIDE)` 的原因：从 cmd 启动时
+/// ShowWindow 会把**父 cmd 窗口**一起隐藏掉；FreeConsole 只影响本进程，
+/// cmd 窗口不受影响。
+///
+/// 注意：仅主 GUI 入口（crates/bin 无子命令分支）在 release 下调用；
+/// CLI 子命令（export / stats）需要控制台输出，**不得**调用本函数。
+#[cfg(windows)]
+pub fn hide_console_for_gui() {
+    if !cfg!(debug_assertions) {
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn hide_console_for_gui() {}
+
 /// 让窗口不出现在 **Windows 系统任务栏**（工具窗口样式 `WS_EX_TOOLWINDOW`）。
 ///
 /// 悬浮窗 / 进程详情页 / 任务栏窗口都适用：设置后窗口不占系统任务栏按钮，
