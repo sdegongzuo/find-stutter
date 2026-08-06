@@ -51,6 +51,10 @@ click_through = false
 auto_start_service = true
 # P2: 任务栏嵌入模式（伪任务栏窗口，横向窄条显示在屏幕底部，可拖动到任务栏位置）
 taskbar = false
+# 进程详情页：CPU/内存使用率超过该百分比（%）的行高亮标红
+process_highlight_pct = 30.0
+# 进程详情页：自动刷新间隔（毫秒），标题栏下拉可选 500/1000/2000/5000/30000
+process_refresh_ms = 30000
 
 [storage]
 # SQLite 数据库文件路径

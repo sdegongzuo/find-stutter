@@ -128,6 +128,9 @@ pub fn run() -> anyhow::Result<()> {
     //      「进程详情」→ 按需创建进程列表窗口 + sysinfo 采集一次快照
     let weak_ui_for_menu = ui.as_weak();
     let state_for_menu = state.clone();
+    // 进程详情页配置（高亮阈值 + 刷新间隔；由菜单闭包捕获）
+    let proc_highlight_pct = config.ui.process_highlight_pct;
+    let proc_refresh_ms = config.ui.process_refresh_ms;
     // 进程列表窗口：首次打开时创建，之后复用（每次打开都重新采集刷新）
     let process_win: std::sync::Arc<
         std::sync::Mutex<Option<std::sync::Arc<crate::process_list::ProcessListWindow>>>,
@@ -155,7 +158,10 @@ pub fn run() -> anyhow::Result<()> {
                 Some(crate::window::NativeMenuCmd::ProcessList) => {
                     let mut guard = process_win_for_menu.lock().unwrap();
                     if guard.is_none() {
-                        match crate::process_list::ProcessListWindow::show() {
+                        match crate::process_list::ProcessListWindow::show(
+                            proc_highlight_pct,
+                            proc_refresh_ms,
+                        ) {
                             Ok(w) => {
                                 log::info!("进程详情窗口已打开");
                                 *guard = Some(std::sync::Arc::new(w));

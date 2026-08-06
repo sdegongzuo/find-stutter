@@ -187,6 +187,11 @@ pub fn show_context_menu(
             None,
         );
         let _ = DestroyMenu(hmenu);
+        // TrackPopupMenu 的模态循环会"吞掉"鼠标按键弹起事件（up 都发给了
+        // 菜单窗口），悬浮窗收不到 → Slint TouchArea 残留 pressed 状态 →
+        // 菜单关闭后移动鼠标被误判为拖动（悬浮窗跟着鼠标走）。
+        // 这里释放捕获 + 合成一次右键弹起，复位 winit/Slint 的鼠标状态机。
+        reset_mouse_state_after_menu(hwnd);
 
         match cmd.0 as u32 {
             1 => Some(NativeMenuCmd::TogglePause),
@@ -207,25 +212,52 @@ pub enum RowMenuCmd {
     Kill = 2,
 }
 
-/// 行右键菜单（进程详情列表）：顶部标题行 + 「打开文件所在的位置」+「停止进程」。
+/// 鼠标右键虚拟键码（`GetAsyncKeyState` 检测右键按下 / 释放用）。
+/// 模块级常量：`show_row_menu_once` 与 `wait_rbutton_release` 共用。
+pub const VK_RBUTTON: i32 = 0x02;
+
+/// 行右键菜单单次弹出的结果（用单一枚举让「关闭方式」只能与命令互斥，
+/// 编译器保证不出现 `(None, Command)` 这类非法组合）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowMenuOutcome {
+    /// 用户选择了命令（打开位置 / 停止进程）
+    Command(RowMenuCmd),
+    /// 菜单被**右键**点击外部关闭（用户在别处又按了右键 → 可能想切换进程，
+    /// 调用方应命中测试鼠标新位置，若在另一行则重新弹出）
+    Switch,
+    /// 左键点击外部 / Esc 关闭（结束菜单流程）
+    Cancelled,
+}
+
+/// 弹一次行右键菜单（顶部标题行 + 「打开文件所在的位置」+「停止进程」），
+/// **不循环**。返回 [`RowMenuOutcome`]：
 ///
-/// - `pid`：行对应的进程 PID（服务条目 pid=0，无法定位文件 → 禁用「打开文件所在的位置」）
-/// - `name`：行显示名（用于顶部标题，e.g. `wps.exe (PID 33864)`）
+/// - `Command(cmd)`：用户选择了菜单项
+/// - `Switch`：菜单被**右键**点击外部关闭 → 连续右键切换流程
+/// - `Cancelled`：左键/Esc 关闭，流程结束
 ///
 /// 弹出位置用 `GetCursorPos()` 取**鼠标当前屏幕坐标**（右键按下瞬间光标就在
 /// 目标行上），不依赖 Slint 坐标换算——`mouse-x` 是行内局部坐标（丢 ListView
 /// 偏移），`absolute-position` 是 item 布局位置（ListView 池化复用 + 绑定缓存，
 /// 连续右键不同行可能拿到旧值），两者都不可靠。
 ///
-/// 返回用户选择的命令；点空白 / Esc / 标题行返回 `None`。
-pub fn show_row_menu(window: &slint::Window, pid: i32, name: &str) -> Option<RowMenuCmd> {
+/// 右键关闭检测：`TrackPopupMenu` 前先调 `GetAsyncKeyState(VK_RBUTTON)` 清除
+/// 历史位（低位 1 = 自上次调用以来被按下过），模态结束后再读一次：
+/// 模态期间若发生右键按下，低位必为 1（user32 菜单循环走 GetKeyState，
+/// 不清除 GetAsyncKeyState 的历史位）。
+pub fn show_row_menu_once(
+    window: &slint::Window,
+    pid: i32,
+    name: &str,
+) -> RowMenuOutcome {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenu, MF_GRAYED,
         MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     };
 
     let Some(hwnd) = extract_hwnd_from(window) else {
-        return None;
+        return RowMenuOutcome::Cancelled;
     };
 
     unsafe {
@@ -233,7 +265,7 @@ pub fn show_row_menu(window: &slint::Window, pid: i32, name: &str) -> Option<Row
             Ok(m) => m,
             Err(e) => {
                 log::warn!("CreatePopupMenu 失败: {}", e);
-                return None;
+                return RowMenuOutcome::Cancelled;
             }
         };
         // 顶部标题行：显示 `{name} (PID {pid})`，灰色不可点击
@@ -255,6 +287,8 @@ pub fn show_row_menu(window: &slint::Window, pid: i32, name: &str) -> Option<Row
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
 
+        // 清除 GetAsyncKeyState 历史位：确保下面的低位检测只反映模态期间
+        let _ = GetAsyncKeyState(VK_RBUTTON);
         let cmd = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
@@ -264,12 +298,63 @@ pub fn show_row_menu(window: &slint::Window, pid: i32, name: &str) -> Option<Row
             hwnd,
             None,
         );
+        // 模态期间是否发生过右键按下（历史位，低位 1）
+        let right_clicked_away = GetAsyncKeyState(VK_RBUTTON) & 0x0001 != 0;
         let _ = DestroyMenu(hmenu);
+        // TrackPopupMenu 的模态循环会"吞掉"up 事件 → 复位 winit/Slint 鼠标状态机
+        reset_mouse_state_after_menu(hwnd);
 
         match cmd.0 as u32 {
-            1 => Some(RowMenuCmd::OpenLocation),
-            2 => Some(RowMenuCmd::Kill),
-            _ => None,
+            1 => RowMenuOutcome::Command(RowMenuCmd::OpenLocation),
+            2 => RowMenuOutcome::Command(RowMenuCmd::Kill),
+            _ if right_clicked_away => RowMenuOutcome::Switch,
+            _ => RowMenuOutcome::Cancelled,
+        }
+    }
+}
+
+/// `TrackPopupMenu` 的模态消息循环会消费鼠标按键弹起事件，导致 Slint
+/// TouchArea 残留 `pressed` 状态（菜单关闭后移动鼠标被误判为拖动）。
+///
+/// 菜单返回后调用：释放鼠标捕获 + 向窗口合成一次右键弹起事件，
+/// 复位 winit/Slint 的鼠标状态机，使悬浮窗在菜单关闭后保持原地不动。
+fn reset_mouse_state_after_menu(hwnd: HWND) {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, GetCursorPos, PostMessageW, WM_RBUTTONUP,
+    };
+    unsafe {
+        let _ = ReleaseCapture();
+        // 取鼠标当前位置（屏幕坐标）→ 转窗口客户区坐标，作为合成事件的坐标，
+        // 避免 winit 解析到 (0,0) 造成光标位置跳变
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        if GetCursorPos(&mut pt).is_ok() {
+            let _ = ScreenToClient(hwnd, &mut pt);
+            // 光标可能在窗口外（ScreenToClient 得负坐标）→ clamp 进客户区，
+            // 防止负值被 `as u32` 包装成超大 LPARAM
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            if GetClientRect(hwnd, &mut rc).is_ok() {
+                let cx = pt.x.clamp(0, rc.right.saturating_sub(1).max(0));
+                let cy = pt.y.clamp(0, rc.bottom.saturating_sub(1).max(0));
+                let lparam = (((cy as u32) & 0xffff) << 16) | ((cx as u32) & 0xffff);
+                let _ = PostMessageW(Some(hwnd), WM_RBUTTONUP, WPARAM(0), LPARAM(lparam as isize));
+            }
+        }
+    }
+}
+
+/// 等待用户松开右键（连续切换时，若用户按住右键移动，菜单关闭后先等释放再重弹）。
+///
+/// 最多等 1 秒，防止异常情况下死循环。返回时右键必定处于释放状态。
+pub fn wait_rbutton_release() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    let mut waited = 0u32;
+    unsafe {
+        while ((GetAsyncKeyState(VK_RBUTTON) as u16) & 0x8000) != 0 && waited < 100 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
         }
     }
 }

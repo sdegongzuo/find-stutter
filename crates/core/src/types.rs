@@ -176,9 +176,19 @@ pub struct UiConfig {
     /// P2：任务栏嵌入模式（伪任务栏窗口，显示在屏幕底部，可拖动到任务栏位置）
     #[serde(default)]
     pub taskbar: bool,
+    /// 进程详情页：CPU/内存使用率超过该百分比（%）的行高亮标红（默认 30）
+    #[serde(default = "default_highlight_pct")]
+    pub process_highlight_pct: f32,
+    /// 进程详情页：自动刷新间隔（毫秒）。默认 30000 = 30 秒
+    #[serde(default = "default_process_refresh_ms")]
+    pub process_refresh_ms: u64,
 }
 
 fn default_true() -> bool { true }
+
+fn default_highlight_pct() -> f32 { 30.0 }
+
+fn default_process_refresh_ms() -> u64 { 30_000 }
 
 impl Default for UiConfig {
     fn default() -> Self {
@@ -197,6 +207,8 @@ impl Default for UiConfig {
             click_through: false,
             auto_start_service: true,
             taskbar: false,
+            process_highlight_pct: default_highlight_pct(),
+            process_refresh_ms: default_process_refresh_ms(),
         }
     }
 }
