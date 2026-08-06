@@ -260,7 +260,7 @@ struct ProcessRowData {
 component ProcessRow inherits Rectangle {
     in property <ProcessRowData> data;
     callback group-toggle(string);
-    callback context-menu(int, length, length);
+    callback context-menu(int, string, length, length);
     height: 26px;
 
     // 行分隔线
@@ -280,7 +280,8 @@ component ProcessRow inherits Rectangle {
         }
         pointer-event(event) => {
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
-                root.context-menu(root.data.pid, self.mouse-x, self.mouse-y);
+                // 传 absolute-position（物理屏幕坐标）+ 进程名给 Rust 端做菜单
+                root.context-menu(root.data.pid, root.data.name, self.absolute-position.x, self.absolute-position.y);
             }
         }
     }
@@ -404,8 +405,8 @@ export component ProcessList inherits Window {
     callback sort-requested(string);
     // 聚合父节点展开/收起（传 group-key）
     callback group-toggle(string);
-    // 行右键菜单（pid, 窗口内逻辑坐标）
-    callback row-context-menu(int, length, length);
+    // 行右键菜单（pid, 进程名, 物理屏幕坐标）
+    callback row-context-menu(int, string, length, length);
     // 右下角 resize 手柄：传 dx/dy（逻辑像素）
     callback resize-requested(length, length);
 
@@ -482,7 +483,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("pid"); } }
                     Text {
-                        text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -493,7 +494,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("name"); } }
                     Text {
-                        text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -504,7 +505,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("cpu"); } }
                     Text {
-                        text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -515,7 +516,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("mem"); } }
                     Text {
-                        text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -526,7 +527,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("disk"); } }
                     Text {
-                        text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -537,7 +538,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("net"); } }
                     Text {
-                        text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -548,7 +549,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("nettotal"); } }
                     Text {
-                        text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -559,7 +560,7 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("status"); } }
                     Text {
-                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : " ⇅");
+                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -582,7 +583,7 @@ export component ProcessList inherits Window {
                 for row in root.process-model : ProcessRow {
                     data: row;
                     group-toggle(key) => { root.group-toggle(key); }
-                    context-menu(pid, x, y) => { root.row-context-menu(pid, x, y); }
+                    context-menu(pid, name, screen-x, screen-y) => { root.row-context-menu(pid, name, screen-x, screen-y); }
                 }
             }
         }

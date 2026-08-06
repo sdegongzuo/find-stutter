@@ -480,10 +480,19 @@ pub fn service_map() -> std::collections::HashMap<u32, Vec<String>> {
 }
 
 fn format_bytes(b: u64) -> String {
-    if b >= 1024 * 1024 {
-        format!("{:.1}M", b as f64 / (1024.0 * 1024.0))
-    } else if b >= 1024 {
-        format!("{:.1}K", b as f64 / 1024.0)
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    const TB: f64 = GB * 1024.0;
+    let v = b as f64;
+    if v >= TB {
+        format!("{:.2}T", v / TB)
+    } else if v >= GB {
+        format!("{:.1}G", v / GB)
+    } else if v >= MB {
+        format!("{:.1}M", v / MB)
+    } else if v >= KB {
+        format!("{:.1}K", v / KB)
     } else {
         format!("{}B", b)
     }
@@ -788,30 +797,46 @@ impl ProcessListWindow {
             }
         });
 
-        // 行右键菜单 → 「打开文件所在的位置」/「停止进程」（原生菜单）
+        // 行右键菜单 → 顶部标题 + 「打开文件所在的位置」/「停止进程」（原生菜单）
+        // 坐标：来自 Slint TouchArea.absolute-position（window-absolute 物理坐标，
+        // 物理像素；Slint 1.x CHANGELOG 原文 "for computing window-absolute positions"），
+        // 在 Rust 端再 + window.position() 转换为屏幕坐标。
         let weak_rowmenu = ui.as_weak();
-        ui.on_row_context_menu(move |pid: i32, x: f32, y: f32| {
-            if let Some(ui) = weak_rowmenu.upgrade() {
-                match crate::window::show_row_menu(ui.window(), pid, x, y) {
-                    Some(crate::window::RowMenuCmd::Kill) => {
-                        let ok = kill_process(pid as u32);
-                        log::info!(
-                            "停止进程 {} {}",
-                            pid,
-                            if ok { "成功" } else { "失败（权限不足或进程已退出）" }
-                        );
-                        // 下一次刷新自动更新
-                    }
-                    Some(crate::window::RowMenuCmd::OpenLocation) => {
-                        match open_process_location(pid as u32) {
-                            Ok(()) => log::info!("打开文件所在的位置 PID {} 成功", pid),
-                            Err(e) => log::warn!("打开文件所在的位置 PID {} 失败: {}", pid, e),
+        ui.on_row_context_menu(
+            move |pid: i32,
+                  name: slint::SharedString,
+                  abs_x: f32,
+                  abs_y: f32| {
+                if let Some(ui) = weak_rowmenu.upgrade() {
+                    match crate::window::show_row_menu(
+                        ui.window(),
+                        pid,
+                        name.as_str(),
+                        abs_x as i32,
+                        abs_y as i32,
+                    ) {
+                        Some(crate::window::RowMenuCmd::Kill) => {
+                            let ok = kill_process(pid as u32);
+                            log::info!(
+                                "停止进程 {} {}",
+                                pid,
+                                if ok { "成功" } else { "失败（权限不足或进程已退出）" }
+                            );
+                            // 下一次刷新自动更新
                         }
+                        Some(crate::window::RowMenuCmd::OpenLocation) => {
+                            match open_process_location(pid as u32) {
+                                Ok(()) => log::info!("打开文件所在的位置 PID {} 成功", pid),
+                                Err(e) => {
+                                    log::warn!("打开文件所在的位置 PID {} 失败: {}", pid, e)
+                                }
+                            }
+                        }
+                        None => {} // 用户取消（点空白 / Esc）
                     }
-                    None => {} // 用户取消（点空白 / Esc）
                 }
-            }
-        });
+            },
+        );
 
         // 聚合父节点点击 → 展开/收起 + 用缓存重绘
         let expanded_for_cb = expanded.clone();
@@ -1145,6 +1170,17 @@ mod tests {
         assert_eq!(format_bytes(0), "0B");
         assert_eq!(format_bytes(2048), "2.0K");
         assert_eq!(format_bytes(3 * 1024 * 1024), "3.0M");
+    }
+
+    #[test]
+    fn format_rate_units_auto_upgrade_to_gb_tb() {
+        // 累计网络 / 磁盘等大字节场景：>= 1GB 升 G，>= 1TB 升 T
+        let gb = 1024_u64 * 1024 * 1024;
+        let tb = gb * 1024;
+        assert_eq!(format_bytes(gb + 512 * 1024 * 1024), "1.5G");
+        assert_eq!(format_bytes(900 * gb), "900.0G");
+        assert_eq!(format_bytes(tb), "1.00T");
+        assert_eq!(format_bytes(2 * tb + 100 * gb), "2.10T");
     }
 
     #[test]

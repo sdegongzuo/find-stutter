@@ -207,27 +207,30 @@ pub enum RowMenuCmd {
     Kill = 2,
 }
 
-/// 行右键菜单（进程详情列表）：「打开文件所在的位置」+「停止进程」。
+/// 行右键菜单（进程详情列表）：顶部标题行 + 「打开文件所在的位置」+「停止进程」。
 ///
 /// - `pid`：行对应的进程 PID（服务条目 pid=0，无法定位文件 → 禁用「打开文件所在的位置」）
-/// - 坐标同为窗口内逻辑坐标，换算屏幕坐标弹出
+/// - `name`：行显示名（用于顶部标题，e.g. `wps.exe (PID 33864)`）
+/// - `abs_x` / `abs_y`：`TouchArea.absolute-position` 提供的**窗口内**物理坐标
+///   （Slint 1.x 文档原话 "window-absolute positions"）；加上 `window.position()` 才
+///   是屏幕坐标（避免菜单出现在老远的地方）。
 ///
-/// 返回用户选择的命令；点空白 / Esc 返回 `None`。
+/// 返回用户选择的命令；点空白 / Esc / 标题行返回 `None`。
 pub fn show_row_menu(
     window: &slint::Window,
     pid: i32,
-    x_logical: f32,
-    y_logical: f32,
+    name: &str,
+    abs_x: i32,
+    abs_y: i32,
 ) -> Option<RowMenuCmd> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_GRAYED, MF_STRING,
-        TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_GRAYED, MF_SEPARATOR,
+        MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     };
 
     let Some(hwnd) = extract_hwnd_from(window) else {
         return None;
     };
-    let scale = window.scale_factor();
 
     unsafe {
         let hmenu = match CreatePopupMenu() {
@@ -237,6 +240,11 @@ pub fn show_row_menu(
                 return None;
             }
         };
+        // 顶部标题行：显示 `{name} (PID {pid})`，灰色不可点击
+        let title = format!("{} (PID {})", name, pid);
+        let _ = AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 0, wide(&title));
+        // 分隔线
+        let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, windows::core::PCWSTR(std::ptr::null()));
         // 服务条目（pid<=0）没有可定位的可执行文件 → 置灰「打开文件所在的位置」
         let locate_flags = if pid <= 0 { MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(
@@ -247,9 +255,10 @@ pub fn show_row_menu(
         );
         let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
 
+        // Slint absolute-position 是窗口内物理坐标；加窗口位置得到屏幕坐标
         let pos = window.position();
-        let screen_x = pos.x + (x_logical * scale) as i32;
-        let screen_y = pos.y + (y_logical * scale) as i32;
+        let screen_x = pos.x + abs_x;
+        let screen_y = pos.y + abs_y;
 
         let cmd = TrackPopupMenu(
             hmenu,
