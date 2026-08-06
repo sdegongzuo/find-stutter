@@ -28,3 +28,4 @@ stutter.db-shm
 stutter.db-wal
 *.diag.log
 target-svc-check/
+screenshot.png
