@@ -38,8 +38,25 @@ impl TaskbarWindow {
             }
         });
         ui.show()?;
+        // 任务栏窗口也不显示在 Windows 系统任务栏（工具窗口样式，
+        // 避免在系统任务栏上再占一个按钮，与「伪任务栏」设计一致）
+        crate::window::ensure_tool_window_for(ui.window());
+        // winit 在 show 后会重算扩展样式（覆盖 WS_EX_TOOLWINDOW / 加回
+        // WS_EX_APPWINDOW），延迟 500ms 再补一次；长期由 Overlay 的
+        // 1Hz tick 守护（lib.rs）。
+        let weak = ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(500), move || {
+            if let Some(ui) = weak.upgrade() {
+                crate::window::ensure_tool_window_for(ui.window());
+            }
+        });
         position_at_bottom_center(&ui);
         Ok(Self { ui })
+    }
+
+    /// 底层 Slint 窗口（供 tick 守护重新设置任务栏样式）。
+    pub fn window(&self) -> &slint::Window {
+        self.ui.window()
     }
 
     /// 把 OverlayState 的最新指标推给任务栏窗口。

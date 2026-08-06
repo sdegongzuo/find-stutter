@@ -330,6 +330,55 @@ pub fn kill_process(pid: u32) -> bool {
     }
 }
 
+/// 打开进程可执行文件所在的位置（任务管理器「打开文件所在的位置」）。
+///
+/// 流程：`QueryFullProcessImageNameW` 取完整路径 → 启动 `explorer /select,<path>`
+/// 打开资源管理器并选中该文件。失败（权限不足 / 进程已退出 / 无法启动资源管理器）
+/// 返回 `Err`。
+pub fn open_process_location(pid: u32) -> anyhow::Result<()> {
+    let path = process_exe_path(pid).ok_or_else(|| {
+        anyhow::anyhow!("无法获取进程 {} 的可执行文件路径（权限不足或进程已退出）", pid)
+    })?;
+    log::info!("打开文件所在的位置: {} (PID {})", path, pid);
+    // explorer 非标准解析命令行参数：把整个 `/select,"path"` 作为单个参数传入，
+    // 路径含空格也能正确选中目标文件。
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,\"{}\"", path))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("启动资源管理器失败: {}", e))
+}
+
+/// 查询进程可执行文件完整路径（`QueryFullProcessImageNameW`，Win32 格式如
+/// `C:\Windows\System32\notepad.exe`）。失败（权限不足 / 进程已退出）返回 `None`。
+#[cfg(windows)]
+fn process_exe_path(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buf = [0u16; 32 * 1024];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32, // Win32 格式：返回 C:\ 形式的路径
+            windows::core::PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        result.ok()?;
+        Some(String::from_utf16_lossy(&buf[..len as usize]))
+    }
+}
+
+#[cfg(not(windows))]
+fn process_exe_path(_pid: u32) -> Option<String> {
+    None
+}
+
 /// 读进程 I/O 计数器（`GetProcessIoCounters`）。
 #[cfg(windows)]
 fn process_io_counters(pid: u32) -> Option<windows::Win32::System::Threading::IO_COUNTERS> {
@@ -739,18 +788,27 @@ impl ProcessListWindow {
             }
         });
 
-        // 行右键菜单 → 「停止进程」（原生菜单）
+        // 行右键菜单 → 「打开文件所在的位置」/「停止进程」（原生菜单）
         let weak_rowmenu = ui.as_weak();
         ui.on_row_context_menu(move |pid: i32, x: f32, y: f32| {
             if let Some(ui) = weak_rowmenu.upgrade() {
-                if crate::window::show_row_kill_menu(ui.window(), x, y) {
-                    let ok = kill_process(pid as u32);
-                    log::info!(
-                        "停止进程 {} {}",
-                        pid,
-                        if ok { "成功" } else { "失败（权限不足或进程已退出）" }
-                    );
-                    // 下一次刷新自动更新
+                match crate::window::show_row_menu(ui.window(), pid, x, y) {
+                    Some(crate::window::RowMenuCmd::Kill) => {
+                        let ok = kill_process(pid as u32);
+                        log::info!(
+                            "停止进程 {} {}",
+                            pid,
+                            if ok { "成功" } else { "失败（权限不足或进程已退出）" }
+                        );
+                        // 下一次刷新自动更新
+                    }
+                    Some(crate::window::RowMenuCmd::OpenLocation) => {
+                        match open_process_location(pid as u32) {
+                            Ok(()) => log::info!("打开文件所在的位置 PID {} 成功", pid),
+                            Err(e) => log::warn!("打开文件所在的位置 PID {} 失败: {}", pid, e),
+                        }
+                    }
+                    None => {} // 用户取消（点空白 / Esc）
                 }
             }
         });
@@ -791,6 +849,17 @@ impl ProcessListWindow {
         });
 
         ui.show()?;
+        // 进程详情页同样不出现在 Windows 系统任务栏（工具窗口样式）
+        crate::window::ensure_tool_window_for(ui.window());
+        // winit 在 show 后会重算扩展样式（覆盖 WS_EX_TOOLWINDOW / 加回
+        // WS_EX_APPWINDOW），延迟 500ms 再补一次；长期由 Overlay 的
+        // 1Hz tick 守护（lib.rs）。
+        let weak_toolwin = ui.as_weak();
+        slint::Timer::single_shot(Duration::from_millis(500), move || {
+            if let Some(ui) = weak_toolwin.upgrade() {
+                crate::window::ensure_tool_window_for(ui.window());
+            }
+        });
 
         // 30s 自动刷新：重采样 + 重绘
         let weak_tick = ui.as_weak();
@@ -844,6 +913,8 @@ impl ProcessListWindow {
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
             let _ = self.ui.show();
+            // show 可能触发 winit 重算样式 → 重新确保不在任务栏显示
+            crate::window::ensure_tool_window_for(self.ui.window());
         }
         {
             let mut s = self.sampler.lock().unwrap();
@@ -851,6 +922,11 @@ impl ProcessListWindow {
             *self.cache.lock().unwrap() = rows;
         }
         render(&self.ui, &self.cache, &self.sort, &self.search, &self.expanded, *self.nb_cpus.lock().unwrap());
+    }
+
+    /// 底层 Slint 窗口（供 tick 守护重新设置任务栏样式）。
+    pub fn window(&self) -> &slint::Window {
+        self.ui.window()
     }
 }
 

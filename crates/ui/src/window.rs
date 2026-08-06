@@ -14,7 +14,7 @@ use slint::ComponentHandle;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GWL_EXSTYLE, SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WS_EX_TRANSPARENT,
+    SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
 };
 
 use crate::Overlay;
@@ -38,6 +38,53 @@ pub fn extract_hwnd_from(win: &slint::Window) -> Option<HWND> {
     match raw.as_raw() {
         RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut _)),
         _ => None,
+    }
+}
+
+/// 让窗口不出现在 **Windows 系统任务栏**（工具窗口样式 `WS_EX_TOOLWINDOW`）。
+///
+/// 悬浮窗 / 进程详情页 / 任务栏窗口都适用：设置后窗口不占系统任务栏按钮，
+/// 也不会出现在 Alt-Tab 切换列表里。
+///
+/// ## 为什么是「ensure」而不是「set once」
+///
+/// winit（Slint 的 Windows backend）在窗口 show / 状态变化时会**重新计算扩展
+/// 样式**（`update_ex_style`），把我们手动设置的位清掉，且默认会加回
+/// `WS_EX_APPWINDOW`（0x40000，强制显示在任务栏）。实测：show() 后立即设置
+/// 无效（ExStyle 仍是 0x40118）。
+///
+/// 因此本函数做两件事：
+/// 1. 置位 `WS_EX_TOOLWINDOW`（0x80）
+/// 2. 清除 `WS_EX_APPWINDOW`（0x40000）
+///
+/// 调用方应**周期性重复调用**（Overlay 的 1Hz tick 守护三个窗口），
+/// 确保 winit 覆盖后 1 秒内自动恢复。函数幂等，无样式变化时不重绘。
+pub fn ensure_tool_window_for(win: &slint::Window) {
+    if let Some(hwnd) = extract_hwnd_from(win) {
+        ensure_tool_window(hwnd);
+    }
+}
+
+/// 设置 `WS_EX_TOOLWINDOW` + 清除 `WS_EX_APPWINDOW`（纯位运算，可单测）。
+fn ensure_tool_window(hwnd: HWND) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let tool = WS_EX_TOOLWINDOW.0 as isize;
+        let appwin = WS_EX_APPWINDOW.0 as isize;
+        let new_style = (style | tool) & !appwin;
+        if new_style != style {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
+            // 触发重绘使样式生效
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
     }
 }
 
@@ -130,16 +177,34 @@ pub fn show_context_menu(
     }
 }
 
-/// 行右键菜单（进程详情列表）：仅「停止进程」。
-/// 返回 `true` = 用户选择了停止。坐标同为窗口内逻辑坐标，换算屏幕坐标弹出。
-pub fn show_row_kill_menu(window: &slint::Window, x_logical: f32, y_logical: f32) -> bool {
+/// 进程详情列表行右键菜单命令。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowMenuCmd {
+    /// 打开进程可执行文件所在位置（资源管理器打开并选中该文件）
+    OpenLocation = 1,
+    /// 停止进程
+    Kill = 2,
+}
+
+/// 行右键菜单（进程详情列表）：「打开文件所在的位置」+「停止进程」。
+///
+/// - `pid`：行对应的进程 PID（服务条目 pid=0，无法定位文件 → 禁用「打开文件所在的位置」）
+/// - 坐标同为窗口内逻辑坐标，换算屏幕坐标弹出
+///
+/// 返回用户选择的命令；点空白 / Esc 返回 `None`。
+pub fn show_row_menu(
+    window: &slint::Window,
+    pid: i32,
+    x_logical: f32,
+    y_logical: f32,
+) -> Option<RowMenuCmd> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_NONOTIFY,
-        TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_GRAYED, MF_STRING,
+        TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     };
 
     let Some(hwnd) = extract_hwnd_from(window) else {
-        return false;
+        return None;
     };
     let scale = window.scale_factor();
 
@@ -148,10 +213,18 @@ pub fn show_row_kill_menu(window: &slint::Window, x_logical: f32, y_logical: f32
             Ok(m) => m,
             Err(e) => {
                 log::warn!("CreatePopupMenu 失败: {}", e);
-                return false;
+                return None;
             }
         };
-        let _ = AppendMenuW(hmenu, MF_STRING, 1, wide("停止进程"));
+        // 服务条目（pid<=0）没有可定位的可执行文件 → 置灰「打开文件所在的位置」
+        let locate_flags = if pid <= 0 { MF_GRAYED } else { MF_STRING };
+        let _ = AppendMenuW(
+            hmenu,
+            locate_flags,
+            RowMenuCmd::OpenLocation as usize,
+            wide("打开文件所在的位置"),
+        );
+        let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
 
         let pos = window.position();
         let screen_x = pos.x + (x_logical * scale) as i32;
@@ -167,7 +240,12 @@ pub fn show_row_kill_menu(window: &slint::Window, x_logical: f32, y_logical: f32
             None,
         );
         let _ = DestroyMenu(hmenu);
-        cmd.0 as u32 == 1
+
+        match cmd.0 as u32 {
+            1 => Some(RowMenuCmd::OpenLocation),
+            2 => Some(RowMenuCmd::Kill),
+            _ => None,
+        }
     }
 }
 
@@ -257,9 +335,44 @@ mod tests {
         assert_eq!(toggle_transparent_style(TRANSPARENT, false), 0);
     }
 
+    // ===== WS_EX_TOOLWINDOW（不在系统任务栏显示）=====
+
+    /// WS_EX_TOOLWINDOW = 0x00000080，WS_EX_APPWINDOW = 0x00040000
+    const TOOLWINDOW: isize = 0x80;
+    const APPWINDOW: isize = 0x40000;
+
+    /// 模拟 ensure_tool_window 的位逻辑：置 TOOLWINDOW + 清 APPWINDOW + 保留其他
+    #[test]
+    fn tool_window_sets_bit_and_clears_appwindow() {
+        let style = APPWINDOW | 0x1000; // winit 默认：APPWINDOW + 一些其他样式
+        let new = (style | TOOLWINDOW) & !APPWINDOW;
+        assert_ne!(new & TOOLWINDOW, 0);
+        assert_eq!(new & APPWINDOW, 0);
+        assert_ne!(new & 0x1000, 0); // 不破坏其他位
+    }
+
+    /// 已设置且无 APPWINDOW 时幂等（ensure 里 `new_style != style` 才改）
+    #[test]
+    fn tool_window_idempotent_when_already_clean() {
+        let style = TOOLWINDOW | 0x1000; // 无 APPWINDOW
+        let new = (style | TOOLWINDOW) & !APPWINDOW;
+        assert_eq!(new, style);
+    }
+
+    /// 典型 winit 初始样式（0x40118）应判定为需要修改
+    #[test]
+    fn tool_window_detects_winit_default_needs_fix() {
+        let style = 0x40118; // 实测 winit 默认：APPWINDOW|WINDOWEDGE|TOPMOST|ACCEPTFILES
+        let new = (style | TOOLWINDOW) & !APPWINDOW;
+        assert_ne!(new, style); // APPWINDOW 被清除 → 需要修改
+        assert_eq!(new & APPWINDOW, 0);
+        assert_ne!(new & TOOLWINDOW, 0);
+        assert_eq!(new & 0x100, 0x100); // WINDOWEDGE 保留
+    }
+
     // ===== NativeMenuCmd（右键原生菜单命令）=====
 
-    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3）
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3/4）
     #[test]
     fn native_menu_cmd_ids_stable() {
         assert_eq!(NativeMenuCmd::TogglePause as u32, 1);
@@ -289,6 +402,29 @@ mod tests {
         assert_eq!(map(2), Some(NativeMenuCmd::ToggleClickThrough));
         assert_eq!(map(3), Some(NativeMenuCmd::Quit));
         assert_eq!(map(4), Some(NativeMenuCmd::ProcessList));
+        assert_eq!(map(0), None); // 用户取消
+        assert_eq!(map(99), None);
+    }
+
+    // ===== RowMenuCmd（进程详情行右键菜单命令）=====
+
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2）
+    #[test]
+    fn row_menu_cmd_ids_stable() {
+        assert_eq!(RowMenuCmd::OpenLocation as u32, 1);
+        assert_eq!(RowMenuCmd::Kill as u32, 2);
+    }
+
+    /// 验证：命令码到枚举的映射（show_row_menu 的返回逻辑）
+    #[test]
+    fn row_menu_cmd_from_trackpopup_value() {
+        let map = |v: u32| match v {
+            1 => Some(RowMenuCmd::OpenLocation),
+            2 => Some(RowMenuCmd::Kill),
+            _ => None,
+        };
+        assert_eq!(map(1), Some(RowMenuCmd::OpenLocation));
+        assert_eq!(map(2), Some(RowMenuCmd::Kill));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
     }

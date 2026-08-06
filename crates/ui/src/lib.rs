@@ -118,6 +118,10 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
     ui.show()?;
+    // 3a) 悬浮窗不显示在 Windows 系统任务栏（WS_EX_TOOLWINDOW 工具窗口样式）；
+    //     注意：winit 在 show 后会重算扩展样式覆盖手动设置，所以这里先设一次，
+    //     再由下方 1Hz tick 每 tick 守护（ensure_tool_window_for 幂等）。
+    crate::window::ensure_tool_window_for(ui.window());
 
     // 3a2) 右键菜单（Win32 原生 TrackPopupMenu，可超出悬浮窗区域）
     //      menu-requested(x, y) = 窗口内逻辑坐标 → 原生菜单 → 执行动作
@@ -212,10 +216,24 @@ pub fn run() -> anyhow::Result<()> {
     let state_for_tick = state.clone();
     let tray_for_tick = tray.clone();
     let taskbar_for_tick = taskbar.clone();
+    let process_win_for_tick = process_win.clone();
     timer.start(
         slint::TimerMode::Repeated,
         POLL_INTERVAL,
         move || {
+            // -2) 守护：三个窗口都不显示在 Windows 系统任务栏。
+            //     winit 在 show / 状态变化时会重算扩展样式（覆盖 WS_EX_TOOLWINDOW、
+            //     加回 WS_EX_APPWINDOW），因此每 tick 复查一次；
+            //     ensure_tool_window_for 幂等，样式无变化时零开销（微秒级）。
+            if let Some(ui) = weak_ui.upgrade() {
+                crate::window::ensure_tool_window_for(ui.window());
+                if let Some(tb) = &taskbar_for_tick {
+                    crate::window::ensure_tool_window_for(tb.window());
+                }
+                if let Some(pw) = process_win_for_tick.lock().unwrap().as_ref() {
+                    crate::window::ensure_tool_window_for(pw.window());
+                }
+            }
             // -1) 消费托盘命令（后台线程投递）
             if let Some(tray) = &tray_for_tick {
                 while let Some(cmd) = tray.try_recv() {
