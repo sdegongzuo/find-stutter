@@ -260,7 +260,7 @@ struct ProcessRowData {
 component ProcessRow inherits Rectangle {
     in property <ProcessRowData> data;
     callback group-toggle(string);
-    callback context-menu(int, string, length, length);
+    callback context-menu(int, string);
     height: 26px;
 
     // 行分隔线
@@ -280,8 +280,8 @@ component ProcessRow inherits Rectangle {
         }
         pointer-event(event) => {
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
-                // 传 absolute-position（物理屏幕坐标）+ 进程名给 Rust 端做菜单
-                root.context-menu(root.data.pid, root.data.name, self.absolute-position.x, self.absolute-position.y);
+                // 只传 PID + 名称；菜单位置由 Rust 端 GetCursorPos() 取鼠标屏幕坐标
+                root.context-menu(root.data.pid, root.data.name);
             }
         }
     }
@@ -405,8 +405,8 @@ export component ProcessList inherits Window {
     callback sort-requested(string);
     // 聚合父节点展开/收起（传 group-key）
     callback group-toggle(string);
-    // 行右键菜单（pid, 进程名, 物理屏幕坐标）
-    callback row-context-menu(int, string, length, length);
+    // 行右键菜单（pid, 进程名；弹出位置由 Rust 端 GetCursorPos() 决定）
+    callback row-context-menu(int, string);
     // 右下角 resize 手柄：传 dx/dy（逻辑像素）
     callback resize-requested(length, length);
 
@@ -583,7 +583,7 @@ export component ProcessList inherits Window {
                 for row in root.process-model : ProcessRow {
                     data: row;
                     group-toggle(key) => { root.group-toggle(key); }
-                    context-menu(pid, name, screen-x, screen-y) => { root.row-context-menu(pid, name, screen-x, screen-y); }
+                    context-menu(pid, name) => { root.row-context-menu(pid, name); }
                 }
             }
         }

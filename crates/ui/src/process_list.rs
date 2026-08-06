@@ -798,45 +798,31 @@ impl ProcessListWindow {
         });
 
         // 行右键菜单 → 顶部标题 + 「打开文件所在的位置」/「停止进程」（原生菜单）
-        // 坐标：来自 Slint TouchArea.absolute-position（window-absolute 物理坐标，
-        // 物理像素；Slint 1.x CHANGELOG 原文 "for computing window-absolute positions"），
-        // 在 Rust 端再 + window.position() 转换为屏幕坐标。
+        // 弹出位置：show_row_menu 内部用 GetCursorPos() 取鼠标屏幕坐标，
+        // 不依赖 Slint 坐标换算（避免 ListView 偏移/缓存导致菜单位置错位）。
         let weak_rowmenu = ui.as_weak();
-        ui.on_row_context_menu(
-            move |pid: i32,
-                  name: slint::SharedString,
-                  abs_x: f32,
-                  abs_y: f32| {
-                if let Some(ui) = weak_rowmenu.upgrade() {
-                    match crate::window::show_row_menu(
-                        ui.window(),
-                        pid,
-                        name.as_str(),
-                        abs_x as i32,
-                        abs_y as i32,
-                    ) {
-                        Some(crate::window::RowMenuCmd::Kill) => {
-                            let ok = kill_process(pid as u32);
-                            log::info!(
-                                "停止进程 {} {}",
-                                pid,
-                                if ok { "成功" } else { "失败（权限不足或进程已退出）" }
-                            );
-                            // 下一次刷新自动更新
-                        }
-                        Some(crate::window::RowMenuCmd::OpenLocation) => {
-                            match open_process_location(pid as u32) {
-                                Ok(()) => log::info!("打开文件所在的位置 PID {} 成功", pid),
-                                Err(e) => {
-                                    log::warn!("打开文件所在的位置 PID {} 失败: {}", pid, e)
-                                }
-                            }
-                        }
-                        None => {} // 用户取消（点空白 / Esc）
+        ui.on_row_context_menu(move |pid: i32, name: slint::SharedString| {
+            if let Some(ui) = weak_rowmenu.upgrade() {
+                match crate::window::show_row_menu(ui.window(), pid, name.as_str()) {
+                    Some(crate::window::RowMenuCmd::Kill) => {
+                        let ok = kill_process(pid as u32);
+                        log::info!(
+                            "停止进程 {} {}",
+                            pid,
+                            if ok { "成功" } else { "失败（权限不足或进程已退出）" }
+                        );
+                        // 下一次刷新自动更新
                     }
+                    Some(crate::window::RowMenuCmd::OpenLocation) => {
+                        match open_process_location(pid as u32) {
+                            Ok(()) => log::info!("打开文件所在的位置 PID {} 成功", pid),
+                            Err(e) => log::warn!("打开文件所在的位置 PID {} 失败: {}", pid, e),
+                        }
+                    }
+                    None => {} // 用户取消（点空白 / Esc）
                 }
-            },
-        );
+            }
+        });
 
         // 聚合父节点点击 → 展开/收起 + 用缓存重绘
         let expanded_for_cb = expanded.clone();

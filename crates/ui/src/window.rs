@@ -211,21 +211,17 @@ pub enum RowMenuCmd {
 ///
 /// - `pid`：行对应的进程 PID（服务条目 pid=0，无法定位文件 → 禁用「打开文件所在的位置」）
 /// - `name`：行显示名（用于顶部标题，e.g. `wps.exe (PID 33864)`）
-/// - `abs_x` / `abs_y`：`TouchArea.absolute-position` 提供的**窗口内**物理坐标
-///   （Slint 1.x 文档原话 "window-absolute positions"）；加上 `window.position()` 才
-///   是屏幕坐标（避免菜单出现在老远的地方）。
+///
+/// 弹出位置用 `GetCursorPos()` 取**鼠标当前屏幕坐标**（右键按下瞬间光标就在
+/// 目标行上），不依赖 Slint 坐标换算——`mouse-x` 是行内局部坐标（丢 ListView
+/// 偏移），`absolute-position` 是 item 布局位置（ListView 池化复用 + 绑定缓存，
+/// 连续右键不同行可能拿到旧值），两者都不可靠。
 ///
 /// 返回用户选择的命令；点空白 / Esc / 标题行返回 `None`。
-pub fn show_row_menu(
-    window: &slint::Window,
-    pid: i32,
-    name: &str,
-    abs_x: i32,
-    abs_y: i32,
-) -> Option<RowMenuCmd> {
+pub fn show_row_menu(window: &slint::Window, pid: i32, name: &str) -> Option<RowMenuCmd> {
     use windows::Win32::UI::WindowsAndMessaging::{
-        AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_GRAYED, MF_SEPARATOR,
-        MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, TrackPopupMenu, MF_GRAYED,
+        MF_SEPARATOR, MF_STRING, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
     };
 
     let Some(hwnd) = extract_hwnd_from(window) else {
@@ -255,16 +251,15 @@ pub fn show_row_menu(
         );
         let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
 
-        // Slint absolute-position 是窗口内物理坐标；加窗口位置得到屏幕坐标
-        let pos = window.position();
-        let screen_x = pos.x + abs_x;
-        let screen_y = pos.y + abs_y;
+        // 鼠标当前位置（物理屏幕像素）作为菜单弹出点
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut pt);
 
         let cmd = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-            screen_x,
-            screen_y,
+            pt.x,
+            pt.y,
             None,
             hwnd,
             None,
