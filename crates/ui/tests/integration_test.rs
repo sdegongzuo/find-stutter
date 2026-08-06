@@ -23,7 +23,7 @@ fn skin_default_dimensions() {
 #[test]
 fn skin_default_colors() {
     let skin = SkinConfig::default();
-    assert_eq!(skin.background_color, "#F5F5F7");
+    assert_eq!(skin.background_color, "#FFFFFF");
     assert_eq!(skin.border_color, "#C0C0C8");
     assert_eq!(skin.upload_color, "#2E7D32");
     assert_eq!(skin.download_color, "#1565C0");
@@ -50,7 +50,7 @@ fn skin_toml_parse_from_string() {
     assert_eq!(parsed.font_size, 15.0);
     assert_eq!(parsed.upload_color, "00FF00");
     // 未指定字段用默认值
-    assert_eq!(parsed.background_color, "#F5F5F7");
+    assert_eq!(parsed.background_color, "#FFFFFF");
 }
 
 // ========== OverlayState（P3 新字段）==========

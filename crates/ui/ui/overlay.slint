@@ -29,17 +29,22 @@ export component Overlay inherits Window {
     background: transparent;
 
     // === 皮肤（Rust 端注入）===
+    // 配色风格对齐进程详情页（ProcessList）：白底 + 1px 边框 + 8px 圆角 + 深色文字。
+    // 字段保留 in property 是为了让 skin.toml 仍可覆盖（边框颜色/半径/背景色都在
+    // skin.toml 的 SkinConfig 里）。
     in property <length> skin-width: 360px;
     in property <length> skin-height: 78px;
-    in property <brush> skin-bg: #000000cc;
-    in property <color> cpu-color: #ffffff;
-    in property <color> mem-color: #cce0ff;
-    in property <color> event-color: #ffa0a0;
-    in property <color> gpu-color: #aaffaa;
-    in property <color> temp-color: #ffcc88;
-    in property <color> net-color: #88ccff;
-    in property <color> disk-color: #ddaaff;
-    in property <color> hb-color: #666;
+    in property <brush> skin-bg: #ffffff;
+    in property <color> skin-border-color: #c0c0c0;
+    in property <length> skin-border-radius: 8px;
+    in property <color> cpu-color: #1e1e2e;
+    in property <color> mem-color: #1e1e2e;
+    in property <color> event-color: #c44c4c;
+    in property <color> gpu-color: #1e1e2e;
+    in property <color> temp-color: #1e1e2e;
+    in property <color> net-color: #1e1e2e;
+    in property <color> disk-color: #1e1e2e;
+    in property <color> hb-color: #8a8a92;
     in property <length> text-size: 13px;
 
     // === P3: 服务健康状态（角标模式：● + 文字，融进主区）===
@@ -86,11 +91,14 @@ export component Overlay inherits Window {
         }
     }
 
-    // === 单一半透背板（无 border，无分割）===
+    // === 单一背板（白底 + 1px 边框 + 8px 圆角，与进程详情页一致）===
     Rectangle {
         width: 100%;
         height: 100%;
         background: root.skin-bg;
+        border-width: 1px;
+        border-color: root.skin-border-color;
+        border-radius: root.skin-border-radius;
 
         // 指标网格
         HorizontalLayout {

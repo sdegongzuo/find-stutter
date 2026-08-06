@@ -39,7 +39,7 @@ pub struct SkinConfig {
 
 fn default_width() -> f32 { 360.0 }
 fn default_height() -> f32 { 78.0 }
-fn default_bg() -> String { "#F5F5F7".into() }
+fn default_bg() -> String { "#FFFFFF".into() }
 fn default_border() -> String { "#C0C0C8".into() }
 fn default_radius() -> f32 { 8.0 }
 fn default_font_size() -> f32 { 13.0 }
@@ -56,7 +56,7 @@ impl Default for SkinConfig {
         Self {
             width: 360.0,
             height: 78.0,
-            background_color: "#F5F5F7".into(),
+            background_color: "#FFFFFF".into(),
             border_color: "#C0C0C8".into(),
             border_radius: 8.0,
             font_size: 13.0,
@@ -121,7 +121,7 @@ mod tests {
         let skin = SkinConfig::default();
         assert_eq!(skin.width, 360.0);
         assert_eq!(skin.height, 78.0);
-        assert_eq!(skin.background_color, "#F5F5F7");
+        assert_eq!(skin.background_color, "#FFFFFF");
         assert_eq!(skin.border_color, "#C0C0C8");
         assert_eq!(skin.border_radius, 8.0);
         assert_eq!(skin.font_size, 13.0);
@@ -154,7 +154,7 @@ mod tests {
         assert_eq!(skin.font_size, 15.0);
         assert_eq!(skin.upload_color, "00FF00");
         // 未指定的字段用默认值
-        assert_eq!(skin.background_color, "#F5F5F7");
+        assert_eq!(skin.background_color, "#FFFFFF");
     }
 
     /// 仓库内自带 default 皮肤必须能被 load（修复：原实现路径/结构不匹配，

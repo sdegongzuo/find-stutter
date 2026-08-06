@@ -98,22 +98,39 @@ pub fn parse_color(s: &str) -> Option<Color> {
 
 /// 把 OverlayState 推到 Slint Overlay 实例。
 pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
-    // 0) 皮肤：颜色 / 字号 / 尺寸注入（修复：P3 后皮肤名存实亡，从未接线）
+    // 0) 皮肤：颜色 / 字号 / 尺寸 / 边框 注入（修复：P3 后皮肤名存实亡，从未接线）
+    //
+    // 主窗口（Overlay）的视觉风格与进程详情页（ProcessList）对齐：
+    //   - 背景色：白底（skin.background_color，默认 #F5F5F7 的 skin.toml 已统一为 #ffffff）
+    //   - 边框：1px，颜色由 skin.border_color 注入（默认 #C0C0C8 ≈ ProcessList 的 #c0c0c0）
+    //   - 圆角：由 skin.border_radius 注入（默认 8px，与 ProcessList 一致）
+    //   - 指标文字：统一深色 #1e1e2e（与 ProcessList 文本色一致；不再用 skin 字段的
+    //     Material 800 彩色 — skin 字段保留供将来扩展，不破坏皮肤系统）
+    //   - 卡顿计数：保留红色 #c44c4c 作为视觉重点（今日卡顿:N）
+    //   - 心跳时间：灰色 #8a8a92（弱化的辅助信息）
     let skin = &state.skin;
+    let text_color = Color::from_rgb_u8(0x1e, 0x1e, 0x2e); // 与 ProcessList 文本色一致
+    let event_red = Color::from_rgb_u8(0xc4, 0x4c, 0x4c); // 卡顿计数红色（醒目）
+    let hb_gray = Color::from_rgb_u8(0x8a, 0x8a, 0x92); // 心跳时间灰色（弱化）
+
     ui.set_skin_width(skin.width as f32);
     ui.set_skin_height(skin.height as f32);
     ui.set_text_size(skin.font_size as f32);
     ui.set_skin_bg(Brush::SolidColor(
-        parse_color(&skin.background_color).unwrap_or(Color::from_rgb_u8(0xf5, 0xf5, 0xf7)),
+        parse_color(&skin.background_color).unwrap_or(Color::from_rgb_u8(0xff, 0xff, 0xff)),
     ));
-    ui.set_cpu_color(parse_color(&skin.cpu_color).unwrap_or(Color::from_rgb_u8(0x37, 0x47, 0x4f)));
-    ui.set_mem_color(parse_color(&skin.memory_color).unwrap_or(Color::from_rgb_u8(0x6a, 0x1b, 0x9a)));
-    ui.set_event_color(parse_color(&skin.label_color).unwrap_or(Color::from_rgb_u8(0x54, 0x6e, 0x7a)));
-    ui.set_gpu_color(parse_color(&skin.gpu_color).unwrap_or(Color::from_rgb_u8(0x00, 0x69, 0x5c)));
-    ui.set_temp_color(parse_color(&skin.label_color).unwrap_or(Color::from_rgb_u8(0x54, 0x6e, 0x7a)));
-    ui.set_net_color(parse_color(&skin.download_color).unwrap_or(Color::from_rgb_u8(0x15, 0x65, 0xc0)));
-    ui.set_disk_color(parse_color(&skin.disk_color).unwrap_or(Color::from_rgb_u8(0xad, 0x14, 0x57)));
-    ui.set_hb_color(parse_color("#8a8a92").unwrap_or(Color::from_rgb_u8(0x8a, 0x8a, 0x92)));
+    ui.set_skin_border_color(
+        parse_color(&skin.border_color).unwrap_or(Color::from_rgb_u8(0xc0, 0xc0, 0xc0)),
+    );
+    ui.set_skin_border_radius(skin.border_radius as f32);
+    ui.set_cpu_color(text_color);
+    ui.set_mem_color(text_color);
+    ui.set_event_color(event_red);
+    ui.set_gpu_color(text_color);
+    ui.set_temp_color(text_color);
+    ui.set_net_color(text_color);
+    ui.set_disk_color(text_color);
+    ui.set_hb_color(hb_gray);
 
     // 1) 服务健康条
     let (text, color) = format_service_status(state.service_health);

@@ -1,8 +1,18 @@
 # 默认皮肤（浅色主题，与 SkinConfig 扁平结构一致，直接解析）
 # 颜色格式 #RRGGBB；opacity 仅当 UI 支持时生效（当前版本保留字段）
+#
+# 与进程详情页（ProcessList）保持一致的视觉风格：
+#   - 白底（#ffffff，与 ProcessList 完全一致）
+#   - 1px 边框 #C0C0C8（≈ ProcessList 的 #c0c0c0）
+#   - 8px 圆角（与 ProcessList 一致）
+# 指标文字色：默认 skin 字段保留 Material 800 系彩色（cpu 蓝灰、mem 紫、gpu 青绿、
+# disk 粉），但 UI 的 apply_metrics 会忽略它们，统一用 #1e1e2e 深色（与 ProcessList
+# 文本色一致）— 改本文件不会影响主窗口文字色；将来若要恢复彩色区分，可改 overlay.rs
+# 重新从 skin 字段注入。
+
 width = 360.0
 height = 78.0
-background_color = "#F5F5F7"
+background_color = "#FFFFFF"
 border_color = "#C0C0C8"
 border_radius = 8.0
 font_size = 13.0
