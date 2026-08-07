@@ -12,16 +12,25 @@ slow_interval_factor = 5
 [detection]
 # CPU 使用率超过该百分比（%）即视为潜在卡顿
 cpu_threshold = 90.0
+# CPU 滞回（百分点）：进入卡顿需 > cpu_threshold，退出需 < cpu_threshold - cpu_hysteresis。
+# 滞回带内维持当前状态，避免 CPU 在阈值附近震荡时反复记录
+cpu_hysteresis = 10.0
 # 内存使用率超过该百分比（%）即视为潜在卡顿
 mem_threshold_percent = 90.0
 # 或：可用内存低于该值（MB）即视为潜在卡顿
 mem_threshold_mb = 500
 # 交换分区使用率超过该百分比（%）即视为潜在卡顿
 swap_threshold = 50.0
+# Swap 滞回（百分点）：进入需 > swap_threshold，退出需 < swap_threshold - swap_hysteresis。
+# 滞回带内维持当前状态，避免反复记录
+swap_hysteresis = 10.0
 # 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
 disk_rate_spike_ratio = 5.0
 # 综合指标相对基线的突增倍数
 spike_ratio = 2.0
+# 网络/磁盘 spike 的绝对下限（B/s）：当前速率低于该值不判定 spike，
+# 避免空闲时几 B/s ~ 几十 KB/s 的零头波动按倍数误报
+spike_min_bps = 1000000
 # 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
 

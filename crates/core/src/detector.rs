@@ -7,6 +7,11 @@ pub struct Detector {
     history: Vec<Sample>,
     stutter_start: Option<SystemTime>,
     current_causes: Vec<String>,
+    /// CPU 滞回状态：进入后直到 < threshold - hysteresis 才解除
+    /// （滞回带内维持激活，避免阈值附近反复 start/stop 反复记录）
+    cpu_active: bool,
+    /// Swap 滞回状态（同上）
+    swap_active: bool,
 }
 
 impl Detector {
@@ -16,6 +21,8 @@ impl Detector {
             history: Vec::new(),
             stutter_start: None,
             current_causes: Vec::new(),
+            cpu_active: false,
+            swap_active: false,
         }
     }
 
@@ -63,10 +70,18 @@ impl Detector {
         }
     }
 
-    fn check_hard_thresholds(&self, sample: &Sample) -> Vec<String> {
+    fn check_hard_thresholds(&mut self, sample: &Sample) -> Vec<String> {
         let mut causes = Vec::new();
 
+        // CPU：滞回模型。进入 > cpu_threshold；退出 < cpu_threshold - cpu_hysteresis；
+        // 滞回带内（threshold - hysteresis ~ threshold）维持 cpu_active 不变，
+        // 防止 CPU 在阈值附近震荡时反复开始/结束卡顿记录。
         if sample.cpu_usage > self.config.cpu_threshold {
+            self.cpu_active = true;
+        } else if sample.cpu_usage <= self.config.cpu_threshold - self.config.cpu_hysteresis {
+            self.cpu_active = false;
+        }
+        if self.cpu_active {
             causes.push(format!(
                 "CPU usage {:.1}% > {}%",
                 sample.cpu_usage, self.config.cpu_threshold
@@ -80,7 +95,15 @@ impl Detector {
             ));
         }
 
+        // Swap：滞回模型（与 CPU 相同；进入 > swap_threshold，退出 < swap_threshold - hysteresis）
         if sample.swap_usage_percent > self.config.swap_threshold {
+            self.swap_active = true;
+        } else if sample.swap_usage_percent
+            <= self.config.swap_threshold - self.config.swap_hysteresis
+        {
+            self.swap_active = false;
+        }
+        if self.swap_active {
             causes.push(format!(
                 "Swap usage {:.1}% > {}%",
                 sample.swap_usage_percent, self.config.swap_threshold
@@ -107,6 +130,7 @@ impl Detector {
             recent.iter().map(|s| s.cpu_usage).collect(),
             baseline.iter().map(|s| s.cpu_usage).collect(),
             self.config.spike_ratio,
+            0.0, // CPU 为百分比，无绝对下限
         );
 
         Self::spike_check(
@@ -116,6 +140,7 @@ impl Detector {
             recent.iter().map(|s| s.disk_write_bps as f32).collect(),
             baseline.iter().map(|s| s.disk_write_bps as f32).collect(),
             self.config.disk_rate_spike_ratio,
+            self.config.spike_min_bps as f32,
         );
 
         Self::spike_check(
@@ -131,6 +156,7 @@ impl Detector {
                 .map(|s| (s.net_sent_bps + s.net_recv_bps) as f32)
                 .collect(),
             self.config.spike_ratio,
+            self.config.spike_min_bps as f32,
         );
 
         let recent_mem: Vec<f32> = recent.iter().map(|s| s.mem_available_mb as f32).collect();
@@ -157,10 +183,13 @@ impl Detector {
         recent: Vec<f32>,
         baseline: Vec<f32>,
         threshold: f32,
+        min_abs: f32,
     ) {
         let r_avg = recent.iter().sum::<f32>() / recent.len() as f32;
         let b_avg = baseline.iter().sum::<f32>() / baseline.len() as f32;
-        if b_avg > 1.0 {
+        // 绝对下限：当前速率必须达到 min_abs 才判定 spike（网络/磁盘用，
+        // 避免空闲零头 B/s 被倍数放大误报）。CPU 传 0 表示不设下限。
+        if r_avg >= min_abs && b_avg > 1.0 {
             let ratio = (r_avg - b_avg).abs() / b_avg;
             if ratio > threshold {
                 causes.push(format!(
@@ -489,5 +518,116 @@ mod tests {
         let cpu_and_swap = make_sample(95.0, 2000, 80.0);
         d.analyze(&cpu_and_swap);
         assert_eq!(d.current_causes.len(), 2);
+    }
+
+    // --- swap / cpu 滞回（hysteresis）---
+
+    #[test]
+    fn swap_hysteresis_keeps_active_within_band() {
+        let config = DetectionConfig::default(); // swap_threshold=50, hysteresis=10 → 退出线 40
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(30.0, 2000, 55.0)); // >50 进入
+        assert!(!d.current_causes.is_empty());
+        assert!(d.current_causes[0].contains("Swap usage"));
+
+        // 滞回带内（45：< 50 但 > 40）→ 维持激活，不解除
+        d.analyze(&make_sample(30.0, 2000, 45.0));
+        assert!(
+            !d.current_causes.is_empty(),
+            "滞回带内应维持 Swap 激活状态"
+        );
+        assert!(d.current_causes[0].contains("Swap usage"));
+    }
+
+    #[test]
+    fn swap_hysteresis_releases_below_exit_line() {
+        let config = DetectionConfig::default(); // 退出线 40
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(30.0, 2000, 55.0)); // 进入
+        assert!(!d.current_causes.is_empty());
+
+        d.analyze(&make_sample(30.0, 2000, 35.0)); // <40 退出
+        assert!(d.current_causes.is_empty());
+    }
+
+    #[test]
+    fn cpu_hysteresis_keeps_active_within_band() {
+        let config = DetectionConfig::default(); // cpu_threshold=90, hysteresis=10 → 退出线 80
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(95.0, 2000, 10.0)); // >90 进入
+        assert!(!d.current_causes.is_empty());
+        assert!(d.current_causes[0].contains("CPU usage"));
+
+        // 滞回带内（85：< 90 但 > 80）→ 维持激活
+        d.analyze(&make_sample(85.0, 2000, 10.0));
+        assert!(
+            !d.current_causes.is_empty(),
+            "滞回带内应维持 CPU 激活状态"
+        );
+        assert!(d.current_causes[0].contains("CPU usage"));
+    }
+
+    #[test]
+    fn cpu_hysteresis_releases_below_exit_line() {
+        let config = DetectionConfig::default(); // 退出线 80
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(95.0, 2000, 10.0)); // 进入
+        assert!(!d.current_causes.is_empty());
+
+        d.analyze(&make_sample(75.0, 2000, 10.0)); // <80 退出
+        assert!(d.current_causes.is_empty());
+    }
+
+    // --- spike 绝对下限 ---
+
+    fn make_sample_net(cpu: f32, mem_avail_mb: u64, swap: f32, net_bps: u64) -> Sample {
+        let mut s = make_sample(cpu, mem_avail_mb, swap);
+        s.net_sent_bps = net_bps;
+        s
+    }
+
+    /// 空闲零头（KB 级波动）即使倍数很大也不应触发 spike（绝对下限拦截）。
+    #[test]
+    fn spike_min_floor_ignores_small_rates() {
+        let config = DetectionConfig::default(); // spike_ratio=2.0, spike_min_bps=1MB
+        let mut d = Detector::new(&config);
+
+        // 60 个基线样本（1 KB/s）+ 10 个 recent（10 KB/s）：ratio=9 > 2，
+        // 但 r_avg=10KB << 1MB → 绝对下限拦截
+        for _ in 0..60 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 1_000));
+        }
+        for _ in 0..10 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 10_000));
+        }
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("spike")),
+            "KB 级零头不应触发 spike，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 真实大流量（≥ 绝对下限）时 spike 正常触发。
+    #[test]
+    fn spike_min_floor_allows_large_rates() {
+        let config = DetectionConfig::default();
+        let mut d = Detector::new(&config);
+
+        // 60 个基线（1 MB/s）+ 10 个 recent（5 MB/s）：ratio=4 > 2 且 ≥ 1MB
+        for _ in 0..60 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 1_000_000));
+        }
+        for _ in 0..10 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 5_000_000));
+        }
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Network spike")),
+            "真实大流量 spike 应触发，got: {:?}",
+            d.current_causes
+        );
     }
 }

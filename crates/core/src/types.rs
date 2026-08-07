@@ -99,11 +99,23 @@ pub struct StutterEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
     pub cpu_threshold: f32,
+    /// CPU 滞回：进入卡顿需 > cpu_threshold；退出需 < cpu_threshold - cpu_hysteresis。
+    /// 滞回带内维持当前状态，避免阈值附近反复横跳反复记录。
+    #[serde(default = "default_cpu_hysteresis")]
+    pub cpu_hysteresis: f32,
     pub mem_threshold_percent: f32,
     pub mem_threshold_mb: u64,
     pub swap_threshold: f32,
+    /// Swap 滞回：进入需 > swap_threshold；退出需 < swap_threshold - swap_hysteresis。
+    /// 滞回带内维持当前状态。
+    #[serde(default = "default_swap_hysteresis")]
+    pub swap_hysteresis: f32,
     pub disk_rate_spike_ratio: f32,
     pub spike_ratio: f32,
+    /// 网络/磁盘 spike 的绝对下限（B/s）：当前速率低于该值不判定 spike，
+    /// 避免空闲时几 B/s ~ 几十 KB/s 的零头波动按倍数误报。
+    #[serde(default = "default_spike_min_bps")]
+    pub spike_min_bps: u64,
     pub sustained_seconds: u32,
 }
 
@@ -111,14 +123,29 @@ impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
             cpu_threshold: 90.0,
+            cpu_hysteresis: 10.0,
             mem_threshold_percent: 90.0,
             mem_threshold_mb: 500,
             swap_threshold: 50.0,
+            swap_hysteresis: 10.0,
             disk_rate_spike_ratio: 5.0,
             spike_ratio: 2.0,
+            spike_min_bps: 1_000_000,
             sustained_seconds: 3,
         }
     }
+}
+
+fn default_cpu_hysteresis() -> f32 {
+    10.0
+}
+
+fn default_swap_hysteresis() -> f32 {
+    10.0
+}
+
+fn default_spike_min_bps() -> u64 {
+    1_000_000
 }
 
 /// 采样配置
