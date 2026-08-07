@@ -3,8 +3,8 @@
 // 布局（P3+）：
 //   ┌────────────────────────────────────────┐
 //   │  CPU  XX%       GPU  XX%        ● 绿    │  ← 指标 + 服务角标（无独立状态条）
-//   │  MEM  XX%       ↑ ↓  R W               │  ← 网速/磁盘行
-//   │  今日卡顿: 0     T   XX°C          ▶ 暂停 │  ← 操作收敛到右下
+//   │  MEM  XX%       ↑  XX/s  R  XX/s      │  ← 网速/磁盘各两行，网速左磁盘右
+//   │  今日卡顿: 0     ↓  XX/s  W  XX/s      │  ← 操作收敛到右下
 //   └────────────────────────────────────────┘
 //
 // 沉浸感要点：
@@ -41,7 +41,6 @@ export component Overlay inherits Window {
     in property <color> mem-color: #1e1e2e;
     in property <color> event-color: #c44c4c;
     in property <color> gpu-color: #1e1e2e;
-    in property <color> temp-color: #1e1e2e;
     in property <color> net-color: #1e1e2e;
     in property <color> disk-color: #1e1e2e;
     in property <color> hb-color: #8a8a92;
@@ -56,7 +55,6 @@ export component Overlay inherits Window {
     in property <string> cpu-text: "CPU  --";
     in property <string> mem-text: "内存  --";
     in property <string> gpu-text: "GPU  --";
-    in property <string> temp-text: "T  --";
     in property <string> net-send: "↑  --";
     in property <string> net-recv: "↓  --";
     in property <string> disk-read: "R  --";
@@ -123,14 +121,17 @@ export component Overlay inherits Window {
                 spacing: 1px;
                 width: 50%;
                 Text { text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
+                // 网速/磁盘各两行：上传+读一行，下载+写一行（网速左、磁盘右）
                 HorizontalLayout {
                     spacing: 4px;
                     Text { text: net-send; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
-                    Text { text: net-recv; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
                     Text { text: disk-read; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text { text: net-recv; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
                     Text { text: disk-write; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
                 }
-                Text { text: temp-text; color: root.temp-color; font-size: max(12px, root.text-size - 1px); }
             }
         }
 

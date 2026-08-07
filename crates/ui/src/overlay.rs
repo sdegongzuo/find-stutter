@@ -145,7 +145,6 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
     ui.set_mem_color(text_color);
     ui.set_event_color(event_red);
     ui.set_gpu_color(text_color);
-    ui.set_temp_color(text_color);
     ui.set_net_color(text_color);
     ui.set_disk_color(text_color);
     ui.set_hb_color(hb_gray);
@@ -174,9 +173,7 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
         if let Some(g) = s.gpu_usage {
             ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
         }
-        if let Some(t) = s.cpu_temp {
-            ui.set_temp_text(SharedString::from(format!("T {:4.1}°C", t)));
-        }
+        // 温度已从悬浮窗移除（采集/入库保留，仅不显示）
     }
 
     // 4) 今日事件数
