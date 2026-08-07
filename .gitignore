@@ -18,7 +18,6 @@ Thumbs.db
 *.csv
 
 # Build documentation
-BUILD.md
 build.log
 test.log
 test_*.log

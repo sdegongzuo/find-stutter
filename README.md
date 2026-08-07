@@ -21,6 +21,11 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 - **卡顿通知弹窗**（P2）：检测到新的 Major/Critical 卡顿时弹 Windows 原生系统通知（气泡 toast），`[notifications]` 配置开关与最低等级。
 - **任务栏嵌入**（P2）：`config.toml [ui] taskbar = true` 启用横向窄条伪任务栏窗口（默认底部中央，可拖到任务栏位置）。
 - **CLI 导出**：将卡顿记录导出为 CSV，或查询当日卡顿次数。
+- **进程详情页**（P2）：右键菜单「进程详情」打开任务管理器风格进程列表——同名进程按 PPID
+  聚合分组（孙进程扁平化到所属 root），显示 PID / 名称 / CPU / 内存（提交大小）/
+  物理内存（工作集）/ 磁盘 / 网络 / 累计网络；点击列头排序、聚合行点击展开/收起、
+  关键字 / PID / 端口号搜索、双击行打开进程详情面板（路径 / 命令行 / 线程 / 句柄 /
+  内存明细等，文本可拖选 + Ctrl+C 复制，标题栏「复制」按钮全量复制）。
 
 ## 架构（P3 重构后）
 
@@ -63,8 +68,11 @@ cargo build --release
 ```
 
 产物：
-- `target/release/find-stutter.exe`（UI 端）
+- `target/release/find-stutter.exe`（GUI 端；由 `crates/bin` 入口编译，link `find-stutter-ui` 库）
 - `target/release/find-stutter-service.exe`（Windows 服务）
+
+> 单独改 UI 代码后请用 `cargo build --release -p find-stutter` 重新编译 GUI 入口
+> （不要只编 `-p find-stutter-ui`，那不会更新 `find-stutter.exe`）。
 
 ## 运行
 
@@ -195,12 +203,23 @@ find-stutter.exe stats
 | --- | --- |
 | 拖动窗口 | 移动悬浮窗（原生拖拽，无重影） |
 | 单击窗口 | 展开 / 收起详情面板 |
-| **右键窗口** | **弹出菜单列表：暂停/恢复监控、点击穿透、退出** |
+| **右键窗口** | **弹出菜单列表：暂停/恢复监控、进程详情、点击穿透、退出** |
 | 右键托盘图标 | 托盘菜单：显示/隐藏悬浮窗、暂停/恢复、退出 |
 | 左键单击托盘图标 | 显示 / 隐藏悬浮窗 |
 | 按 `T` | 切换点击穿透模式（穿透时鼠标无效，用于「只看不挡」） |
 | 顶部状态条 | 显示「● 服务运行中（绿）/ 卡顿（黄）/ 已停止（红）」，服务断开时变红并禁用暂停按钮 |
 | 修改 config.toml / skin.toml | 保存后热加载（皮肤颜色/字号实时生效；db 路径等需重启生效） |
+
+### 进程详情页操作
+
+| 操作 | 效果 |
+| --- | --- |
+| 点击列头 | 切换排序列 / 方向（PID / 名称 / CPU / 内存 / 物理内存 / 磁盘 / 网络 / 累计网络） |
+| 点击聚合行 | 展开 / 收起该组的子进程（服务宿主 / 子进程） |
+| 搜索框输入 | 按名称 / PID / 端口号过滤（保留组结构） |
+| 双击进程行 | 打开进程详情面板（路径 / 命令行 / 用户 / 线程数 / 句柄数 / 启动时间 / 内存明细） |
+| 详情面板拖选文本 | 选中部分内容，Ctrl+C 复制 |
+| 详情面板「复制」按钮 | 一键复制全部详情文本 |
 
 ## 目录结构
 
@@ -211,8 +230,9 @@ crates/
   ui/        悬浮窗 UI、皮肤、DbReader（1Hz SQLite 轮询）、服务健康状态条、
              auto_start（GUI 启动时自动检测 + UAC 提权安装/启动）、
              elevate（ShellExecuteExW + runas）、hotreload（notify 配置/皮肤监听）、
-             tray（系统托盘）、notify（卡顿气泡通知）、taskbar（伪任务栏窗口）
-  bin/       CLI 入口（默认 UI / export / stats）
+             tray（系统托盘）、notify（卡顿气泡通知）、taskbar（伪任务栏窗口）、
+             process_list（进程详情页：采样/聚合/排序/搜索/详情面板）
+  bin/       GUI 入口（package find-stutter，link ui 库；默认 UI / export / stats 子命令）
 config.toml  配置（含 [ui] taskbar、[notifications] 开关）
 stutter.db   运行时生成的数据库
 ```
@@ -221,12 +241,16 @@ stutter.db   运行时生成的数据库
 
 ```bash
 cargo test --workspace
-# core:  59 unit + 13 integration
-# ui:    83 unit + 10 integration
-# service: 17 unit
-# bin:    5 cli tests
-# 合计 184 个测试（0 失败）
+# core:     82 测试
+# ui:      146 测试（进程列表聚合/排序/搜索、皮肤、热加载、自动启动等）
+# service:  17 测试
+# bin:       5 CLI 测试
+# 合计 250 个测试（0 失败）
 ```
+
+> 注：GUI 入口是 `crates/bin`（package `find-stutter`，link `find-stutter-ui` 库）。
+> 改完 UI 代码后需重新编译该入口：`cargo build --release -p find-stutter`（只编
+> `-p find-stutter-ui` 不会更新 `target/release/find-stutter.exe`）。
 
 ## 已知限制 / 后续计划
 

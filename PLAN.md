@@ -1,5 +1,16 @@
 
 # 系统卡顿监控日志器 + 悬浮窗 — 最终实现方案
+
+> **现状说明（2026-08）**：本文件为早期设计文档，主体已按 P3 服务化落地，部分内容
+> 已与实现不同，阅读时以 README.md / TODO.md 为准：
+> - **UI 框架**：已从 egui 迁移到 **Slint 1.x**（`crates/ui/ui/*.slint`，winit 后端，
+>   原生拖拽无重影、透明置顶正常）。
+> - **进程模型**：已改为「**Windows 服务采集写库 + GUI 只读轮询**」（P3 重构），
+>   非本文件的单进程多线程 / Named Pipe 方案；并发经 SQLite WAL 模式解决。
+> - **模块布局**：`collector / detector / logger / types` 在 `crates/core`；
+>   服务在 `crates/service`；UI 与进程详情页在 `crates/ui`；入口在 `crates/bin`。
+> 下文保留作为设计演进记录。
+
 ## 1. 核心架构设计
 采用 **生产者-消费者** 模式，将系统采集、数据分析、数据存储与 UI 渲染完全解耦。
 ### 1.1 进程模型

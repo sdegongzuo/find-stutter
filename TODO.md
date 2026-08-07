@@ -31,6 +31,25 @@
 - [x] **README.md** — 项目说明、构建/运行、CLI 子命令、交互说明、配置、目录结构、已知限制 — `README.md`
 - [x] **P3 服务化重构** — 拆出独立 `find-stutter-service` crate（Windows 服务，6 个 CLI 子命令），GUI 改为 1Hz SQLite 轮询只读（`DbReader` + `ServiceHealth`），WAL 并发读写，111 个测试全过 — `crates/service/` + `crates/ui/src/reader.rs`
 
+### 进程详情页 & 悬浮窗迭代（2026-08-07）
+
+- [x] **进程聚合支持同名多 root**（c55aa4c）— 组内 PPID 不在组内的进程均为 root，
+      每个 root 独立成组；子进程沿 PPID 链归属（find_root_pid 防环），孙进程扁平化。
+- [x] **进程内存列改提交大小**（e012ed6）— PagefileUsage（任务管理器「详细信息」页
+      口径），失败回退工作集；采样热路径每进程一次 GetProcessMemoryInfo。
+- [x] **进程详情页首次显示修复** — 非阻塞 refresh（去掉 3s 死等）+ 首帧 1s 快速 tick，
+      数据就绪立即渲染，窗口不卡顿。
+- [x] **进程详情页列调整**（7f92b0a）— 删「状态」「操作」「用户」列（用户列连带
+      移除采样热路径的 user 查询，每进程省一次 token 查询）；新增「物理内存」列
+      （工作集，支持 pmem 排序）；「名称」列占两列宽（220px）。
+- [x] **详情面板可复制**（7f92b0a）— 内容改只读 TextInput（拖选 + Ctrl+C 复制选中），
+      标题栏「复制」按钮全量写剪贴板（Win32 CF_UNICODETEXT）。
+- [x] **sort_groups 性能优化**（7f92b0a）— 预计算聚合 key 后对索引排序，比较器不再
+      重复 group_aggregate（O(N log N × C) → O(N × C)），循环置换就地重排。
+- [x] **悬浮窗三列布局 + 暂停按钮**（e2236fa / 7728b9d）— 左 28% / 中剩余 / 右 96px，
+      行高 16px 行距 5px；暂停按钮点击并入全窗口 TouchArea 坐标判断（z 层级实测无效）。
+- [x] 全量测试 250 个（core 82 / ui 146 / service 17 / bin 5）全过，workspace 零警告。
+
 ## 未完成
 
 > **P0（核心功能）已全部完成**，见上方"已完成"列表。以下为 P1–P4 待办（本会话已补齐 P1 右键菜单/点击穿透、P2 卡顿闪烁、P3 WAL 基础、P4 文档）。
