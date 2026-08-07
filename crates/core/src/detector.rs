@@ -42,7 +42,15 @@ impl Detector {
                 self.current_causes = causes;
             } else {
                 for c in causes {
-                    if !self.current_causes.contains(&c) {
+                    // 按 cause 类型去重：同类型（如 Swap usage）更新为最新文案，
+                    // 避免滞回带内文案随数值变化导致字符串去重失效、cause 反复追加
+                    // （一次卡顿中 current_causes 膨胀，还会虚高 severity）。
+                    let key = cause_key(&c);
+                    if let Some(pos) =
+                        self.current_causes.iter().position(|x| cause_key(x) == key)
+                    {
+                        self.current_causes[pos] = c;
+                    } else {
                         self.current_causes.push(c);
                     }
                 }
@@ -82,10 +90,19 @@ impl Detector {
             self.cpu_active = false;
         }
         if self.cpu_active {
-            causes.push(format!(
-                "CPU usage {:.1}% > {}%",
-                sample.cpu_usage, self.config.cpu_threshold
-            ));
+            if sample.cpu_usage > self.config.cpu_threshold {
+                causes.push(format!(
+                    "CPU usage {:.1}% > {}%",
+                    sample.cpu_usage, self.config.cpu_threshold
+                ));
+            } else {
+                // 滞回带内维持激活：数值已回落但未到退出线，
+                // 文案明确"滞回保持"，避免出现 "85% > 90%" 的矛盾
+                causes.push(format!(
+                    "CPU usage {:.1}%（滞回保持，阈值 {}%）",
+                    sample.cpu_usage, self.config.cpu_threshold
+                ));
+            }
         }
 
         if sample.mem_available_mb < self.config.mem_threshold_mb {
@@ -104,10 +121,18 @@ impl Detector {
             self.swap_active = false;
         }
         if self.swap_active {
-            causes.push(format!(
-                "Swap usage {:.1}% > {}%",
-                sample.swap_usage_percent, self.config.swap_threshold
-            ));
+            if sample.swap_usage_percent > self.config.swap_threshold {
+                causes.push(format!(
+                    "Swap usage {:.1}% > {}%",
+                    sample.swap_usage_percent, self.config.swap_threshold
+                ));
+            } else {
+                // 滞回带内维持激活（同上，文案避免 "45% > 50%" 的矛盾）
+                causes.push(format!(
+                    "Swap usage {:.1}%（滞回保持，阈值 {}%）",
+                    sample.swap_usage_percent, self.config.swap_threshold
+                ));
+            }
         }
 
         causes
@@ -210,6 +235,27 @@ impl Detector {
             Severity::Minor
         }
     }
+}
+
+/// cause 的稳定类型 key：按已知前缀匹配，用于同类型去重/更新。
+/// 滞回带内文案数值会变化（"CPU usage 85%（滞回保持…）" vs "CPU usage 95% > 90%"），
+/// 但类型 key 不变；CPU 硬阈值与 CPU spike 是不同的 cause（key 不同）。
+fn cause_key(cause: &str) -> &str {
+    const PREFIXES: [&str; 7] = [
+        "CPU usage",
+        "CPU spike",
+        "Disk write",
+        "Network",
+        "Memory available",
+        "Available memory",
+        "Swap usage",
+    ];
+    for p in PREFIXES {
+        if cause.starts_with(p) {
+            return p;
+        }
+    }
+    cause
 }
 
 #[cfg(test)]
@@ -531,13 +577,24 @@ mod tests {
         assert!(!d.current_causes.is_empty());
         assert!(d.current_causes[0].contains("Swap usage"));
 
-        // 滞回带内（45：< 50 但 > 40）→ 维持激活，不解除
+        // 滞回带内（45：< 50 但 > 40）→ 维持激活，不解除；同类型 cause 更新而非追加
         d.analyze(&make_sample(30.0, 2000, 45.0));
         assert!(
             !d.current_causes.is_empty(),
             "滞回带内应维持 Swap 激活状态"
         );
+        assert_eq!(
+            d.current_causes.len(),
+            1,
+            "滞回带内同类型 cause 应更新而非追加，got: {:?}",
+            d.current_causes
+        );
         assert!(d.current_causes[0].contains("Swap usage"));
+        assert!(
+            d.current_causes[0].contains("滞回保持"),
+            "滞回带内文案应标注滞回保持，got: {}",
+            d.current_causes[0]
+        );
     }
 
     #[test]
@@ -561,13 +618,24 @@ mod tests {
         assert!(!d.current_causes.is_empty());
         assert!(d.current_causes[0].contains("CPU usage"));
 
-        // 滞回带内（85：< 90 但 > 80）→ 维持激活
+        // 滞回带内（85：< 90 但 > 80）→ 维持激活；同类型 cause 更新而非追加
         d.analyze(&make_sample(85.0, 2000, 10.0));
         assert!(
             !d.current_causes.is_empty(),
             "滞回带内应维持 CPU 激活状态"
         );
+        assert_eq!(
+            d.current_causes.len(),
+            1,
+            "滞回带内同类型 cause 应更新而非追加，got: {:?}",
+            d.current_causes
+        );
         assert!(d.current_causes[0].contains("CPU usage"));
+        assert!(
+            d.current_causes[0].contains("滞回保持"),
+            "滞回带内文案应标注滞回保持，got: {}",
+            d.current_causes[0]
+        );
     }
 
     #[test]
@@ -629,5 +697,25 @@ mod tests {
             "真实大流量 spike 应触发，got: {:?}",
             d.current_causes
         );
+    }
+
+    // --- cause 类型去重 key ---
+
+    #[test]
+    fn cause_key_groups_hysteresis_variants() {
+        // 滞回带内/外文案不同，但类型 key 一致 → 同一条 cause 更新而非追加
+        assert_eq!(
+            cause_key("CPU usage 95.0% > 90%"),
+            cause_key("CPU usage 85.0%（滞回保持，阈值 90%）")
+        );
+        assert_eq!(
+            cause_key("Swap usage 55.0% > 50%"),
+            cause_key("Swap usage 45.0%（滞回保持，阈值 50%）")
+        );
+        // 硬阈值与 spike 是不同 cause
+        assert_ne!(cause_key("CPU usage 95.0% > 90%"), cause_key("CPU spike: 1.0% → 3.0%"));
+        // spike 各类型互不混淆
+        assert_ne!(cause_key("Disk write spike: 1B/s → 3B/s"), cause_key("Network spike: 1B/s → 3B/s"));
+        assert_ne!(cause_key("Memory available spike: 1MB → 3MB"), cause_key("Available memory 100MB < 500MB"));
     }
 }
