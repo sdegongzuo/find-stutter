@@ -58,6 +58,9 @@ pub struct ProcessRow {
     pub net_bps: u64,
     /// 累计网络等非磁盘 I/O 字节（OtherTransferCount 当前值）
     pub net_total_bytes: u64,
+    /// 监听 TCP 端口 + UDP 端口（去重 + 排序后的端口号列表）。
+    /// 空 = 无端口。
+    pub ports: Vec<u16>,
     /// 运行状态（中文）
     pub status: String,
 }
@@ -71,6 +74,9 @@ pub struct ProcessSampler {
     prev_time: Option<Instant>,
     /// 全机物理内存（字节；sample() 时更新，聚合行内存占比用）
     total_mem: u64,
+    /// 上次采样的 pid → 端口列表（sample() 期间重新枚举；
+    /// 用于进程行的「端口」列展示；缓存避免每帧重复 GetExtendedTcpTable）
+    port_cache: HashMap<u32, Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,6 +96,7 @@ impl ProcessSampler {
             sys,
             prev_io: HashMap::new(),
             prev_time: None,
+            port_cache: HashMap::new(),
         }
     }
 
@@ -107,6 +114,10 @@ impl ProcessSampler {
         // 全机物理内存（字节）——内存占比/高亮判断用
         self.total_mem = self.sys.total_memory().max(1);
         let total_mem = self.total_mem;
+
+        // 端口快照：每轮重新枚举（监听 TCP + 全部 UDP）；
+        // 系统级调用几十毫秒，进程列表刷新间隔 ≥ 500ms，开销可接受。
+        self.port_cache = port_map();
 
         let mut rows: Vec<ProcessRow> = Vec::with_capacity(self.sys.processes().len());
         let mut next_io: HashMap<u32, IoSnapshot> = HashMap::new();
@@ -136,6 +147,8 @@ impl ProcessSampler {
             // （权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
             let ws = p.memory();
             let mem = process_commit_bytes(pid_u32).unwrap_or(ws);
+            // 监听/UDP 端口：port_map 里有就取，没有就是空（绝大多数进程无端口）
+            let ports = self.port_cache.get(&pid_u32).cloned().unwrap_or_default();
             rows.push(ProcessRow {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
@@ -148,6 +161,7 @@ impl ProcessSampler {
                 disk_write_bps: write_bps,
                 net_bps,
                 net_total_bytes: cur.other,
+                ports,
                 status: format_status(p.status()),
             });
         }
@@ -156,6 +170,12 @@ impl ProcessSampler {
         self.prev_time = Some(now);
 
         rows
+    }
+
+    /// 采样时缓存的 pid → 端口列表（聚合行的端口合并、详情面板的端口列表用）。
+    /// 返回空 vec 表示该进程无监听端口；不返回 None。
+    pub fn ports_of(&self, pid: u32) -> Vec<u16> {
+        self.port_cache.get(&pid).cloned().unwrap_or_default()
     }
 
     /// 逻辑 CPU 核数（用于 CPU 归一化）
@@ -190,7 +210,7 @@ pub fn rank_processes(rows: &mut [ProcessRow], limit: usize) -> Vec<ProcessRow> 
 }
 
 /// 按指定列排序（任务管理器风格；纯函数，可单测）。
-/// `column`：pid / name / cpu / mem / disk / net；`ascending`：升序。
+/// `column`：pid / name / cpu / mem / disk / net / port；`ascending`：升序。
 pub fn sort_processes(rows: &mut [ProcessRow], column: &str, ascending: bool) {
     let cmp = |a: &ProcessRow, b: &ProcessRow| -> std::cmp::Ordering {
         let o = match column {
@@ -200,6 +220,20 @@ pub fn sort_processes(rows: &mut [ProcessRow], column: &str, ascending: bool) {
             "mem" => a.memory_bytes.cmp(&b.memory_bytes),
             "disk" => (a.disk_read_bps + a.disk_write_bps).cmp(&(b.disk_read_bps + b.disk_write_bps)),
             "net" => a.net_bps.cmp(&b.net_bps),
+            // 端口：按端口数量排序（无端口的沉底升序 / 顶端降序）；
+            // 同数量时按最小端口号排序，结果稳定。
+            "port" => {
+                let an = a.ports.len();
+                let bn = b.ports.len();
+                let by_count = an.cmp(&bn);
+                if by_count != std::cmp::Ordering::Equal {
+                    by_count
+                } else {
+                    let a_min = a.ports.first().copied().unwrap_or(u16::MAX);
+                    let b_min = b.ports.first().copied().unwrap_or(u16::MAX);
+                    a_min.cmp(&b_min)
+                }
+            }
             _ => a.pid.cmp(&b.pid),
         };
         if ascending { o } else { o.reverse() }
@@ -368,7 +402,7 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
 }
 
 /// 按列排序聚合组（任务管理器风格；纯函数，可单测）。
-/// `column`：pid / name / cpu / mem / disk / net / nettotal / status。
+/// `column`：pid / name / cpu / mem / disk / net / nettotal / status / port。
 ///
 /// 性能：key（聚合值 + 小写名）先对每个组预计算一次，再对索引排序，
 /// 最后单次重排——避免比较器内反复 `group_aggregate`（原实现把聚合成本
@@ -389,6 +423,22 @@ pub fn sort_groups(groups: &mut [GroupedProcess], column: &str, ascending: bool)
                 "disk" => (agg.disk_read_bps + agg.disk_write_bps) as f64,
                 "net" => agg.net_bps as f64,
                 "nettotal" => agg.net_total_bytes as f64,
+                // 端口：聚合组的所有端口（root + children）合并去重；
+                // 主键 = 端口数量；用 (数量*100000 + 最小端口) 把两个比较
+                // 维度压成一个 f64 避免破坏 (f64, String) key 结构。
+                // 最小端口的 +MAX 把"无端口"组排到末尾（升序时）。
+                "port" => {
+                    let mut all: Vec<u16> = g.root.ports.clone();
+                    for c in &g.children {
+                        all.extend_from_slice(&c.ports);
+                    }
+                    all.sort();
+                    all.dedup();
+                    let count = all.len() as f64;
+                    let min_port = all.first().copied().unwrap_or(u16::MAX) as f64;
+                    // 用 100000 作为端口号最大可能值（1-65535）的放大系数
+                    count * 100_000.0 + min_port
+                }
                 _ => 0.0,
             };
             (num, g.name.to_ascii_lowercase())
@@ -1083,6 +1133,138 @@ pub fn port_owners(_port: u16) -> Vec<(u32, String, String, String)> {
     Vec::new()
 }
 
+/// 枚举当前所有「进程 → 端口号列表」：监听 TCP + 全部 UDP（去重 + 升序）。
+///
+/// 用于进程详情页的「端口」列：
+/// - TCP 只取 `LISTEN` 状态（避免每个连接都占一行；任务管理器只显示监听端口）
+/// - UDP 全部（UDP 无状态，所有条目都是「占用」）
+/// - pid=0 的系统条目过滤掉
+/// - 同一 pid 的端口去重 + 升序，方便显示稳定（端口号在调用间不会跳来跳去）
+#[cfg(windows)]
+pub fn port_map() -> std::collections::HashMap<u32, Vec<u16>> {
+    use std::collections::{BTreeSet, HashMap};
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCPTABLE_OWNER_PID, MIB_TCP_STATE_LISTEN,
+        MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
+    };
+    const AF_INET: u32 = 2;
+    const NO_ERROR: u32 = 0;
+
+    let mut out: HashMap<u32, BTreeSet<u16>> = HashMap::new();
+
+    unsafe {
+        // ---- TCP LISTEN ----
+        let mut size: u32 = 0;
+        let r = GetExtendedTcpTable(None, &mut size, false, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
+        if r == ERROR_INSUFFICIENT_BUFFER.0 && size > 0 {
+            let mut buf = vec![0u8; size as usize];
+            let r2 = GetExtendedTcpTable(
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut size,
+                false,
+                AF_INET,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if r2 == NO_ERROR {
+                let table = &*(buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(
+                    table.table.as_ptr(),
+                    table.dwNumEntries as usize,
+                );
+                for row in rows {
+                    // MIB_TCP_STATE 是 i32 newtype；row.dwState 是 u32，
+                    // 不能直接 ==（类型不匹配）。用 .0 取内部 i32 再比较。
+                    if row.dwState != MIB_TCP_STATE_LISTEN.0 as u32 {
+                        continue;
+                    }
+                    if row.dwOwningPid == 0 {
+                        continue;
+                    }
+                    let lp = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+                    out.entry(row.dwOwningPid).or_default().insert(lp);
+                }
+            }
+        }
+        // ---- UDP 全部 ----
+        let mut size: u32 = 0;
+        let r = GetExtendedUdpTable(None, &mut size, false, AF_INET, UDP_TABLE_OWNER_PID, 0);
+        if r == ERROR_INSUFFICIENT_BUFFER.0 && size > 0 {
+            let mut buf = vec![0u8; size as usize];
+            let r2 = GetExtendedUdpTable(
+                Some(buf.as_mut_ptr() as *mut _),
+                &mut size,
+                false,
+                AF_INET,
+                UDP_TABLE_OWNER_PID,
+                0,
+            );
+            if r2 == NO_ERROR {
+                let table = &*(buf.as_ptr() as *const MIB_UDPTABLE_OWNER_PID);
+                let rows = std::slice::from_raw_parts(
+                    table.table.as_ptr(),
+                    table.dwNumEntries as usize,
+                );
+                for row in rows {
+                    if row.dwOwningPid == 0 {
+                        continue;
+                    }
+                    let lp = u16::from_be((row.dwLocalPort & 0xffff) as u16);
+                    out.entry(row.dwOwningPid).or_default().insert(lp);
+                }
+            }
+        }
+    }
+
+    // BTreeSet → Vec（小集合，多次 to_vec 比 HashMap 排序便宜）
+    out.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
+}
+
+#[cfg(not(windows))]
+pub fn port_map() -> std::collections::HashMap<u32, Vec<u16>> {
+    Default::default()
+}
+
+/// 端口列表 → 显示字符串。
+/// - 空 → "—"
+/// - 1 个 → "80"
+/// - 2 个 → "80, 443"
+/// - 3+ 个 → "80, 443 +N"（前两个 + 剩余数量；悬浮详情用 port-full 看完整）
+pub fn format_ports_short(ports: &[u16]) -> String {
+    match ports.len() {
+        0 => "—".to_string(),
+        1 => ports[0].to_string(),
+        2 => format!("{}, {}", ports[0], ports[1]),
+        _ => format!("{}, {} +{}", ports[0], ports[1], ports.len() - 2),
+    }
+}
+
+/// 端口列表 → 完整字符串（悬浮详情用）：按逗号分隔全部。
+pub fn format_ports_full(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        "无监听端口".to_string()
+    } else {
+        ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// 合并多个进程的端口（去重 + 升序）。聚合行显示用。
+pub fn merge_ports(pids_ports: &[Vec<u16>]) -> Vec<u16> {
+    use std::collections::BTreeSet;
+    let mut set: BTreeSet<u16> = BTreeSet::new();
+    for v in pids_ports {
+        for p in v {
+            set.insert(*p);
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// TCP 状态码 → 中文（MIB_TCP_STATE）。
 #[cfg(windows)]
 fn tcp_state_text(state: u32) -> String {
@@ -1310,6 +1492,8 @@ pub fn row_to_slint(
     net_full: String,
     net_total: String,
     net_total_full: String,
+    port: String,
+    port_full: String,
     is_group: bool,
     child_count: i32,
 ) -> crate::ProcessRowData {
@@ -1329,6 +1513,8 @@ pub fn row_to_slint(
         net_full: SharedString::from(net_full),
         net_total: SharedString::from(net_total),
         net_total_full: SharedString::from(net_total_full),
+        port: SharedString::from(port),
+        port_full: SharedString::from(port_full),
         is_group,
         child_count,
     }
@@ -1366,6 +1552,8 @@ fn row_display(
         format_net_full(r),
         format_net_total(r),
         format_net_total_full(r),
+        format_ports_short(&r.ports),
+        format_ports_full(&r.ports),
         false,
         0,
     )
@@ -1419,6 +1607,13 @@ fn group_display(
             g.name.clone(),
         )
     };
+    // 聚合端口：合并 root + 所有 children 的端口（去重升序）
+    let mut all_ports: Vec<Vec<u16>> = Vec::with_capacity(1 + g.children.len());
+    all_ports.push(g.root.ports.clone());
+    for c in &g.children {
+        all_ports.push(c.ports.clone());
+    }
+    let merged_ports = merge_ports(&all_ports);
     row_to_slint(
         agg.pid,
         title,
@@ -1435,6 +1630,8 @@ fn group_display(
         format_net_full(agg),
         format_net_total(agg),
         format_net_total_full(agg),
+        format_ports_short(&merged_ports),
+        format_ports_full(&merged_ports),
         true,
         count,
     )
@@ -2092,6 +2289,8 @@ fn render(
                             String::new(),
                             String::new(),
                             String::new(),
+                            String::new(),
+                            String::new(),
                             false,
                             0,
                         ));
@@ -2186,6 +2385,7 @@ mod tests {
             disk_write_bps: 0,
             net_bps: 0,
             net_total_bytes: 0,
+            ports: Vec::new(),
             status: "运行中".into(),
         }
     }
@@ -2686,5 +2886,81 @@ mod tests {
         let mut groups = group_processes(&rows, &no_services());
         sort_groups(&mut groups, "status", true);
         assert_eq!(groups[0].name, "aaa.exe");
+    }
+
+    // ===== 端口（port_map / format_ports_* / sort by port）=====
+
+    #[test]
+    fn format_ports_short_covers_all_cases() {
+        assert_eq!(format_ports_short(&[]), "—");
+        assert_eq!(format_ports_short(&[80]), "80");
+        assert_eq!(format_ports_short(&[80, 443]), "80, 443");
+        assert_eq!(format_ports_short(&[80, 443, 8080]), "80, 443 +1");
+        assert_eq!(format_ports_short(&[1, 2, 3, 4, 5]), "1, 2 +3");
+    }
+
+    #[test]
+    fn format_ports_full_joins_all() {
+        assert_eq!(format_ports_full(&[]), "无监听端口");
+        assert_eq!(format_ports_full(&[80]), "80");
+        assert_eq!(format_ports_full(&[80, 443, 8080]), "80, 443, 8080");
+    }
+
+    #[test]
+    fn merge_ports_dedups_and_sorts() {
+        assert_eq!(merge_ports(&[]), Vec::<u16>::new());
+        assert_eq!(merge_ports(&[vec![443, 80]]), vec![80, 443]);
+        // 跨多进程去重 + 升序
+        assert_eq!(
+            merge_ports(&[vec![443, 80], vec![80, 8080], vec![9090]]),
+            vec![80, 443, 8080, 9090]
+        );
+    }
+
+    #[test]
+    fn sort_processes_by_port_count_then_min() {
+        // 排序键：(端口数量, 最小端口) — 数量优先，相同时按最小端口
+        // 数量主键：升序 = 少→多；降序 = 多→少
+        // tiebreak（最小端口）：升序 = 小→大；降序 = 大→小
+        let mut r1 = row(1, "no-port.exe", 0.0, 0); // 0 端口
+        r1.ports = vec![];
+        let mut r2 = row(2, "one.exe", 0.0, 0); // 1 端口(80)
+        r2.ports = vec![80];
+        let mut r3 = row(3, "two-high.exe", 0.0, 0); // 2 端口(8080, 9090)
+        r3.ports = vec![8080, 9090];
+        let mut r4 = row(4, "two-low.exe", 0.0, 0); // 2 端口(80, 443)
+        r4.ports = vec![80, 443];
+        let mut rows = vec![r1.clone(), r2, r3, r4];
+
+        // 降序：端口多 → 端口少；同数量按 min 端口大→小
+        sort_processes(&mut rows, "port", false);
+        assert_eq!(rows[0].name, "two-high.exe"); // 2 个，min=8080
+        assert_eq!(rows[1].name, "two-low.exe"); // 2 个，min=80
+        assert_eq!(rows[2].name, "one.exe"); // 1 个
+        assert_eq!(rows[3].name, "no-port.exe"); // 0 个
+
+        // 升序：端口少 → 端口多；同数量按 min 端口小→大
+        sort_processes(&mut rows, "port", true);
+        assert_eq!(rows[0].name, "no-port.exe");
+        assert_eq!(rows[1].name, "one.exe");
+        assert_eq!(rows[2].name, "two-low.exe"); // 2 个，min=80
+        assert_eq!(rows[3].name, "two-high.exe"); // 2 个，min=8080
+    }
+
+    #[test]
+    fn sort_groups_by_port_merges_children() {
+        // 聚合端口：root + children 合并去重升序 → 排序
+        let mut r1 = row_p(1, 0, "svc.exe", 10.0, 100);
+        r1.ports = vec![80];
+        let mut c1 = row_p(2, 1, "svc.exe", 5.0, 50);
+        c1.ports = vec![443, 8080]; // 与 root 合并 → 3 端口
+        let mut r2 = row_p(3, 0, "empty.exe", 20.0, 200);
+        r2.ports = vec![]; // 0 端口
+        let rows = vec![r1, c1, r2];
+        let mut groups = group_processes(&rows, &no_services());
+        sort_groups(&mut groups, "port", false);
+        // svc.exe(3 端口, 最小 80) 排第一，empty.exe(0 端口) 排第二
+        assert_eq!(groups[0].name, "svc.exe");
+        assert_eq!(groups[1].name, "empty.exe");
     }
 }

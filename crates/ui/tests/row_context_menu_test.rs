@@ -63,6 +63,8 @@ fn row(pid: i32, name: &str) -> find_stutter_ui::ProcessRowData {
         net_full: String::new().into(),
         net_total: "0 B".into(),
         net_total_full: String::new().into(),
+        port: "—".into(),
+        port_full: "无监听端口".into(),
         is_group: false,
         child_count: 0,
     }

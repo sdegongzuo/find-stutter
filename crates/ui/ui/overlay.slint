@@ -282,6 +282,8 @@ struct ProcessRowData {
     net-full: string,      // 网络速率完整详情
     net-total: string,     // 累计网络传输量 "3.5G"
     net-total-full: string, // 累计网络完整详情
+    port: string,          // 监听端口 "80, 443" / "—" / "80, 443 +3"
+    port-full: string,     // 端口完整列表（悬浮详情）
     is-group: bool,        // 是否为聚合父节点
     child-count: int,      // 聚合的子进程数（非聚合 = 0）
 }
@@ -322,106 +324,138 @@ component ProcessRow inherits Rectangle {
     HorizontalLayout {
         height: 29px;
         padding-left: 6px;
-        spacing: 4px;
+        // 列间距 8px：PID-名称/数字-数字都让出空间，名字不会贴数字
+        spacing: 8px;
 
-        // PID（固定宽，超出截断 + 悬浮）
+        // PID（右对齐贴近名称列；min/max-width 强制不被 layout 用 preferred-width 覆盖）
         Text {
-            width: 60px;
+            min-width: 56px;
+            max-width: 56px;
             height: 100%;
             text: root.data.is-group ? "" : root.data.pid;
             color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
         }
 
-        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行；占两列宽）
+        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行；左对齐）
         Text {
-            width: 220px;
+            min-width: 184px;
+            max-width: 184px;
             height: 100%;
             text: root.data.is-group ? (root.data.child-count > 0 ? "▼ " : "▶ ") + root.data.name : root.data.name;
             color: root.data.is-group ? #1e88e5 : #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: left;
             vertical-alignment: center;
             Tooltip { text: @markdown("\{root.data.name-full}"); }
         }
 
-        // CPU（高占用标红加粗）
+        // CPU（高占用标红加粗；右对齐贴近下一列）
         Text {
-            width: 62px;
+            min-width: 56px;
+            max-width: 56px;
             height: 100%;
             text: data.cpu;
             color: data.cpu-high ? #c44c4c : #1e1e2e;
             font-weight: data.cpu-high ? 700 : 400;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
         }
 
-        // 内存（提交大小；高占用标红加粗）
+        // 内存（提交大小；高占用标红加粗；右对齐）
         Text {
-            width: 76px;
+            min-width: 64px;
+            max-width: 64px;
             height: 100%;
             text: data.mem;
             color: data.mem-high ? #c44c4c : #1e1e2e;
             font-weight: data.mem-high ? 700 : 400;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
         }
 
-        // 物理内存（工作集）
+        // 物理内存（工作集；右对齐）
         Text {
-            width: 76px;
+            min-width: 64px;
+            max-width: 64px;
             height: 100%;
             text: data.physical-mem;
             color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
         }
 
-        // 磁盘（超出截断 + 悬浮完整）
+        // 磁盘（加宽到 132px 装下 "R 217.8K/s W 28.6K/s"；右对齐 + 悬浮完整）
         Text {
-            width: 96px;
+            min-width: 132px;
+            max-width: 132px;
             height: 100%;
             text: data.disk;
             color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
             Tooltip { text: @markdown("\{data.disk-full}"); }
         }
 
-        // 网络（速率）
+        // 网络（速率；右对齐）
         Text {
-            width: 60px;
+            min-width: 56px;
+            max-width: 56px;
             height: 100%;
             text: data.net;
             color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
             Tooltip { text: @markdown("\{data.net-full}"); }
         }
 
-        // 累计网络传输量
+        // 累计网络传输量（右对齐）
         Text {
-            width: 64px;
+            min-width: 66px;
+            max-width: 66px;
             height: 100%;
             text: data.net-total;
             color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
+            horizontal-alignment: right;
             vertical-alignment: center;
             Tooltip { text: @markdown("\{data.net-total-full}"); }
+        }
+
+        // 端口（监听 TCP + UDP；右对齐；空时显示 "—"；110px 装下
+        // "80, 443 +11" 这类长列表，WorkBuddy(13) 等聚合行也能完整显示）
+        Text {
+            min-width: 110px;
+            max-width: 110px;
+            height: 100%;
+            text: data.port;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+            Tooltip { text: @markdown("\{data.port-full}"); }
         }
     }
 }
 
 export component ProcessList inherits Window {
-    width: 880px;
+    width: 870px;
     height: 506px;
     always-on-top: true;
     title: "find-stutter - 进程详情";
@@ -508,7 +542,6 @@ export component ProcessList inherits Window {
 
                     ComboBox {
                         width: 84px;
-                        height: 26px;
                         model: ["0.5s", "1s", "2s", "5s", "30s"];
                         current-index: root.refresh-interval-index;
                         selected(value) => { root.refresh-interval-changed(value); }
@@ -532,94 +565,142 @@ export component ProcessList inherits Window {
                 z: 2;
                 height: 22px;
                 padding-left: 6px;
-                spacing: 4px;
+                // 与数据行同间距 8px
+                spacing: 8px;
 
                 // 每个列头：Text + TouchArea + 排序箭头
                 Rectangle {
-                    width: 60px;
+                    min-width: 56px;
+                    max-width: 56px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("pid"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "PID" + (root.sort-column == "pid" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 220px;
+                    min-width: 184px;
+                    max-width: 184px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("name"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: left;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 62px;
+                    min-width: 56px;
+                    max-width: 56px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("cpu"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "CPU" + (root.sort-column == "cpu" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 76px;
+                    min-width: 64px;
+                    max-width: 64px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("mem"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 76px;
+                    min-width: 64px;
+                    max-width: 64px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("pmem"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "物理内存" + (root.sort-column == "pmem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 96px;
+                    min-width: 132px;
+                    max-width: 132px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("disk"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "磁盘" + (root.sort-column == "disk" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 60px;
+                    min-width: 56px;
+                    max-width: 56px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("net"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "网络" + (root.sort-column == "net" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
                 Rectangle {
-                    width: 64px;
+                    min-width: 66px;
+                    max-width: 66px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("nettotal"); } }
                     Text {
+                        width: 100%;
+                        height: 100%;
                         text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    min-width: 110px;
+                    max-width: 110px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("port"); } }
+                    Text {
+                        width: 100%;
+                        height: 100%;
+                        text: "端口" + (root.sort-column == "port" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                        color: #606060;
+                        font-size: 11px;
+                        horizontal-alignment: right;
                         vertical-alignment: center;
                     }
                 }
