@@ -242,8 +242,10 @@ pub fn filter_processes(rows: &[ProcessRow], keyword: &str) -> Vec<ProcessRow> {
 /// 任务管理器折叠效果的聚合规则：
 /// 1. **同名归类**：Name 相同的进程归为一组
 /// 2. **找主进程（Root）**：组内 PPID 不属于本组（被其他应用 / explorer
-///    拉起）的进程即主进程；其余进程塌陷为它的子节点
-/// 3. **svchost.exe 特殊处理**：不显示 "svchost.exe"，而是查该 PID 绑定的
+///    拉起）的进程即主进程；**同名多 root 时每个 root 生成独立组**
+/// 3. **子进程按 PPID 归属**：组内其余进程沿 PPID 链向上，挂到对应 root 下
+///    （孙进程也扁平归入该 root 的 children）
+/// 4. **svchost.exe 特殊处理**：不显示 "svchost.exe"，而是查该 PID 绑定的
 ///    服务显示名（`EnumServicesStatusEx`），主条目显示「服务宿主: [组名]」，
 ///    展开显示具体服务列表
 #[derive(Debug, Clone, PartialEq)]
@@ -266,6 +268,9 @@ impl GroupedProcess {
 
 /// 按「同名 + PPID 父子关系」聚合（纯函数，可单测）。
 /// `services`：pid → 服务名（svchost 特殊聚合用；可为空 Map）。
+///
+/// 同名多 root（如多个被各自父进程拉起的 chrome）时，每个 root 生成独立
+/// 聚合组；子进程沿 PPID 链归属到对应 root（孙进程扁平化进 children）。
 pub fn group_processes(
     rows: &[ProcessRow],
     services: &std::collections::HashMap<u32, Vec<String>>,
@@ -280,28 +285,87 @@ pub fn group_processes(
     }
 
     let mut out: Vec<GroupedProcess> = Vec::new();
-    for (key, mut group_rows) in by_name {
-        // 2) 找主进程：PPID 不属于本组的进程
+    for (_key, group_rows) in by_name {
         let pids: std::collections::HashSet<u32> =
             group_rows.iter().map(|r| r.pid).collect();
-        let root_idx = group_rows
-            .iter()
-            .position(|r| !pids.contains(&r.parent_pid))
-            .unwrap_or(0); // 全在组内（罕见环）→ 取第一个为主
-        let root = group_rows.remove(root_idx);
-        let children = group_rows;
+        let pid_to_row: std::collections::HashMap<u32, &ProcessRow> =
+            group_rows.iter().map(|r| (r.pid, r)).collect();
 
-        // 3) svchost 特殊聚合：查服务名
-        let services_of_root = services.get(&root.pid).cloned().unwrap_or_default();
-        out.push(GroupedProcess {
-            name: root.name.clone(),
-            root,
-            children,
-            services: services_of_root,
-        });
-        let _ = key;
+        // 2) 找所有 root：PPID 不在本组 PID 集合中（被外部进程拉起的顶层进程）
+        let roots: Vec<&ProcessRow> = group_rows
+            .iter()
+            .filter(|r| !pids.contains(&r.parent_pid))
+            .collect();
+
+        if roots.is_empty() {
+            // 罕见环（所有 PPID 都在组内）：取第一个为主进程，其余全为子节点
+            let root = group_rows[0].clone();
+            out.push(GroupedProcess {
+                name: root.name.clone(),
+                root,
+                children: group_rows[1..].to_vec(),
+                services: services.get(&group_rows[0].pid).cloned().unwrap_or_default(),
+            });
+            continue;
+        }
+
+        // 3) 每个 root 生成独立组；其余进程沿 PPID 链归属到对应 root
+        let root_pids: std::collections::HashSet<u32> =
+            roots.iter().map(|r| r.pid).collect();
+        let root_index: std::collections::HashMap<u32, usize> = roots
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.pid, i))
+            .collect();
+        let mut groups: Vec<(ProcessRow, Vec<ProcessRow>)> = roots
+            .iter()
+            .map(|r| ((*r).clone(), Vec::new()))
+            .collect();
+        for r in &group_rows {
+            if root_index.contains_key(&r.pid) {
+                continue; // root 已建组
+            }
+            // 沿 PPID 链找所属 root；环/异常保底挂第一个 root
+            let root_pid = find_root_pid(r.pid, &pid_to_row, &root_pids)
+                .unwrap_or(roots[0].pid);
+            let idx = root_index.get(&root_pid).copied().unwrap_or(0);
+            groups[idx].1.push(r.clone());
+        }
+        for (root, children) in groups {
+            let svc = services.get(&root.pid).cloned().unwrap_or_default();
+            out.push(GroupedProcess {
+                name: root.name.clone(),
+                root,
+                children,
+                services: svc,
+            });
+        }
     }
     out
+}
+
+/// 沿 PPID 链向上找进程所属的 root pid（父链在组内走到 root）。
+/// 环 / 父链断裂（父不在组内且非 root）时返回 None，由调用方保底。
+fn find_root_pid(
+    pid: u32,
+    pid_to_row: &std::collections::HashMap<u32, &ProcessRow>,
+    root_pids: &std::collections::HashSet<u32>,
+) -> Option<u32> {
+    let mut cur = pid;
+    let mut visited: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    loop {
+        if root_pids.contains(&cur) {
+            return Some(cur);
+        }
+        if !visited.insert(cur) {
+            return None; // 环
+        }
+        let next = pid_to_row.get(&cur).map(|r| r.parent_pid)?;
+        if next == cur {
+            return None; // 自父（异常）
+        }
+        cur = next;
+    }
 }
 
 /// 聚合组 → 汇总行（主进程 + 子进程求和的聚合值）。
@@ -2260,6 +2324,51 @@ mod tests {
         let groups = group_processes(&rows, &no_services());
         assert_eq!(groups[0].root.pid, 1);
         assert_eq!(groups[0].children.len(), 1);
+    }
+
+    #[test]
+    fn group_multi_root_creates_separate_groups() {
+        // 同名多 root：3 个 chrome 都被外部进程（explorer/不同父）拉起 → 3 个独立组
+        let rows = vec![
+            row_p(100, 500, "chrome.exe", 10.0, 100), // 500 外部
+            row_p(200, 501, "chrome.exe", 20.0, 200), // 501 外部
+            row_p(300, 502, "chrome.exe", 30.0, 300), // 502 外部
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let chromes: Vec<&GroupedProcess> =
+            groups.iter().filter(|g| g.name == "chrome.exe").collect();
+        assert_eq!(chromes.len(), 3, "每个 root 应生成独立组");
+        for g in &chromes {
+            assert!(g.children.is_empty());
+        }
+        // root PID 集合完整
+        let mut pids: Vec<u32> = chromes.iter().map(|g| g.root.pid).collect();
+        pids.sort();
+        assert_eq!(pids, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn group_children_attach_by_ppid_chain() {
+        // 两个 chrome root（100、300，父进程 900/901 不在组内）+ 各自子进程
+        // + 孙进程（500 → 200 → 100）：子进程按 PPID 链归属，孙进程扁平化
+        let rows = vec![
+            row_p(100, 900, "chrome.exe", 10.0, 100),  // root（900 外部）
+            row_p(200, 100, "chrome.exe", 20.0, 200),  // 100 的子
+            row_p(300, 901, "chrome.exe", 30.0, 300),  // root（901 外部）
+            row_p(400, 300, "chrome.exe", 40.0, 400),  // 300 的子
+            row_p(500, 200, "chrome.exe", 50.0, 500),  // 孙：200 → 100
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let chromes: Vec<&GroupedProcess> =
+            groups.iter().filter(|g| g.name == "chrome.exe").collect();
+        assert_eq!(chromes.len(), 2);
+        let g100 = chromes.iter().find(|g| g.root.pid == 100).unwrap();
+        let mut c100: Vec<u32> = g100.children.iter().map(|c| c.pid).collect();
+        c100.sort();
+        assert_eq!(c100, vec![200, 500], "200 直接子、500 孙进程都应归 100");
+        let g300 = chromes.iter().find(|g| g.root.pid == 300).unwrap();
+        assert_eq!(g300.children.len(), 1);
+        assert_eq!(g300.children[0].pid, 400);
     }
 
     #[test]
