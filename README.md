@@ -11,7 +11,7 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 - **悬浮窗闪烁提醒**：检测到 `major` / `critical` 卡顿时，窗口边框脉冲闪烁（红/橙）。
 - **详情面板**：单击窗口展开，显示今日流量、CPU 频率、温度、卡顿次数、进程/线程数。
 - **原生拖拽**：在窗口上按住拖动，由系统负责重绘，无重影/闪烁。
-- **右键菜单**：暂停/恢复监控、展开详情、点击穿透、退出。
+- **右键菜单**：暂停/恢复监控、进程详情、点击穿透、退出。
 - **点击穿透模式**：窗口鼠标事件穿透（看得到点不到），按 `T` 退出穿透。
 - **SQLite 持久化**：采样与卡顿事件写入 `stutter.db`（WAL 模式，读写并发无锁）。
 - **P3 服务化架构**（已完成）：独立 Windows 服务做采集写库，GUI 只读 SQLite 轮询；服务停止时 UI 顶部状态条变红「● 服务已停止」并禁用暂停按钮。
@@ -247,10 +247,6 @@ cargo test --workspace
 # bin:       5 CLI 测试
 # 合计 250 个测试（0 失败）
 ```
-
-> 注：GUI 入口是 `crates/bin`（package `find-stutter`，link `find-stutter-ui` 库）。
-> 改完 UI 代码后需重新编译该入口：`cargo build --release -p find-stutter`（只编
-> `-p find-stutter-ui` 不会更新 `target/release/find-stutter.exe`）。
 
 ## 已知限制 / 后续计划
 
