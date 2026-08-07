@@ -1313,8 +1313,10 @@ fn group_display(
 /// 进程列表窗口句柄。
 pub struct ProcessListWindow {
     ui: crate::ProcessList,
-    /// 最近一次采样的全量进程行缓存（渲染/搜索/展开直接用，避免反复采样）
-    cache: Mutex<Vec<ProcessRow>>,
+    /// 最近一次采样的全量进程行缓存（渲染/搜索/展开直接用，避免反复采样）。
+    /// 与采样线程共享同一个 Arc（构造时由 `cache` 传入，非新建），
+    /// 否则 `refresh()` 首帧读到的永远是空列表。
+    cache: Arc<Mutex<Vec<ProcessRow>>>,
     /// 快照采集器（采样线程持有操作；本字段仅作 Arc 持有者，
     /// 与采样线程闭包共享同一实例）
     #[allow(dead_code)]
@@ -1731,7 +1733,10 @@ impl ProcessListWindow {
 
         Ok(Self {
             ui,
-            cache: Mutex::new(Vec::new()),
+            // 复用与采样线程共享的 cache Arc（而非 Mutex::new(Vec::new())）：
+            // 否则 refresh() 用 self.cache 渲染时读不到采样线程写入的数据，
+            // 进程详情页第一次打开（lib.rs 创建后立即 refresh()）会显示空列表。
+            cache,
             sampler,
             sort,
             search,
@@ -1765,7 +1770,7 @@ impl ProcessListWindow {
         }
         render(
             &self.ui,
-            &self.cache,
+            &*self.cache,
             &self.sort,
             &self.search,
             &self.expanded,
