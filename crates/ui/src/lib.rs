@@ -144,6 +144,13 @@ pub fn run() -> anyhow::Result<()> {
                 Some(crate::window::NativeMenuCmd::TogglePause) => {
                     let mut s = state_for_menu.lock();
                     s.paused = !s.paused;
+                    let p = s.paused;
+                    drop(s);
+                    log::info!("右键菜单暂停监控: {}", if p { "暂停" } else { "恢复" });
+                    // 同步悬浮窗右下角按钮文字（slint 端按钮仅本地翻转自己的状态）
+                    if let Some(ui2) = weak_ui_for_menu.upgrade() {
+                        ui2.set_paused(p);
+                    }
                 }
                 Some(crate::window::NativeMenuCmd::ToggleClickThrough) => {
                     let mut s = state_for_menu.lock();
@@ -183,6 +190,15 @@ pub fn run() -> anyhow::Result<()> {
                 None => {} // 用户取消（点空白 / Esc）
             }
         }
+    });
+
+    // 3a3) 悬浮窗右下角暂停按钮 → 真正切换暂停状态（slint 端已翻转按钮文字，
+    //      这里翻转共享状态；1Hz tick 在 paused 时冻结指标显示与卡顿通知）
+    let state_for_pause = state.clone();
+    ui.on_toggle_pause(move || {
+        let mut s = state_for_pause.lock();
+        s.paused = !s.paused;
+        log::info!("暂停按钮: {}", if s.paused { "暂停" } else { "恢复" });
     });
 
     // 3b) P1：系统托盘图标（后台线程 + win32 消息循环；失败不阻塞 GUI）
@@ -278,11 +294,12 @@ pub fn run() -> anyhow::Result<()> {
                 watcher.clear_debounce();
             }
 
+            let paused = state_for_tick.lock().paused;
             let poll: PollResult = reader_for_tick.poll();
-            // 1) 更新共享状态
+            // 1) 更新共享状态（暂停时也保持数据新鲜，恢复后立即显示最新值）
             state_for_tick.lock().update_from_poll(&poll);
-            // 1b) P2：检测到新的 Major/Critical 事件 → 弹系统通知
-            {
+            // 1b) P2：检测到新的 Major/Critical 事件 → 弹系统通知（暂停时不弹）
+            if !paused {
                 let mut s = state_for_tick.lock();
                 if let Some(ev) = &poll.event {
                     if crate::notify::should_notify(s.last_notified_at, ev, &config.notifications) {
@@ -291,14 +308,23 @@ pub fn run() -> anyhow::Result<()> {
                     }
                 }
             }
-            // 2) 推到 Slint（窗口已关闭时不操作）
-            if let Some(ui) = weak_ui.upgrade() {
-                let s = state_for_tick.lock();
-                overlay::apply_metrics(&ui, &s);
-                // P2：任务栏窗口同步（若启用）
-                if let Some(tb) = &taskbar_for_tick {
-                    tb.apply(&s);
+            // 2) 推到 Slint（窗口已关闭时不操作；暂停时冻结指标显示）
+            if !paused {
+                if let Some(ui) = weak_ui.upgrade() {
+                    let s = state_for_tick.lock();
+                    overlay::apply_metrics(&ui, &s);
+                    // P2：任务栏窗口同步（若启用）
+                    if let Some(tb) = &taskbar_for_tick {
+                        tb.apply(&s);
+                    }
                 }
+            } else if let Some(ui) = weak_ui.upgrade() {
+                // 暂停中：指标冻结，但服务状态行明确显示「已暂停」，
+                // 恢复后由 apply_metrics 恢复为真实服务状态
+                ui.set_service_status(slint::SharedString::from("⏸ 已暂停"));
+                ui.set_service_status_color(slint::Brush::SolidColor(
+                    slint::Color::from_rgb_u8(0x8a, 0x8a, 0x92),
+                ));
             }
         },
     );
