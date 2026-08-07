@@ -42,7 +42,8 @@ pub struct ProcessRow {
     pub name: String,
     /// CPU 使用率（0.0 ~ 100.0×核数；显示前归一化）
     pub cpu_usage: f32,
-    /// 常驻内存字节数
+    /// 内存字节数（提交大小 Commit Size = `PagefileUsage`，与任务管理器
+    /// 「详细信息」页「内存」列口径一致；取不到时回退工作集）
     pub memory_bytes: u64,
     /// 内存占用百分比（相对全机物理内存；高亮判断用）
     pub memory_pct: f32,
@@ -146,7 +147,10 @@ impl ProcessSampler {
             };
             seen_pids.insert(pid_u32);
 
-            let mem = p.memory();
+            // 内存口径与任务管理器「详细信息」页一致：提交大小（Commit
+            // Size = PagefileUsage，含已换出到页面文件的私有页）。取不到
+            // （权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
+            let mem = process_commit_bytes(pid_u32).unwrap_or_else(|| p.memory());
             rows.push(ProcessRow {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
@@ -629,7 +633,9 @@ fn process_start_time(pid: u32) -> Option<String> {
     }
 }
 
-/// 进程内存明细：工作集 + 私有字节（`GetProcessMemoryInfo`）。
+/// 进程内存明细：工作集 + 提交大小（`GetProcessMemoryInfo`）。
+/// 元组第二项 `PagefileUsage` = 提交大小（Commit Size），即任务管理器
+/// 「详细信息」页「内存」列的取值口径。
 #[cfg(windows)]
 fn process_memory_detail(pid: u32) -> Option<(u64, u64)> {
     use windows::Win32::Foundation::CloseHandle;
@@ -648,6 +654,19 @@ fn process_memory_detail(pid: u32) -> Option<(u64, u64)> {
         ok.ok()?;
         Some((mc.WorkingSetSize as u64, mc.PagefileUsage as u64))
     }
+}
+
+/// 进程提交大小（Commit Size = `PagefileUsage`，含已换出到页面文件的私有页）。
+/// 任务管理器「详细信息」页「内存」列的取值口径。失败（权限不足 /
+/// 进程已退出）返回 None，调用方应回退其他口径。
+#[cfg(windows)]
+fn process_commit_bytes(pid: u32) -> Option<u64> {
+    process_memory_detail(pid).map(|(_, commit)| commit)
+}
+
+#[cfg(not(windows))]
+fn process_commit_bytes(_pid: u32) -> Option<u64> {
+    None
 }
 
 /// 生成以 NUL 结尾的 UTF-16 缓冲（MessageBoxW / ShellExecuteW 用）。
