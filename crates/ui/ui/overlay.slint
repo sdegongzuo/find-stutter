@@ -105,31 +105,31 @@ export component Overlay inherits Window {
             width: parent.width;
             height: parent.height;
             padding: 6px;
-            spacing: 8px;
+            spacing: 5.6px; // 列间距（原 8px，缩小 30%）
 
-            // 左列
+            // 左列（33%）
             VerticalLayout {
                 spacing: 1px;
-                width: 50%;
+                width: 33%;
                 Text { text: cpu-text; color: root.cpu-color; font-size: root.text-size; }
                 Text { text: mem-text; color: root.mem-color; font-size: root.text-size; }
                 Text { text: event-count; color: root.event-color; font-size: max(10px, root.text-size - 3px); }
             }
 
-            // 右列
+            // 右列（占剩余空间 67%）
             VerticalLayout {
                 spacing: 1px;
-                width: 50%;
+                width: 67%;
                 Text { text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
                 // 网速/磁盘各两行：上传+读一行，下载+写一行（网速左、磁盘右）
                 HorizontalLayout {
                     spacing: 4px;
-                    Text { text: net-send; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
+                    Text { text: net-send; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
                     Text { text: disk-read; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
                 }
                 HorizontalLayout {
                     spacing: 4px;
-                    Text { text: net-recv; color: root.net-color; font-size: max(10px, root.text-size - 3px); }
+                    Text { text: net-recv; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
                     Text { text: disk-write; color: root.disk-color; font-size: max(10px, root.text-size - 3px); }
                 }
             }
@@ -267,7 +267,7 @@ component ProcessRow inherits Rectangle {
     callback context-menu(int, string);
     // 非聚合行单击（Rust 端做双击检测 → 弹详情面板）
     callback row-clicked(int);
-    height: 26px;
+    height: 29px;
 
     // 行分隔线
     Rectangle {
@@ -295,7 +295,7 @@ component ProcessRow inherits Rectangle {
     }
 
     HorizontalLayout {
-        height: 26px;
+        height: 29px;
         padding-left: 6px;
         spacing: 4px;
 
@@ -408,8 +408,8 @@ component ProcessRow inherits Rectangle {
 }
 
 export component ProcessList inherits Window {
-    width: 800px;
-    height: 460px;
+    width: 880px;
+    height: 506px;
     always-on-top: true;
     title: "find-stutter - 进程详情";
     no-frame: true;
