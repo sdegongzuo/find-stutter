@@ -128,9 +128,9 @@ impl Default for DetectionConfig {
             mem_threshold_mb: 500,
             swap_threshold: 50.0,
             swap_hysteresis: 10.0,
-            disk_rate_spike_ratio: 5.0,
-            spike_ratio: 2.0,
-            spike_min_bps: 1_000_000,
+            disk_rate_spike_ratio: 10.0,
+            spike_ratio: 3.0,
+            spike_min_bps: 2_000_000,
             sustained_seconds: 3,
         }
     }
@@ -145,7 +145,7 @@ fn default_swap_hysteresis() -> f32 {
 }
 
 fn default_spike_min_bps() -> u64 {
-    1_000_000
+    2_000_000
 }
 
 /// 采样配置
@@ -428,8 +428,9 @@ mod tests {
         assert_eq!(c.mem_threshold_percent, 90.0);
         assert_eq!(c.mem_threshold_mb, 500);
         assert_eq!(c.swap_threshold, 50.0);
-        assert_eq!(c.disk_rate_spike_ratio, 5.0);
-        assert_eq!(c.spike_ratio, 2.0);
+        assert_eq!(c.disk_rate_spike_ratio, 10.0);
+        assert_eq!(c.spike_ratio, 3.0);
+        assert_eq!(c.spike_min_bps, 2_000_000);
         assert_eq!(c.sustained_seconds, 3);
     }
 

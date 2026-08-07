@@ -12,6 +12,12 @@ pub struct Detector {
     cpu_active: bool,
     /// Swap 滞回状态（同上）
     swap_active: bool,
+    /// spike 滞回状态（各指标独立）：触发后需明显回落才解除，
+    /// 配合「连续确认」（recent 中 ≥6/10 超阈值）避免瞬时抖动误报
+    cpu_spike_active: bool,
+    disk_spike_active: bool,
+    net_spike_active: bool,
+    mem_spike_active: bool,
 }
 
 impl Detector {
@@ -23,6 +29,10 @@ impl Detector {
             current_causes: Vec::new(),
             cpu_active: false,
             swap_active: false,
+            cpu_spike_active: false,
+            disk_spike_active: false,
+            net_spike_active: false,
+            mem_spike_active: false,
         }
     }
 
@@ -138,7 +148,7 @@ impl Detector {
         causes
     }
 
-    fn check_spike(&self) -> Vec<String> {
+    fn check_spike(&mut self) -> Vec<String> {
         let mut causes = Vec::new();
         let len = self.history.len();
         if len < 70 {
@@ -148,49 +158,67 @@ impl Detector {
         let recent = &self.history[len - 10..];
         let baseline = &self.history[len - 70..len - 10];
 
+        // CPU / Disk write / Network：上升方向 spike（只认突增，速率骤降
+        // = 传输完成不算），连续确认（10 样本 ≥6 超阈值）+ 滞回（触发后
+        // 需明显回落才解除），避免瞬时抖动与阈值附近反复横跳。
+        let cpu_r: Vec<f32> = recent.iter().map(|s| s.cpu_usage).collect();
+        let cpu_b: Vec<f32> = baseline.iter().map(|s| s.cpu_usage).collect();
         Self::spike_check(
             &mut causes,
             "CPU",
             "%",
-            recent.iter().map(|s| s.cpu_usage).collect(),
-            baseline.iter().map(|s| s.cpu_usage).collect(),
+            &cpu_r,
+            &cpu_b,
             self.config.spike_ratio,
             0.0, // CPU 为百分比，无绝对下限
+            &mut self.cpu_spike_active,
         );
 
+        let disk_r: Vec<f32> = recent.iter().map(|s| s.disk_write_bps as f32).collect();
+        let disk_b: Vec<f32> = baseline.iter().map(|s| s.disk_write_bps as f32).collect();
         Self::spike_check(
             &mut causes,
             "Disk write",
             "B/s",
-            recent.iter().map(|s| s.disk_write_bps as f32).collect(),
-            baseline.iter().map(|s| s.disk_write_bps as f32).collect(),
+            &disk_r,
+            &disk_b,
             self.config.disk_rate_spike_ratio,
             self.config.spike_min_bps as f32,
+            &mut self.disk_spike_active,
         );
 
+        let net_r: Vec<f32> = recent
+            .iter()
+            .map(|s| (s.net_sent_bps + s.net_recv_bps) as f32)
+            .collect();
+        let net_b: Vec<f32> = baseline
+            .iter()
+            .map(|s| (s.net_sent_bps + s.net_recv_bps) as f32)
+            .collect();
         Self::spike_check(
             &mut causes,
             "Network",
             "B/s",
-            recent
-                .iter()
-                .map(|s| (s.net_sent_bps + s.net_recv_bps) as f32)
-                .collect(),
-            baseline
-                .iter()
-                .map(|s| (s.net_sent_bps + s.net_recv_bps) as f32)
-                .collect(),
+            &net_r,
+            &net_b,
             self.config.spike_ratio,
             self.config.spike_min_bps as f32,
+            &mut self.net_spike_active,
         );
 
-        let recent_mem: Vec<f32> = recent.iter().map(|s| s.mem_available_mb as f32).collect();
-        let baseline_mem: Vec<f32> = baseline.iter().map(|s| s.mem_available_mb as f32).collect();
-        let r_avg = recent_mem.iter().sum::<f32>() / recent_mem.len() as f32;
-        let b_avg = baseline_mem.iter().sum::<f32>() / baseline_mem.len() as f32;
+        // 内存可用率 spike：方向相反（可用内存骤降才算），同样滞回。
+        let mem_r: Vec<f32> = recent.iter().map(|s| s.mem_available_mb as f32).collect();
+        let mem_b: Vec<f32> = baseline.iter().map(|s| s.mem_available_mb as f32).collect();
+        let r_avg = avg(&mem_r);
+        let b_avg = avg(&mem_b);
         if b_avg > 1.0 {
-            let ratio = (b_avg - r_avg).abs() / b_avg;
+            let ratio = (b_avg - r_avg).max(0.0) / b_avg;
             if ratio > self.config.spike_ratio {
+                self.mem_spike_active = true;
+            } else if ratio < self.config.spike_ratio * 0.5 {
+                self.mem_spike_active = false;
+            }
+            if self.mem_spike_active {
                 causes.push(format!(
                     "Memory available spike: {:.0}MB → {:.0}MB",
                     b_avg, r_avg
@@ -201,27 +229,39 @@ impl Detector {
         causes
     }
 
+    /// 上升方向 spike 检查（CPU / 磁盘写 / 网络）：
+    /// - 只认突增：`v > b_avg` 才计，速率骤降不触发
+    /// - 绝对下限：单样本 `v >= min_abs` 才算超阈值（网络/磁盘防零头误报）
+    /// - 连续确认：recent 10 样本中 ≥6 个超阈值才置为激活
+    /// - 滞回：激活后需 recent 均值回落到 `threshold * 0.5` 以下才解除
+    ///   （滞回带内维持激活，避免反复横跳）
     fn spike_check(
         causes: &mut Vec<String>,
         name: &str,
         unit: &str,
-        recent: Vec<f32>,
-        baseline: Vec<f32>,
+        recent: &[f32],
+        baseline: &[f32],
         threshold: f32,
         min_abs: f32,
+        active: &mut bool,
     ) {
-        let r_avg = recent.iter().sum::<f32>() / recent.len() as f32;
-        let b_avg = baseline.iter().sum::<f32>() / baseline.len() as f32;
-        // 绝对下限：当前速率必须达到 min_abs 才判定 spike（网络/磁盘用，
-        // 避免空闲零头 B/s 被倍数放大误报）。CPU 传 0 表示不设下限。
-        if r_avg >= min_abs && b_avg > 1.0 {
-            let ratio = (r_avg - b_avg).abs() / b_avg;
-            if ratio > threshold {
-                causes.push(format!(
-                    "{} spike: {:.1}{} → {:.1}{}",
-                    name, b_avg, unit, r_avg, unit
-                ));
-            }
+        const CONFIRM_MIN: usize = 6; // recent 10 样本中至少 6 个超阈值
+        let r_avg = avg(recent);
+        let b_avg = avg(baseline);
+        let over = recent
+            .iter()
+            .filter(|&&v| v >= min_abs && b_avg > 1.0 && v > b_avg && (v - b_avg) / b_avg > threshold)
+            .count();
+        if over >= CONFIRM_MIN {
+            *active = true;
+        } else if b_avg <= 1.0 || (r_avg - b_avg).max(0.0) / b_avg < threshold * 0.5 {
+            *active = false;
+        }
+        if *active {
+            causes.push(format!(
+                "{} spike: {:.1}{} → {:.1}{}",
+                name, b_avg, unit, r_avg, unit
+            ));
         }
     }
 
@@ -234,6 +274,15 @@ impl Detector {
         } else {
             Severity::Minor
         }
+    }
+}
+
+/// f32 切片均值（空切片返回 0）。
+fn avg(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f32>() / v.len() as f32
     }
 }
 
@@ -717,5 +766,81 @@ mod tests {
         // spike 各类型互不混淆
         assert_ne!(cause_key("Disk write spike: 1B/s → 3B/s"), cause_key("Network spike: 1B/s → 3B/s"));
         assert_ne!(cause_key("Memory available spike: 1MB → 3MB"), cause_key("Available memory 100MB < 500MB"));
+    }
+
+    // --- spike 优化：只认突增 / 连续确认 / 滞回 ---
+
+    /// 速率骤降（传输完成、写盘结束）不应触发 spike（旧实现用 abs 会误报）。
+    #[test]
+    fn spike_ignores_rate_drop() {
+        let config = DetectionConfig::default(); // spike_ratio=3.0, min=2MB
+        let mut d = Detector::new(&config);
+
+        // 60 个基线（10 MB/s）→ 10 个 recent（1 MB/s，下降 90%）
+        for _ in 0..60 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 10_000_000));
+        }
+        for _ in 0..10 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 1_000_000));
+        }
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("spike")),
+            "速率骤降不应触发 spike，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 单次/零星尖峰不触发：recent 10 样本中仅 3 个超阈值（<6）。
+    #[test]
+    fn spike_requires_confirmation() {
+        let config = DetectionConfig::default();
+        let mut d = Detector::new(&config);
+
+        // 60 个基线（1 MB/s）+ 10 个 recent：7 个 1MB + 3 个 5MB（ratio 4 > 3）
+        for _ in 0..60 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 1_000_000));
+        }
+        for _ in 0..7 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 1_000_000));
+        }
+        for _ in 0..3 {
+            d.analyze(&make_sample_net(30.0, 2000, 10.0, 5_000_000));
+        }
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Network spike")),
+            "零星尖峰不应触发（需 ≥6/10 确认），got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// spike 滞回：触发后 recent 均值回落到中间带（ratio 在 threshold*0.5 ~
+    /// threshold 之间）仍保持激活；明显回落后才解除。
+    #[test]
+    fn spike_hysteresis_keeps_active_in_band() {
+        let config = DetectionConfig::default(); // spike_ratio=3.0 → 触发 3，解除 <1.5
+        let _d = Detector::new(&config);
+        let mut active = false;
+
+        // 触发：recent 全部 8.0（ratio (8-1.5)/1.5=4.33 > 3，over=10）
+        let recent = vec![8.0f32; 10];
+        let baseline = vec![1.5f32; 60];
+        let mut causes = Vec::new();
+        Detector::spike_check(&mut causes, "Network", "B/s", &recent, &baseline, 3.0, 2.0, &mut active);
+        assert!(active);
+        assert!(causes.iter().any(|c| c.contains("Network spike")));
+
+        // 滞回带内：recent 均值 5.0（ratio 2.33：>1.5 不解除，<3 不触发）
+        let recent2 = vec![5.0f32; 10];
+        let mut causes2 = Vec::new();
+        Detector::spike_check(&mut causes2, "Network", "B/s", &recent2, &baseline, 3.0, 2.0, &mut active);
+        assert!(active, "滞回带内应保持激活");
+        assert!(causes2.iter().any(|c| c.contains("Network spike")));
+
+        // 明显回落：recent 均值 2.0（ratio 0.33 < 1.5）→ 解除
+        let recent3 = vec![2.0f32; 10];
+        let mut causes3 = Vec::new();
+        Detector::spike_check(&mut causes3, "Network", "B/s", &recent3, &baseline, 3.0, 2.0, &mut active);
+        assert!(!active, "明显回落后应解除");
+        assert!(causes3.is_empty());
     }
 }

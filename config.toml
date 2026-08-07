@@ -25,12 +25,12 @@ swap_threshold = 50.0
 # 滞回带内维持当前状态，避免反复记录
 swap_hysteresis = 10.0
 # 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
-disk_rate_spike_ratio = 5.0
+disk_rate_spike_ratio = 10.0
 # 综合指标相对基线的突增倍数
-spike_ratio = 2.0
+spike_ratio = 3.0
 # 网络/磁盘 spike 的绝对下限（B/s）：当前速率低于该值不判定 spike，
 # 避免空闲时几 B/s ~ 几十 KB/s 的零头波动按倍数误报
-spike_min_bps = 1000000
+spike_min_bps = 2000000
 # 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
 
