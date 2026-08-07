@@ -1357,7 +1357,9 @@ pub struct ProcessListWindow {
     stop_sampling: Arc<AtomicBool>,
     /// 手动刷新置位 → 采样线程立即采样（refresh() 用）
     sample_now: Arc<AtomicBool>,
-    /// 采样完成版本号（每次 +1；refresh() 等它变化）
+    /// 采样完成版本号（每次 +1；采样线程局部逻辑保留）。
+    /// refresh() 已改为非阻塞（不再同步等版本变化），此字段仅作 Arc 持有者。
+    #[allow(dead_code)]
     cache_version: Arc<Mutex<u64>>,
     /// 采样线程句柄（#12：采样移出 UI 线程）
     sampler_handle: Option<std::thread::JoinHandle<()>>,
@@ -1701,18 +1703,23 @@ impl ProcessListWindow {
             }
         });
 
-        // 自动刷新（默认 30s，标题栏下拉可调）：只从 cache 快照重绘
-        // （采样已由独立线程完成，UI 不阻塞在 sysinfo 上）
+        // 自动刷新：首帧用 1s 快速间隔。采样线程首轮 sysinfo 初始化可能
+        // 耗时数秒，快速 tick 保证窗口一打开、数据一就绪就立即渲染；
+        // 一旦渲染到非空数据，切换回用户配置的刷新间隔（标题栏下拉可调）。
         let weak_tick = ui.as_weak();
         let sort_tick = sort.clone();
         let search_tick = search.clone();
         let expanded_tick = expanded.clone();
         let shared_tick = shared.clone();
         let refresh_ms_tick = refresh_ms.clone();
+        let cache_data_tick = cache_tick.clone();
         let tick_timer = Arc::new(slint::Timer::default());
+        let timer_for_first = tick_timer.clone();
+        let first_done = Arc::new(AtomicBool::new(false));
+        let first_done_cb = first_done.clone();
         tick_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(*refresh_ms_tick.lock().unwrap()),
+            Duration::from_millis(1000),
             move || {
                 if let Some(ui) = weak_tick.upgrade() {
                     render(
@@ -1723,6 +1730,14 @@ impl ProcessListWindow {
                         &expanded_tick,
                         &shared_tick,
                     );
+                    // 首帧渲染到非空数据 → 恢复正常刷新节奏（只切一次，
+                    // 之后间隔由标题栏下拉回调管理）
+                    let has_data = !cache_data_tick.lock().unwrap().is_empty();
+                    if has_data && !first_done_cb.swap(true, Ordering::SeqCst) {
+                        timer_for_first.set_interval(Duration::from_millis(
+                            *refresh_ms_tick.lock().unwrap(),
+                        ));
+                    }
                 }
             },
         );
@@ -1770,22 +1785,17 @@ impl ProcessListWindow {
         })
     }
 
-    /// 立即刷新：通知采样线程采样一次 + 等完成 + 重绘（若窗口已关闭则先显示）。
+    /// 立即刷新：用当前缓存重绘 + 通知采样线程尽快采样（若窗口已关闭则先显示）。
+    ///
+    /// 非阻塞：不在 UI 线程同步死等采样完成（旧实现等 3s，首轮 sysinfo
+    /// 初始化可能耗时数秒 → 超时后渲染空缓存 → 首次显示空列表，且 3s 阻塞
+    /// 发生在菜单回调所在线程导致窗口卡顿）。数据未就绪时由 show() 里注册的
+    /// 1s 快速 tick 在采样完成后自动补齐渲染。
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
             let _ = self.ui.show();
             // show 可能触发 winit 重算样式 → 重新确保不在任务栏显示
             crate::window::ensure_tool_window_for(self.ui.window());
-        }
-        // 不直接 sample()（避免与后台采样线程共享 ProcessSampler 交错
-        // 污染 prev_io/prev_time 速率差分基线）：置位后等版本号变化
-        let before = *self.cache_version.lock().unwrap();
-        self.sample_now.store(true, Ordering::SeqCst);
-        for _ in 0..300 {
-            if *self.cache_version.lock().unwrap() != before {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
         }
         render(
             &self.ui,
@@ -1795,6 +1805,9 @@ impl ProcessListWindow {
             &self.expanded,
             &self.shared,
         );
+        // 通知采样线程尽快采样（异步，不等待）；不直接 sample()（避免与
+        // 后台采样线程共享 ProcessSampler 交错污染速率差分基线）
+        self.sample_now.store(true, Ordering::SeqCst);
     }
 
     /// 底层 Slint 窗口（供 tick 守护重新设置任务栏样式）。
