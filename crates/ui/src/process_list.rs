@@ -705,21 +705,48 @@ fn hit_test_row(ui: &crate::ProcessList, sx: i32, sy: i32) -> Option<(i32, Strin
 
 /// 打开进程可执行文件所在的位置（任务管理器「打开文件所在的位置」）。
 ///
-/// 流程：`QueryFullProcessImageNameW` 取完整路径 → 启动 `explorer /select,<path>`
-/// 打开资源管理器并选中该文件。失败（权限不足 / 进程已退出 / 无法启动资源管理器）
-/// 返回 `Err`。
+/// 流程：`QueryFullProcessImageNameW` 取完整路径 → `ShellExecuteW` 启动
+/// `explorer /select,<path>` 打开资源管理器并选中该文件。失败（权限不足 /
+/// 进程已退出 / 无法启动资源管理器）返回 `Err`。
+#[cfg(windows)]
 pub fn open_process_location(pid: u32) -> anyhow::Result<()> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
     let path = process_exe_path(pid).ok_or_else(|| {
         anyhow::anyhow!("无法获取进程 {} 的可执行文件路径（权限不足或进程已退出）", pid)
     })?;
     log::info!("打开文件所在的位置: {} (PID {})", path, pid);
-    // explorer 非标准解析命令行参数：把整个 `/select,"path"` 作为单个参数传入，
-    // 路径含空格也能正确选中目标文件。
-    std::process::Command::new("explorer.exe")
-        .arg(format!("/select,\"{}\"", path))
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("启动资源管理器失败: {}", e))
+    // explorer 对命令行的解析非标准：`/select,"path"` 的引号必须原样保留，
+    // 路径含空格时才能正确选中目标文件。
+    // 用 ShellExecuteW 直接传 UTF-16 参数字符串（不经 CreateProcessW 命令行
+    // 转义），避免 `Command::arg` 把引号转义成 `\"` 导致路径被破坏。
+    // 与 elevate_kill_process 的写法保持一致。
+    let params = format!("/select,\"{}\"", path);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            windows::core::w!("explorer.exe"),
+            windows::core::PCWSTR(wide_static(&params).as_ptr()),
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    // 返回 HINSTANCE > 32 表示成功；<= 32 是错误码（与 elevate_kill_process 一致）
+    if result.0 as usize <= 32 {
+        Err(anyhow::anyhow!(
+            "ShellExecuteW 启动资源管理器失败 (code={})",
+            result.0 as usize
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn open_process_location(_pid: u32) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!("当前平台不支持打开文件所在位置"))
 }
 
 /// 查询进程可执行文件完整路径（`QueryFullProcessImageNameW`，Win32 格式如
