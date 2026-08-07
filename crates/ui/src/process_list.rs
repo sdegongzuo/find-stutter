@@ -1926,10 +1926,10 @@ fn interval_ms_to_text(ms: u64) -> &'static str {
 }
 
 /// 进程列表布局常量（逻辑像素）——与 overlay.slint `ProcessList` 布局**双源**：
-/// 列表从标题栏（~70px）下方开始，行高 26px。改动 slint 布局时需同步此处
+/// 列表从标题栏（~70px）下方开始，行高 29px。改动 slint 布局时需同步此处
 /// （hit_test_row 命中测试依赖）。
 const LIST_TOP: f32 = 70.0;
-const ROW_HEIGHT: f32 = 26.0;
+const ROW_HEIGHT: f32 = 29.0;
 
 /// 渲染共享的只读状态（各回调 clone 一份 `Arc<RenderShared>` 传入 render，
 /// 避免每个回调各自 clone 4 个 Arc）。
