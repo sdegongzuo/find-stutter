@@ -271,10 +271,10 @@ struct ProcessRowData {
     name: string,          // 显示名（截断；聚合父节点为 "name (N)"）
     name-full: string,     // 完整名（悬浮详情）
     group-key: string,     // 聚合键（原始进程名；非聚合行 = 空）
-    user: string,          // 所属用户（"SYSTEM" / 用户名）
     cpu: string,           // "45.2%"（归一化后）
     cpu-high: bool,        // CPU 超过高亮阈值（标红加粗）
-    mem: string,           // "512 MB"
+    mem: string,           // "512 MB"（提交大小 Commit Size）
+    physical-mem: string,  // "420 MB"（物理内存/工作集）
     mem-high: bool,        // 内存超过高亮阈值（标红加粗）
     disk: string,          // "R 12K/s W 3K/s"（速率）
     disk-full: string,     // 磁盘完整详情
@@ -282,7 +282,6 @@ struct ProcessRowData {
     net-full: string,      // 网络速率完整详情
     net-total: string,     // 累计网络传输量 "3.5G"
     net-total-full: string, // 累计网络完整详情
-    status: string,        // 运行状态（中文）
     is-group: bool,        // 是否为聚合父节点
     child-count: int,      // 聚合的子进程数（非聚合 = 0）
 }
@@ -336,9 +335,9 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行）
+        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行；占两列宽）
         Text {
-            width: 130px;
+            width: 220px;
             height: 100%;
             text: root.data.is-group ? (root.data.child-count > 0 ? "▼ " : "▶ ") + root.data.name : root.data.name;
             color: root.data.is-group ? #1e88e5 : #1e1e2e;
@@ -346,18 +345,6 @@ component ProcessRow inherits Rectangle {
             overflow: elide;
             vertical-alignment: center;
             Tooltip { text: @markdown("\{root.data.name-full}"); }
-        }
-
-        // 所属用户
-        Text {
-            width: 90px;
-            height: 100%;
-            text: data.user;
-            color: #546e7a;
-            font-size: 12px;
-            overflow: elide;
-            vertical-alignment: center;
-            Tooltip { text: @markdown("所属用户: \{data.user}"); }
         }
 
         // CPU（高占用标红加粗）
@@ -372,13 +359,24 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 内存（高占用标红加粗）
+        // 内存（提交大小；高占用标红加粗）
         Text {
             width: 76px;
             height: 100%;
             text: data.mem;
             color: data.mem-high ? #c44c4c : #1e1e2e;
             font-weight: data.mem-high ? 700 : 400;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        // 物理内存（工作集）
+        Text {
+            width: 76px;
+            height: 100%;
+            text: data.physical-mem;
+            color: #1e1e2e;
             font-size: 12px;
             overflow: elide;
             vertical-alignment: center;
@@ -419,17 +417,6 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
             Tooltip { text: @markdown("\{data.net-total-full}"); }
         }
-
-        // 状态
-        Text {
-            width: 56px;
-            height: 100%;
-            text: data.status;
-            color: #1e1e2e;
-            font-size: 12px;
-            overflow: elide;
-            vertical-alignment: center;
-        }
     }
 }
 
@@ -466,6 +453,8 @@ export component ProcessList inherits Window {
     in property <string> detail-title: "";
     in property <string> detail-text: "";
     callback detail-close();
+    // 详情面板「复制」按钮（Rust 端全量复制 detail-text 到剪贴板）
+    callback detail-copy();
     // 右下角 resize 手柄：传 dx/dy（逻辑像素）
     callback resize-requested(length, length);
 
@@ -558,21 +547,11 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
-                    width: 130px;
+                    width: 220px;
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("name"); } }
                     Text {
                         text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
-                        color: #606060;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-                Rectangle {
-                    width: 90px;
-                    height: 100%;
-                    Text {
-                        text: "用户";
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -595,6 +574,17 @@ export component ProcessList inherits Window {
                     TouchArea { clicked => { root.sort-requested("mem"); } }
                     Text {
                         text: "内存" + (root.sort-column == "mem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                        color: #606060;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    width: 76px;
+                    height: 100%;
+                    TouchArea { clicked => { root.sort-requested("pmem"); } }
+                    Text {
+                        text: "物理内存" + (root.sort-column == "pmem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -628,27 +618,6 @@ export component ProcessList inherits Window {
                     TouchArea { clicked => { root.sort-requested("nettotal"); } }
                     Text {
                         text: "累计网络" + (root.sort-column == "nettotal" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
-                        color: #606060;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-                Rectangle {
-                    width: 56px;
-                    height: 100%;
-                    TouchArea { clicked => { root.sort-requested("status"); } }
-                    Text {
-                        text: "状态" + (root.sort-column == "status" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
-                        color: #606060;
-                        font-size: 11px;
-                        vertical-alignment: center;
-                    }
-                }
-                Rectangle {
-                    width: 44px;
-                    height: 100%;
-                    Text {
-                        text: "操作";
                         color: #606060;
                         font-size: 11px;
                         vertical-alignment: center;
@@ -705,6 +674,10 @@ export component ProcessList inherits Window {
                         horizontal-stretch: 1;
                     }
                     Button {
+                        text: "复制";
+                        clicked => { root.detail-copy(); }
+                    }
+                    Button {
                         text: "关闭";
                         clicked => { root.detail-close(); }
                     }
@@ -716,8 +689,9 @@ export component ProcessList inherits Window {
                     background: #d0d0d0;
                 }
 
-                // 详情内容（等宽字体，多行）
-                Text {
+                // 详情内容（等宽字体，多行；只读 TextInput → 可拖选文本，
+                // Ctrl+C 复制选中；「复制」按钮全量复制）
+                TextInput {
                     width: 100%;
                     height: 100%;
                     text: root.detail-text;
@@ -725,7 +699,11 @@ export component ProcessList inherits Window {
                     font-size: 13px;
                     font-family: "Consolas";
                     wrap: word-wrap;
+                    single-line: false;
+                    read-only: true;
                     vertical-alignment: top;
+                    selection-background-color: #cfe8ff;
+                    selection-foreground-color: #1e1e2e;
                 }
             }
         }

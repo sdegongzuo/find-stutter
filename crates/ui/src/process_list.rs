@@ -45,10 +45,11 @@ pub struct ProcessRow {
     /// 内存字节数（提交大小 Commit Size = `PagefileUsage`，与任务管理器
     /// 「详细信息」页「内存」列口径一致；取不到时回退工作集）
     pub memory_bytes: u64,
+    /// 物理内存字节数（工作集 Working Set；`sysinfo` 的 `p.memory()`）。
+    /// 「物理内存」列用；`memory_bytes` 是提交大小，两者并存展示。
+    pub physical_mem_bytes: u64,
     /// 内存占用百分比（相对全机物理内存；高亮判断用）
     pub memory_pct: f32,
-    /// 所属用户（"SYSTEM" / 用户名；查询失败为空）
-    pub user: String,
     /// 磁盘读速率（B/s）
     pub disk_read_bps: u64,
     /// 磁盘写速率（B/s）
@@ -70,9 +71,6 @@ pub struct ProcessSampler {
     prev_time: Option<Instant>,
     /// 全机物理内存（字节；sample() 时更新，聚合行内存占比用）
     total_mem: u64,
-    /// pid → 所属用户缓存（`process_user` 的 token 查询较贵，采样复用；
-    /// 每轮结束清理已退出进程的条目，防止 pid 复用后串到旧用户）
-    user_cache: HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +90,6 @@ impl ProcessSampler {
             sys,
             prev_io: HashMap::new(),
             prev_time: None,
-            user_cache: HashMap::new(),
         }
     }
 
@@ -113,8 +110,6 @@ impl ProcessSampler {
 
         let mut rows: Vec<ProcessRow> = Vec::with_capacity(self.sys.processes().len());
         let mut next_io: HashMap<u32, IoSnapshot> = HashMap::new();
-        // 本轮出现的 pid（采样结束时清理已退出进程的用户缓存，防 pid 复用串数据）
-        let mut seen_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
 
         for (pid, p) in self.sys.processes() {
             let pid_u32 = pid.as_u32();
@@ -136,29 +131,19 @@ impl ProcessSampler {
             };
             next_io.insert(pid_u32, cur);
 
-            // 用户查询有缓存则复用（token 查询较贵）
-            let user = match self.user_cache.get(&pid_u32) {
-                Some(u) => u.clone(),
-                None => {
-                    let u = process_user(pid_u32);
-                    self.user_cache.insert(pid_u32, u.clone());
-                    u
-                }
-            };
-            seen_pids.insert(pid_u32);
-
             // 内存口径与任务管理器「详细信息」页一致：提交大小（Commit
             // Size = PagefileUsage，含已换出到页面文件的私有页）。取不到
             // （权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
-            let mem = process_commit_bytes(pid_u32).unwrap_or_else(|| p.memory());
+            let ws = p.memory();
+            let mem = process_commit_bytes(pid_u32).unwrap_or(ws);
             rows.push(ProcessRow {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
                 name: p.name().to_string_lossy().into_owned(),
                 cpu_usage: p.cpu_usage(),
                 memory_bytes: mem,
+                physical_mem_bytes: ws,
                 memory_pct: mem_pct(mem, total_mem),
-                user,
                 disk_read_bps: read_bps,
                 disk_write_bps: write_bps,
                 net_bps,
@@ -166,8 +151,6 @@ impl ProcessSampler {
                 status: format_status(p.status()),
             });
         }
-        // 清理已退出进程的缓存条目
-        self.user_cache.retain(|pid, _| seen_pids.contains(pid));
 
         self.prev_io = next_io;
         self.prev_time = Some(now);
@@ -374,6 +357,7 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
     for r in &g.children {
         acc.cpu_usage += r.cpu_usage;
         acc.memory_bytes += r.memory_bytes;
+        acc.physical_mem_bytes += r.physical_mem_bytes;
         acc.disk_read_bps = acc.disk_read_bps.saturating_add(r.disk_read_bps);
         acc.disk_write_bps = acc.disk_write_bps.saturating_add(r.disk_write_bps);
         acc.net_bps = acc.net_bps.saturating_add(r.net_bps);
@@ -385,29 +369,60 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
 
 /// 按列排序聚合组（任务管理器风格；纯函数，可单测）。
 /// `column`：pid / name / cpu / mem / disk / net / nettotal / status。
+///
+/// 性能：key（聚合值 + 小写名）先对每个组预计算一次，再对索引排序，
+/// 最后单次重排——避免比较器内反复 `group_aggregate`（原实现把聚合成本
+/// 放大到 O(N log N × 子进程数)）。排序稳定，行为与原实现一致。
 pub fn sort_groups(groups: &mut [GroupedProcess], column: &str, ascending: bool) {
-    let key = |g: &GroupedProcess| -> (f64, String) {
-        let agg = group_aggregate(g);
-        let num = match column {
+    let by_name = matches!(column, "name" | "status");
+
+    // 1) 预计算 key：每个组只聚合/小写化一次
+    let keys: Vec<(f64, String)> = groups
+        .iter()
+        .map(|g| {
+            let agg = group_aggregate(g);
+            let num = match column {
             "pid" => agg.pid as f64,
             "cpu" => agg.cpu_usage as f64,
             "mem" => agg.memory_bytes as f64,
-            "disk" => (agg.disk_read_bps + agg.disk_write_bps) as f64,
-            "net" => agg.net_bps as f64,
-            "nettotal" => agg.net_total_bytes as f64,
-            _ => 0.0,
-        };
-        (num, g.name.to_ascii_lowercase())
-    };
-    groups.sort_by(|a, b| {
-        let (an, aname) = key(a);
-        let (bn, bname) = key(b);
-        let o = match column {
-            "name" | "status" => aname.cmp(&bname),
-            _ => an.partial_cmp(&bn).unwrap_or(std::cmp::Ordering::Equal),
+            "pmem" => agg.physical_mem_bytes as f64,
+                "disk" => (agg.disk_read_bps + agg.disk_write_bps) as f64,
+                "net" => agg.net_bps as f64,
+                "nettotal" => agg.net_total_bytes as f64,
+                _ => 0.0,
+            };
+            (num, g.name.to_ascii_lowercase())
+        })
+        .collect();
+
+    // 2) 排序索引（比较只发生在预计算 key 上；stable → 相等项保持原相对顺序）
+    let mut order: Vec<usize> = (0..groups.len()).collect();
+    order.sort_by(|&a, &b| {
+        let o = if by_name {
+            keys[a].1.cmp(&keys[b].1)
+        } else {
+            keys[a].0.partial_cmp(&keys[b].0).unwrap_or(std::cmp::Ordering::Equal)
         };
         if ascending { o } else { o.reverse() }
     });
+
+    // 3) 按排列重排：沿置换环就地 swap，每个元素只移动一次
+    //    （visited 保证每环只处理一遍，语义等价于 stable 重排）
+    let n = groups.len();
+    let mut visited = vec![false; n];
+    for i in 0..n {
+        if visited[i] {
+            continue;
+        }
+        visited[i] = true;
+        let mut cur = i;
+        while order[cur] != i {
+            let next = order[cur];
+            groups.swap(cur, next);
+            visited[next] = true;
+            cur = next;
+        }
+    }
 }
 
 /// `ProcessStatus` → 中文。
@@ -551,6 +566,42 @@ fn elevate_kill_process(pid: u32) {
 
 #[cfg(not(windows))]
 pub fn prompt_kill_failure(_pid: u32, _name: &str, _err: KillError) {}
+
+/// 把文本写入系统剪贴板（UTF-16 `CF_UNICODETEXT`）。详情面板「复制」按钮用。
+/// 剪贴板被其他线程占用时静默放弃（不阻塞 UI）。
+#[cfg(windows)]
+fn set_clipboard_text(text: &str) {
+    use windows::Win32::Foundation::{HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    // CF_UNICODETEXT = 13（windows crate 把它放 Win32_System_Ole 下且是 newtype，
+    // 为不引入整个 OLE feature，直接用标准值）
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if !OpenClipboard(Some(HWND::default())).is_ok() {
+            return;
+        }
+        if EmptyClipboard().is_ok() {
+            // UTF-16 编码 + 结尾 NUL（SetClipboardData 要求以 NUL 结尾）
+            let mut wide: Vec<u16> = text.encode_utf16().collect();
+            wide.push(0);
+            if let Ok(h) = GlobalAlloc(GMEM_MOVEABLE, wide.len() * std::mem::size_of::<u16>()) {
+                let ptr = GlobalLock(h);
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
+                    let _ = GlobalUnlock(h);
+                    let _ = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0)));
+                }
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+#[cfg(not(windows))]
+fn set_clipboard_text(_text: &str) {}
 
 /// 按需查询进程详情（双击行时调用，中等成本）：返回多行文本。
 /// `row`：当前快照行（CPU/内存/磁盘/网络显示用；None 时跳过这些）。
@@ -1248,10 +1299,10 @@ pub fn row_to_slint(
     name: String,
     name_full: String,
     group_key: String,
-    user: String,
     cpu: String,
     cpu_high: bool,
     mem: String,
+    physical_mem: String,
     mem_high: bool,
     disk: String,
     disk_full: String,
@@ -1259,7 +1310,6 @@ pub fn row_to_slint(
     net_full: String,
     net_total: String,
     net_total_full: String,
-    status: String,
     is_group: bool,
     child_count: i32,
 ) -> crate::ProcessRowData {
@@ -1268,10 +1318,10 @@ pub fn row_to_slint(
         name: SharedString::from(name),
         name_full: SharedString::from(name_full),
         group_key: SharedString::from(group_key),
-        user: SharedString::from(user),
         cpu: SharedString::from(cpu),
         cpu_high,
         mem: SharedString::from(mem),
+        physical_mem: SharedString::from(physical_mem),
         mem_high,
         disk: SharedString::from(disk),
         disk_full: SharedString::from(disk_full),
@@ -1279,7 +1329,6 @@ pub fn row_to_slint(
         net_full: SharedString::from(net_full),
         net_total: SharedString::from(net_total),
         net_total_full: SharedString::from(net_total_full),
-        status: SharedString::from(status),
         is_group,
         child_count,
     }
@@ -1306,10 +1355,10 @@ fn row_display(
         name,
         full_name,
         String::new(), // 普通行无 group-key
-        r.user.clone(),
         format!("{:.1}%", cpu_pct),
         cpu_high,
         format_mem(r.memory_bytes),
+        format_mem(r.physical_mem_bytes),
         mem_high,
         format_disk_short(r),
         format_disk_full(r),
@@ -1317,7 +1366,6 @@ fn row_display(
         format_net_full(r),
         format_net_total(r),
         format_net_total_full(r),
-        r.status.clone(),
         false,
         0,
     )
@@ -1376,10 +1424,10 @@ fn group_display(
         title,
         full_name,
         group_key,
-        String::new(), // 聚合行用户列显示空（多实例用户可能不同）
         format!("{:.1}%", cpu_pct),
         cpu_high,
         format_mem(agg.memory_bytes),
+        format_mem(agg.physical_mem_bytes),
         mem_high,
         format_disk_short(agg),
         format_disk_full(agg),
@@ -1387,7 +1435,6 @@ fn group_display(
         format_net_full(agg),
         format_net_total(agg),
         format_net_total_full(agg),
-        "运行中".into(),
         true,
         count,
     )
@@ -1412,6 +1459,10 @@ pub struct ProcessListWindow {
     expanded: Arc<Mutex<std::collections::HashSet<String>>>,
     /// 渲染共享状态（CPU 核数 / 高亮阈值 / 总内存 / 增量 model）
     shared: Arc<RenderShared>,
+    /// 最近一次打开的进程详情文本（详情面板「复制」按钮用；双击行时更新）。
+    /// 仅作 Arc 持有者（复制回调持有同一 Arc 的 clone），本字段不直接读取。
+    #[allow(dead_code)]
+    detail_text: Arc<Mutex<String>>,
     /// 自动刷新间隔（毫秒，来自 config.ui.process_refresh_ms；下拉可调）。
     /// 仅作为 Arc 持有者（采样线程 / UI timer / 下拉回调共享同一 Arc），
     /// 本结构体本身不读取。
@@ -1473,6 +1524,8 @@ impl ProcessListWindow {
             total_mem: total_mem.clone(),
             model_arc: model_arc.clone(),
         });
+        // 最近一次打开的详情文本（详情面板「复制」按钮用）
+        let detail_text: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
         // #12 采样/渲染分离：采样线程独立跑（UI 只消费 cache 快照），
         // 间隔跟随 refresh_ms（下拉可调，线程每轮读取）。
@@ -1687,6 +1740,7 @@ impl ProcessListWindow {
         let last_click_for_cb = last_click.clone();
         let cache_click = cache_tick.clone();
         let nb_cpus_click = nb_cpus.clone();
+        let detail_text_click = detail_text.clone();
         let weak_click_ui = ui.as_weak();
         ui.on_row_clicked(move |pid: i32| {
             let pid_u32 = pid as u32;
@@ -1718,6 +1772,7 @@ impl ProcessListWindow {
                     row.as_ref(),
                     *nb_cpus_click.lock().unwrap(),
                 );
+                *detail_text_click.lock().unwrap() = detail.clone(); // 供「复制」按钮使用
                 ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid_u32)));
                 ui.set_detail_text(SharedString::from(detail));
                 ui.set_detail_visible(true);
@@ -1731,6 +1786,18 @@ impl ProcessListWindow {
             if let Some(ui) = weak_detail_ui.upgrade() {
                 ui.set_detail_visible(false);
             }
+        });
+
+        // 详情面板「复制」按钮 → 全量复制详情文本到剪贴板
+        let detail_text_copy = detail_text.clone();
+        ui.on_detail_copy(move || {
+            let text = detail_text_copy.lock().unwrap().clone();
+            if text.is_empty() {
+                log::warn!("复制详情：无可复制内容");
+                return;
+            }
+            set_clipboard_text(&text);
+            log::info!("已复制进程详情到剪贴板（{} 字节）", text.len());
         });
 
         // 右下角 resize 手柄 → set_size
@@ -1840,6 +1907,7 @@ impl ProcessListWindow {
             search,
             expanded,
             shared,
+            detail_text,
             _refresh_ms: refresh_ms,
             stop_sampling,
             sample_now,
@@ -2014,17 +2082,16 @@ fn render(
                             full,
                             String::new(),
                             String::new(),
-                            String::new(),
-                            false,
-                            String::new(),
                             false,
                             String::new(),
                             String::new(),
+                            false,
                             String::new(),
                             String::new(),
                             String::new(),
                             String::new(),
-                            "服务".into(),
+                            String::new(),
+                            String::new(),
                             false,
                             0,
                         ));
@@ -2113,8 +2180,8 @@ mod tests {
             name: name.into(),
             cpu_usage: cpu,
             memory_bytes: mem_mb * 1024 * 1024,
+            physical_mem_bytes: mem_mb * 1024 * 1024,
             memory_pct: 0.0,
-            user: String::new(),
             disk_read_bps: 0,
             disk_write_bps: 0,
             net_bps: 0,
@@ -2381,6 +2448,7 @@ mod tests {
         let agg = group_aggregate(&groups[0]);
         assert_eq!(agg.cpu_usage, 40.0);
         assert_eq!(agg.memory_bytes, 400 * 1024 * 1024);
+        assert_eq!(agg.physical_mem_bytes, 400 * 1024 * 1024);
         assert_eq!(agg.pid, 1); // 取最小 PID
     }
 
@@ -2454,6 +2522,23 @@ mod tests {
         let mut groups = group_processes(&rows, &no_services());
         sort_groups(&mut groups, "mem", false);
         assert_eq!(groups[0].name, "b.exe"); // 内存大 → 降序在前
+        assert_eq!(groups[2].name, "a.exe");
+    }
+
+    #[test]
+    fn sort_groups_by_pmem() {
+        // 物理内存列：提交大小相同、工作集不同 → 按工作集排序
+        let mut rows = vec![
+            row(1, "a.exe", 10.0, 100),
+            row(2, "b.exe", 10.0, 100),
+            row(3, "c.exe", 10.0, 100),
+        ];
+        rows[1].physical_mem_bytes = 900 * 1024 * 1024; // b 工作集最大
+        rows[2].physical_mem_bytes = 500 * 1024 * 1024; // c 次之
+        let mut groups = group_processes(&rows, &no_services());
+        sort_groups(&mut groups, "pmem", false);
+        assert_eq!(groups[0].name, "b.exe");
+        assert_eq!(groups[1].name, "c.exe");
         assert_eq!(groups[2].name, "a.exe");
     }
 
