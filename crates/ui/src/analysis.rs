@@ -17,9 +17,9 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use slint::{Brush, Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{Brush, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 
-use crate::analytics::{self, parse_event_sort_column, EventSort, TimeRange};
+use crate::analytics::{self, parse_event_sort_column, EventSort, TimeRange, TrendBucket};
 
 /// 卡顿分析窗口句柄。
 pub struct AnalysisWindow {
@@ -41,6 +41,15 @@ pub struct AnalysisWindow {
     /// 同上，仅由回调闭包持有其克隆，结构体字段保留引用。
     #[allow(dead_code)]
     current_range: Arc<Mutex<TimeRange>>,
+    /// F1：当前趋势分桶粒度（高级模式可选，默认小时）
+    bucket: Arc<Mutex<TrendBucket>>,
+    /// F7：自动刷新定时器（高级模式；间隔变更时重启/停止）。用 `Arc<Mutex<>>` 包装以便
+    /// 在多个 'static 回调闭包间共享同一实例；单次创建、长期持有，回调捕获 Weak 句柄
+    /// 避免泄漏；切到「关闭」或窗口关闭时 stop()。
+    /// 结构体字段保留其一处强引用以维持存活（闭包亦各自持克隆），自身不被直接读取，
+    /// 故允许 dead_code。
+    #[allow(dead_code)]
+    auto_refresh_timer: Arc<Mutex<Timer>>,
 }
 
 impl AnalysisWindow {
@@ -58,6 +67,8 @@ impl AnalysisWindow {
         let custom_range: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
         let drill_filter: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let current_range: Arc<Mutex<TimeRange>> = Arc::new(Mutex::new(TimeRange::Today));
+        let bucket: Arc<Mutex<TrendBucket>> = Arc::new(Mutex::new(TrendBucket::Hour));
+        let auto_refresh_timer: Arc<Mutex<Timer>> = Arc::new(Mutex::new(Timer::default()));
 
         // 皮肤注入：让 Analysis 主框架跟随 skin.toml（与 Overlay/ProcessList 一致）
         apply_skin(&ui);
@@ -79,7 +90,10 @@ impl AnalysisWindow {
 
         // 关闭按钮 → 隐藏窗口（保留实例，下次打开复用）
         let weak_close = ui.as_weak();
+        // F7：窗口关闭时停掉自动刷新定时器，避免隐藏期间仍后台轮询
+        let timer_for_close = auto_refresh_timer.clone();
         ui.on_close_requested(move || {
+            timer_for_close.lock().unwrap().stop();
             if let Some(ui) = weak_close.upgrade() {
                 let _ = ui.hide();
             }
@@ -90,6 +104,7 @@ impl AnalysisWindow {
         let drill_for_toggle = drill_filter.clone();
         let custom_for_toggle = custom_range.clone();
         let range_for_toggle = current_range.clone();
+        let bucket_for_toggle = bucket.clone();
         let db_for_toggle = db_path.clone();
         let weak_toggle = ui.as_weak();
         ui.on_toggle_mode_changed(move |on| {
@@ -103,7 +118,8 @@ impl AnalysisWindow {
                 let range = range_for_toggle.lock().unwrap().clone();
                 // 自定义范围在有值时使用，否则回退默认
                 let range = resolve_range(range, &custom_for_toggle.lock().unwrap());
-                refresh_window(&ui, &db_for_toggle, range, on);
+                let b = *bucket_for_toggle.lock().unwrap();
+                refresh_window(&ui, &db_for_toggle, range, on, b);
             }
         });
 
@@ -112,6 +128,7 @@ impl AnalysisWindow {
         let range_for_cb = range_index.clone();
         let custom_for_cb = custom_range.clone();
         let current_for_cb = current_range.clone();
+        let bucket_for_range_cb = bucket.clone();
         let weak_range = ui.as_weak();
         let db_for_range = db_path.clone();
         let advanced_for_range = advanced.clone();
@@ -133,7 +150,70 @@ impl AnalysisWindow {
                 let range = resolve_range(base, &custom_for_cb.lock().unwrap());
                 *current_for_cb.lock().unwrap() = range.clone();
                 let adv = advanced_for_range.lock().unwrap().clone();
-                refresh_window(&ui, &db_for_range, range, adv);
+                let b = *bucket_for_range_cb.lock().unwrap();
+                refresh_window(&ui, &db_for_range, range, adv, b);
+            }
+        });
+
+        // F1：分桶粒度变更（高级模式）→ 记录粒度并重渲趋势图
+        let bucket_for_cb = bucket.clone();
+        let current_for_bucket = current_range.clone();
+        let custom_for_bucket = custom_range.clone();
+        let db_for_bucket = db_path.clone();
+        let advanced_for_bucket = advanced.clone();
+        let weak_bucket = ui.as_weak();
+        ui.on_bucket_changed(move |value: SharedString| {
+            let b = TrendBucket::from(value.as_str());
+            *bucket_for_cb.lock().unwrap() = b;
+            log::info!("卡顿分析：分桶粒度 = {:?}", b);
+            if let Some(ui) = weak_bucket.upgrade() {
+                let range = resolve_range(
+                    current_for_bucket.lock().unwrap().clone(),
+                    &custom_for_bucket.lock().unwrap(),
+                );
+                refresh_window(&ui, &db_for_bucket, range, *advanced_for_bucket.lock().unwrap(), b);
+            }
+        });
+
+        // F7：自动刷新间隔变更（高级模式）→ 重启/停止定时器（默认 30 秒）
+        let timer_for_auto = auto_refresh_timer.clone();
+        let weak_auto = ui.as_weak();
+        let db_for_auto = db_path.clone();
+        let range_for_auto = current_range.clone();
+        let bucket_for_auto = bucket.clone();
+        let advanced_for_auto = advanced.clone();
+        ui.on_auto_refresh_changed(move |value: SharedString| {
+            let interval: Option<u64> = match value.as_str() {
+                "60 秒" => Some(60),
+                "5 分钟" => Some(300),
+                "30 秒" => Some(30),
+                _ => None, // 关闭
+            };
+            match interval {
+                None => {
+                    timer_for_auto.lock().unwrap().stop();
+                    log::info!("卡顿分析：自动刷新已关闭");
+                }
+                Some(secs) => {
+                    let weak = weak_auto.clone();
+                    let db = db_for_auto.clone();
+                    let rng = range_for_auto.clone();
+                    let bk = bucket_for_auto.clone();
+                    let adv = advanced_for_auto.clone();
+                    let timer = timer_for_auto.clone();
+                    // 重复定时器：每次触发在后台线程重跑 refresh_window（复用现有刷新逻辑）。
+                    // 捕获 Weak 句柄与 Arcs，避免持有窗口强引用导致泄漏；窗口关闭后
+                    // upgrade() 失败即自动跳过，定时器亦在切换「关闭」时 stop()。
+                    timer.lock().unwrap().start(TimerMode::Repeated, Duration::from_secs(secs), move || {
+                        if let Some(ui) = weak.upgrade() {
+                            let range = rng.lock().unwrap().clone();
+                            let b = *bk.lock().unwrap();
+                            let a = *adv.lock().unwrap();
+                            refresh_window(&ui, &db, range, a, b);
+                        }
+                    });
+                    log::info!("卡顿分析：自动刷新 = {} 秒", secs);
+                }
             }
         });
 
@@ -194,6 +274,7 @@ impl AnalysisWindow {
         let current_for_apply = current_range.clone();
         let db_for_apply = db_path.clone();
         let advanced_for_apply = advanced.clone();
+        let bucket_for_apply = bucket.clone();
         let weak_apply = ui.as_weak();
         ui.on_custom_range_applied(move |from: SharedString, to: SharedString| {
             let range = TimeRange::Custom(from.to_string(), to.to_string());
@@ -202,7 +283,8 @@ impl AnalysisWindow {
             log::info!("卡顿分析：应用自定义范围 {} ~ {}", from, to);
             if let Some(ui) = weak_apply.upgrade() {
                 let adv = *advanced_for_apply.lock().unwrap();
-                refresh_window(&ui, &db_for_apply, range, adv);
+                let b = *bucket_for_apply.lock().unwrap();
+                refresh_window(&ui, &db_for_apply, range, adv, b);
             }
         });
 
@@ -262,6 +344,7 @@ impl AnalysisWindow {
         let range_refresh = range_index.clone();
         let custom_refresh = custom_range.clone();
         let advanced_refresh = advanced.clone();
+        let bucket_refresh = bucket.clone();
         // 闭包捕获 db_path 副本（move 后原 db_path 仍留给下方 refresh_window 与结构体）
         let db_path_for_refresh = db_path.clone();
         ui.on_refresh_requested(move || {
@@ -269,7 +352,8 @@ impl AnalysisWindow {
                 let base = TimeRange::from_index(*range_refresh.lock().unwrap());
                 let range = resolve_range(base, &custom_refresh.lock().unwrap());
                 let adv = *advanced_refresh.lock().unwrap();
-                refresh_window(&ui, &db_path_for_refresh, range, adv);
+                let b = *bucket_refresh.lock().unwrap();
+                refresh_window(&ui, &db_path_for_refresh, range, adv, b);
             }
         });
 
@@ -285,7 +369,28 @@ impl AnalysisWindow {
         });
 
         // 首次打开即查询一次
-        refresh_window(&ui, &db_path.clone(), TimeRange::Today, false);
+        refresh_window(&ui, &db_path.clone(), TimeRange::Today, false, TrendBucket::Hour);
+
+        // F7：默认自动刷新 30 秒（与 slint ComboBox 默认项一致）。捕获 Weak 与 Arcs，
+        // 窗口关闭后 upgrade() 失败自动跳过；切到「关闭」时由回调 stop()。
+        // Timer 实例由 on_close_requested / on_auto_refresh_changed 闭包持有的 Arc 克隆
+        // 共同保活，故此处启动后即无需在结构体内额外持有引用。
+        {
+            let weak_auto = ui.as_weak();
+            let db_auto = db_path.clone();
+            let range_auto = current_range.clone();
+            let bucket_auto = bucket.clone();
+            let advanced_auto = advanced.clone();
+            let timer = auto_refresh_timer.clone();
+            timer.lock().unwrap().start(TimerMode::Repeated, Duration::from_secs(30), move || {
+                if let Some(ui) = weak_auto.upgrade() {
+                    let range = range_auto.lock().unwrap().clone();
+                    let b = *bucket_auto.lock().unwrap();
+                    let a = *advanced_auto.lock().unwrap();
+                    refresh_window(&ui, &db_auto, range, a, b);
+                }
+            });
+        }
 
         Ok(Self {
             ui,
@@ -295,6 +400,8 @@ impl AnalysisWindow {
             custom_range,
             drill_filter,
             current_range,
+            bucket,
+            auto_refresh_timer,
         })
     }
 
@@ -308,7 +415,8 @@ impl AnalysisWindow {
         let base = TimeRange::from_index(*self.range_index.lock().unwrap());
         let range = resolve_range(base, &self.custom_range.lock().unwrap());
         let adv = *self.advanced.lock().unwrap();
-        refresh_window(&self.ui, &self.db_path.clone(), range, adv);
+        let b = *self.bucket.lock().unwrap();
+        refresh_window(&self.ui, &self.db_path.clone(), range, adv, b);
     }
 
     /// 底层 Slint 窗口（供 lib.rs 1Hz tick 守护 tool-window 样式）。
@@ -324,7 +432,13 @@ impl AnalysisWindow {
 /// 抽成自由函数便于 `show` / `refresh` / 各回调复用，避免重复逻辑。
 /// `advanced` 决定：基础模式只回填结论所需（Top5 + 结论文案、隐藏事件表）；
 /// 高级模式回填全部（Top10 + 原始事件表）。
-fn refresh_window(ui: &crate::Analysis, db_path: &PathBuf, range: TimeRange, advanced: bool) {
+fn refresh_window(
+    ui: &crate::Analysis,
+    db_path: &PathBuf,
+    range: TimeRange,
+    advanced: bool,
+    bucket: TrendBucket,
+) {
     // 打开只读连接（WAL 下并发于 service 写库）；失败则显示「无数据」
     let conn = match analytics::open_readonly(db_path) {
         Ok(c) => c,
@@ -445,7 +559,7 @@ fn refresh_window(ui: &crate::Analysis, db_path: &PathBuf, range: TimeRange, adv
         .spawn(move || {
             // 后台线程独立开连接渲染（UI 线程不阻塞，PRD §6.3）
             if let Ok(c) = analytics::open_readonly(&db_path_render) {
-                if let Ok(trend) = analytics::load_trend(&c, &range_trend) {
+                if let Ok(trend) = analytics::load_trend(&c, &range_trend, bucket) {
                     super::render_trend_chart(&trend, 860, 300, move |image| {
                         // 推回 UI 线程设置位图
                         slint::invoke_from_event_loop(move || {

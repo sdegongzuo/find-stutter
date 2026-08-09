@@ -1,5 +1,5 @@
 use crate::types::{Sample, StutterEvent, StorageConfig};
-use chrono::{Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
 
@@ -346,12 +346,14 @@ pub struct LatestSampleSummary {
     pub cpu_temp: Option<f32>,
 }
 
-/// 本地时区「今日」的 UTC RFC3339 边界：`(当地 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
+/// 本地时区「今日」的边界，返回 `(当地 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
 ///
-/// 供「今日卡顿次数」等按用户本地日统计使用。库里 `timestamp` 统一存 UTC（`+00:00`），
-/// 故这里把本地零点换算成 UTC 后再用 `BETWEEN` 比较，避免直接拿本地日期前缀去 `LIKE`
-/// （会与 `+00:00` 的 UTC 串前缀不匹配，导致跨时区错位）。
-pub fn local_today_bounds() -> (String, String) {
+/// 这是「今日」口径的**单一来源**：悬浮窗 `event_count_today` 与分析页
+/// `load_kpi_today` / `TimeRange::Today` 都应调用它，保证「今日卡顿 N 次」一致。
+/// 库里 `timestamp` 统一存 UTC（`+00:00`），故这里把本地零点换算成 UTC 后返回
+/// `DateTime<Utc>`，调用方按需格式化为 RFC3339 即可用 `BETWEEN` 比较，避免直接拿
+/// 本地日期前缀去 `LIKE`（会与 `+00:00` 的 UTC 串前缀不匹配，导致跨时区错位）。
+pub fn local_today_bounds_utc() -> (DateTime<Utc>, DateTime<Utc>) {
     let now_local = Local::now();
     let midnight_local = now_local.date_naive().and_hms_opt(0, 0, 0).unwrap();
     let start = Local
@@ -360,6 +362,15 @@ pub fn local_today_bounds() -> (String, String) {
         .unwrap_or(now_local)
         .with_timezone(&Utc);
     let end = Utc::now();
+    (start, end)
+}
+
+/// 本地时区「今日」的 UTC RFC3339 边界：`(当地 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
+///
+/// 供「今日卡顿次数」等按用户本地日统计使用。见 [`local_today_bounds_utc`]——
+/// 本函数即其返回值格式化为 RFC3339 字符串的便捷包装。
+pub fn local_today_bounds() -> (String, String) {
+    let (start, end) = local_today_bounds_utc();
     (start.to_rfc3339(), end.to_rfc3339())
 }
 

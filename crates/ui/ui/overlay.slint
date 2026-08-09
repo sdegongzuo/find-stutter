@@ -961,6 +961,10 @@ export component Analysis inherits Window {
     // 当前时间范围索引（0今日/1近7天/2近30天/3自定义）；仅状态保留，Rust 端以
     // range-changed 的选中文本为准映射。
     in-out property <int> time-range-index: 0;
+    // F7：自动刷新间隔索引（0关闭/1=30秒/2=60秒/3=5分钟，默认 30 秒）
+    in-out property <int> auto-refresh-index: 1;
+    // F1：分桶粒度索引（0小时/1=15分钟/2=天，默认小时）
+    in-out property <int> bucket-index: 0;
     // 4 张 KPI 卡片文本（Rust 端 set_kpi_* 写入）
     in property <string> kpi-today: "—";
     in property <string> kpi-worst: "—";
@@ -1006,6 +1010,10 @@ export component Analysis inherits Window {
     callback refresh-requested();
     callback toggle-mode-changed(bool);
     callback range-changed(string);
+    // F7：自动刷新间隔变更（选中文本：关闭 / 30 秒 / 60 秒 / 5 分钟）
+    callback auto-refresh-changed(string);
+    // F1：分桶粒度变更（选中文本：小时 / 15 分钟 / 天）
+    callback bucket-changed(string);
     callback drag-moved(length, length);
     // F8：点击「导出 CSV」→ Rust 端执行导出（写到用户可写目录）
     callback export-csv-requested();
@@ -1071,6 +1079,24 @@ export component Analysis inherits Window {
                             root.range-changed(value);
                             root.show-custom-editor = (value == "自定义");
                         }
+                    }
+
+                    // F7：自动刷新（仅高级模式可见，默认 30 秒）
+                    ComboBox {
+                        width: 95px;
+                        visible: root.advanced-mode;
+                        model: ["关闭", "30 秒", "60 秒", "5 分钟"];
+                        current-index: root.auto-refresh-index;
+                        selected(value) => { root.auto-refresh-changed(value); }
+                    }
+
+                    // F1：分桶粒度（仅高级模式可见，默认小时）
+                    ComboBox {
+                        width: 95px;
+                        visible: root.advanced-mode;
+                        model: ["小时", "15 分钟", "天"];
+                        current-index: root.bucket-index;
+                        selected(value) => { root.bucket-changed(value); }
                     }
 
                     Button {
@@ -1405,7 +1431,7 @@ export component Analysis inherits Window {
                         font-weight: 700;
                     }
                     Image {
-                        visible: root.has-resource;
+                        visible: root.has-resource && root.advanced-mode;
                         source: root.resource-image;
                         width: 100%;
                         height: 100%;

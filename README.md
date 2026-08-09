@@ -26,7 +26,7 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 
 ```bash
 # 1. 构建（需 Windows + MSVC target 的 Rust 工具链）
-cargo build --release
+rtk cargo build --release
 
 # 2. 启动悬浮窗（首次运行会自动弹 UAC 注册并启动后台采集服务，之后开机自启）
 target/release/find-stutter.exe
@@ -100,7 +100,7 @@ target/release/find-stutter.exe
 
 ### 开发者注意
 
-> 单独改 UI 代码后请用 `cargo build --release -p find-stutter` 重新编译 GUI 入口
+> 单独改 UI 代码后请用 `rtk cargo build --release -p find-stutter` 重新编译 GUI 入口
 > （不要只编 `-p find-stutter-ui`，那不会更新 `find-stutter.exe`）。
 
 ## 使用指南
@@ -231,7 +231,7 @@ stutter.db   运行时生成的数据库
 ### 测试
 
 ```bash
-cargo test --workspace
+rtk cargo test --workspace
 ```
 
 各 crate 均包含单元测试：`core`（检测与日志）、`ui`（进程列表聚合/排序/搜索、皮肤、热加载、

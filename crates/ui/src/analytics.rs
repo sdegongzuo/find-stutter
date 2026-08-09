@@ -7,15 +7,17 @@
 //! ## 时区口径（PRD §3.3）
 //!
 //! - `timestamp` 落库是 UTC RFC3339。
-//! - KPI「今日卡顿 N 次」**必须与悬浮窗 `event_count_today` 完全一致**（同
-//!   一 `Utc::now()` 日期前缀 `LIKE 'YYYY-MM-DD%'`），否则用户会困惑。
+//! - KPI「今日卡顿 N 次」**必须与悬浮窗 `event_count_today` 完全一致**：
+//!   两者共用核心单一来源 `local_today_bounds()`（本地零点→现在，BETWEEN UTC 边界，
+//!   见 `crates/core/src/logger.rs`），分析页 `load_kpi_today` / `TimeRange::Today` 都走它，
+//!   任何一处「今日卡顿 N 次」口径都一致，用户不会困惑。
 //! - 趋势分桶按**本地时区**：`strftime('%Y-%m-%d %H:00', datetime(timestamp,'localtime'))`，
 //!   否则 UTC+8 用户会整体偏移 8 小时。
 //! - KPI「高峰时段 HH:00」取自今日本地时区分桶后的最高桶。
 
 use std::path::Path;
 
-use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use find_stutter_core::ProcessBrief;
 use rusqlite::{params, Connection, OpenFlags};
 
@@ -39,14 +41,9 @@ impl TimeRange {
         let now = Utc::now();
         let start = match self {
             TimeRange::Today => {
-                // 今日「本地」00:00:00 对应的 UTC 时刻（按用户本地时区），
-                // 与 local_today_bounds() 口径一致，保证「今日」范围与今日计数对齐。
-                let midnight_local = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
-                Local
-                    .from_local_datetime(&midnight_local)
-                    .single()
-                    .map(|d| d.with_timezone(&Utc))
-                    .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc())
+                // 今日「本地」零点对应的 UTC 时刻：与悬浮窗 event_count_today 共用
+                // 单一来源 logger::local_today_bounds_utc()，保证「今日」范围与今日计数口径一致。
+                find_stutter_core::logger::local_today_bounds_utc().0
             }
             TimeRange::Last7 => now - ChronoDuration::days(7),
             TimeRange::Last30 => now - ChronoDuration::days(30),
@@ -152,13 +149,47 @@ pub fn ensure_indexes(conn: &Connection) -> anyhow::Result<()> {
     }
 }
 
+/// F1：趋势图分桶粒度（高级模式可选，PRD §4 F1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendBucket {
+    /// 按小时聚合（默认）
+    Hour,
+    /// 按 15 分钟聚合
+    QuarterHour,
+    /// 按天聚合
+    Day,
+}
+
+impl From<&str> for TrendBucket {
+    /// 由 slint 下拉文本映射；未知值一律回退 `Hour`，保证不崩。
+    fn from(s: &str) -> Self {
+        match s {
+            "15 分钟" => TrendBucket::QuarterHour,
+            "天" => TrendBucket::Day,
+            _ => TrendBucket::Hour, // "小时" 或未知 → 默认小时
+        }
+    }
+}
+
 /// 时间趋势聚合（PRD F1 + §7 F1 草稿，改 localtime 分桶）。
 ///
-/// 返回按本地时区分桶的趋势点序列（已 ORDER BY bucket）。空范围返回空 Vec。
-pub fn load_trend(conn: &Connection, range: &TimeRange) -> anyhow::Result<Vec<TrendPoint>> {
+/// - `bucket`：分桶粒度（详见 [`TrendBucket`]），高级模式由 slint 下拉选择传入。
+/// - 返回按本地时区分桶的趋势点序列（已 ORDER BY bucket）。空范围返回空 Vec。
+pub fn load_trend(
+    conn: &Connection,
+    range: &TimeRange,
+    bucket: TrendBucket,
+) -> anyhow::Result<Vec<TrendPoint>> {
     let (start, end) = range.bounds();
-    let mut stmt = conn.prepare(
-        "SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'localtime')) AS bucket,
+    // 分桶表达式按粒度变化（均为本地时区）；%M/15*15 把分钟归到 0/15/30/45 档。
+    let bucket_expr = match bucket {
+        TrendBucket::Hour => "strftime('%Y-%m-%d %H:00', datetime(timestamp, 'localtime'))",
+        TrendBucket::QuarterHour => "strftime('%Y-%m-%d %H:', datetime(timestamp, 'localtime')) \
+            || printf('%02d', (CAST(strftime('%M', datetime(timestamp, 'localtime')) AS INTEGER) / 15) * 15)",
+        TrendBucket::Day => "strftime('%Y-%m-%d', datetime(timestamp, 'localtime'))",
+    };
+    let sql = format!(
+        "SELECT {bucket_expr} AS bucket,
                 COUNT(*)                                            AS cnt,
                 COALESCE(SUM(duration_ms), 0)                       AS total_ms,
                 SUM(CASE severity WHEN 'critical' THEN 1 ELSE 0 END) AS c_crit,
@@ -166,8 +197,9 @@ pub fn load_trend(conn: &Connection, range: &TimeRange) -> anyhow::Result<Vec<Tr
                 SUM(CASE severity WHEN 'minor'    THEN 1 ELSE 0 END) AS c_minor
          FROM stutter_events
          WHERE timestamp BETWEEN ?1 AND ?2
-         GROUP BY bucket ORDER BY bucket",
-    )?;
+         GROUP BY bucket ORDER BY bucket"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![start, end], |row| {
         Ok(TrendPoint {
             bucket: row.get(0)?,
@@ -399,7 +431,7 @@ pub fn load_kpi_today(conn: &Connection) -> anyhow::Result<KpiSummary> {
 
     // 3) 高峰时段：今日本地时区分桶取次数最多桶的 HH:00
     let peak_hour = {
-        let trend = load_trend(conn, &TimeRange::Today).unwrap_or_default();
+        let trend = load_trend(conn, &TimeRange::Today, TrendBucket::Hour).unwrap_or_default();
         trend
             .iter()
             .max_by_key(|p| p.count)
@@ -438,11 +470,6 @@ pub fn format_duration(ms: u64) -> String {
     } else {
         format!("{:.1}min", secs / 60.0)
     }
-}
-
-/// 本地时区此刻（供 UI 侧需要时取用，例如自定义范围默认值）。
-pub fn local_now_string() -> String {
-    Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
 // ===================== M4 / F3：系统资源关联 =====================
@@ -854,15 +881,10 @@ mod tests {
             .to_string()
     }
 
-    /// 测试用：本地零点对应的 UTC 时刻。替换 `Utc::now().date_naive()...and_utc()`，
-    /// 保证各时区下 seed 的「今日」数据都落在 `local_today_bounds` / `TimeRange::Today` 范围内。
+    /// 测试用：本地零点对应的 UTC 时刻。直接复用核心单一来源
+    /// `find_stutter_core::logger::local_today_bounds_utc()`，保证与真实查询口径一致。
     fn local_midnight_utc() -> DateTime<Utc> {
-        let midnight_local = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
-        Local
-            .from_local_datetime(&midnight_local)
-            .single()
-            .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(Utc::now)
+        find_stutter_core::logger::local_today_bounds_utc().0
     }
 
     /// 写入若干今日事件（不同 local 小时桶），返回 db 路径。
@@ -872,10 +894,43 @@ mod tests {
             retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
-        logger.touch_heartbeat().unwrap();
-        let base = local_midnight_utc();
+        logger.touch_heartbeat().unwrap();        let base = local_midnight_utc();
         for (i, (h, sev)) in hours.iter().zip(severities.iter()).enumerate() {
             let ts = base + ChronoDuration::hours(*h as i64) + ChronoDuration::minutes(i as i64);
+            let mut s = Sample::default();
+            s.cpu_usage = 95.0;
+            let ev = find_stutter_core::StutterEvent {
+                timestamp: ts,
+                duration_ms: 1000 * (i + 1) as u64,
+                severity: *sev,
+                causes: vec!["CPU usage 95.0% > 90.0%".into()],
+                snapshot: s,
+                culprits: vec![ProcessBrief {
+                    pid: 100 + i as u32,
+                    name: format!("app{}.exe", i % 2),
+                    cpu_usage: 80.0,
+                    mem_used_mb: 200,
+                }],
+            };
+            logger.write_event(&ev).unwrap();
+        }
+        logger.flush().unwrap();
+    }
+
+    /// 写入若干「近期」事件（相对 `Local::now()` 的过去几分钟），保证落在今日范围内、
+    /// 且不依赖当前是几点（避免本地时间贴近零点时 `+N` 小时种子落入未来导致用例失败）。
+    /// 与 `seed_today` 仅差种子时刻的取法，事件字段语义完全一致。
+    fn seed_recent_today(db: &str, severities: &[Severity]) {
+        let cfg = StorageConfig {
+            db_path: db.to_string(),
+            retention_days: 30,
+        };
+        let mut logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+        let base = Local::now();
+        for (i, sev) in severities.iter().enumerate() {
+            // 10/9/8 分钟前（均在今日、过去），分布在同一本地小时桶内
+            let ts = (base - ChronoDuration::minutes(10 - i as i64)).with_timezone(&Utc);
             let mut s = Sample::default();
             s.cpu_usage = 95.0;
             let ev = find_stutter_core::StutterEvent {
@@ -923,7 +978,9 @@ mod tests {
     #[test]
     fn load_kpi_today_aligns_with_event_count() {
         let db = unique_db("kpi");
-        seed_today(&db, &[8, 9, 10], &[Severity::Minor, Severity::Major, Severity::Critical]);
+        // 用「近期」种子（相对 now 的过去几分钟）而非「零点 +N 小时」，避免本地时间
+        // 贴近零点时种子落入未来、漏算今日次数（用例与时辰无关、稳定可重复）。
+        seed_recent_today(&db, &[Severity::Minor, Severity::Major, Severity::Critical]);
         let conn = open_readonly(std::path::Path::new(&db)).unwrap();
         let kpi = load_kpi_today(&conn).unwrap();
         // 今日 3 次，应与 reader.event_count_today 一致
@@ -944,8 +1001,13 @@ mod tests {
         let db = unique_db("trend");
         seed_today(&db, &[9, 9, 10], &[Severity::Major, Severity::Minor, Severity::Critical]);
         let conn = open_readonly(std::path::Path::new(&db)).unwrap();
-        let trend = load_trend(&conn, &TimeRange::Today).unwrap();
-        // 按本地时区分桶：UTC 9,9,10 → 两个本地桶（一个 count=2、一个 count=1）。
+        // 用覆盖种子时段的「固定自定义范围」而非 Today：种子事件按本地零点 +9/+10 小时，
+        // 若恰好在本地零点附近运行用例，Today 的上界（now）会早于这些未来时刻导致漏查。
+        // 固定 [本地零点, 本地零点+12h] 使用例与时辰无关、稳定可重复（仍验证本地时区分桶）。
+        let base = local_midnight_utc();
+        let range = TimeRange::Custom(base.to_rfc3339(), (base + ChronoDuration::hours(12)).to_rfc3339());
+        let trend = load_trend(&conn, &range, TrendBucket::Hour).unwrap();
+        // 按本地时区分桶：9,9,10 → 两个本地桶（一个 count=2、一个 count=1）。
         // 断言不依赖绝对小时字符串（时区偏移会平移桶标签），只看桶数与计数。
         assert_eq!(trend.len(), 2);
         let total: u32 = trend.iter().map(|p| p.count).sum();

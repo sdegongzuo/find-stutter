@@ -7,7 +7,27 @@
 
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
-use crate::analytics::{CauseTypeCount, ResourceData, TrendPoint};
+use crate::analytics::{CauseTypeCount, ResourceData, ResourcePoint, TrendPoint};
+
+/// 把 plotters 的 RGB（3 字节/像素）缓冲转成 slint 可用的 RGBA8 缓冲（alpha=255 不透明）。
+///
+/// plotters 的 `BitMapBackend::with_buffer` 按 RGB 解释缓冲，渲染完再补 alpha=255
+/// 交给 slint。趋势图/饼图/资源图三处都需要这一步，统一收敛到本函数避免重复。
+fn rgb_to_rgba8(rgb: &[u8], w: u32, h: u32) -> SharedPixelBuffer<Rgba8Pixel> {
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+    {
+        let slice = buffer.make_mut_slice();
+        for i in 0..(w * h) as usize {
+            slice[i] = Rgba8Pixel {
+                r: rgb[i * 3],
+                g: rgb[i * 3 + 1],
+                b: rgb[i * 3 + 2],
+                a: 0xFF,
+            };
+        }
+    }
+    buffer
+}
 
 /// 渲染趋势图。
 ///
@@ -95,18 +115,7 @@ where
     }
 
     // RGB → RGBA8（alpha=255 不透明）
-    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-    {
-        let slice = buffer.make_mut_slice();
-        for i in 0..(width * height) as usize {
-            slice[i] = Rgba8Pixel {
-                r: rgb[i * 3],
-                g: rgb[i * 3 + 1],
-                b: rgb[i * 3 + 2],
-                a: 0xFF,
-            };
-        }
-    }
+    let buffer = rgb_to_rgba8(&rgb, width, height);
 
     on_done(Some(buffer));
 }
@@ -194,36 +203,30 @@ where
     }
 
     // RGB → RGBA8（alpha=255 不透明）
-    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-    {
-        let slice = buffer.make_mut_slice();
-        for i in 0..(width * height) as usize {
-            slice[i] = Rgba8Pixel {
-                r: rgb[i * 3],
-                g: rgb[i * 3 + 1],
-                b: rgb[i * 3 + 2],
-                a: 0xFF,
-            };
-        }
-    }
+    let buffer = rgb_to_rgba8(&rgb, width, height);
 
     on_done(Some(buffer));
 }
 
-/// 把分桶键 `YYYY-MM-DD HH:00` 缩成坐标轴短标签。
-/// 今日范围只显示 `HH:00`；跨天范围显示 `MM-DD HH:00`（避免过长）。
+/// 把分桶键缩成坐标轴短标签（兼容三种粒度，PRD §4 F1 / E11）：
+/// - 天粒度键 `YYYY-MM-DD`       → `MM-DD`
+/// - 小时粒度键 `YYYY-MM-DD HH:00` → `HH:00`
+/// - 15 分钟粒度键 `YYYY-MM-DD HH:30`（或 `HH:15`/`HH:45`）→ `HH:MM`
 fn short_label(bucket: &str) -> String {
     let parts: Vec<&str> = bucket.split(' ').collect();
     match parts.as_slice() {
-        [date, hour] => {
+        // 仅日期（天粒度）：YYYY-MM-DD → MM-DD
+        [date] => {
             let d: Vec<&str> = date.split('-').collect();
-            // date 形如 YYYY-MM-DD → 取 MM-DD
             if d.len() == 3 {
-                format!("{} {} {}", d[1], d[2], hour)
+                format!("{}-{}", d[1], d[2])
             } else {
-                hour.to_string()
+                date.to_string()
             }
         }
+        // 日期+时间（小时 / 15 分钟粒度）：取 `HH:MM` 部分
+        [_, hm] => hm.to_string(),
+        // 其它（异常格式）原样返回，便于排查
         _ => bucket.to_string(),
     }
 }
@@ -234,10 +237,13 @@ fn short_label(bucket: &str) -> String {
 /// `SharedPixelBuffer` → 经回调推回 UI 线程转 `slint::Image`。
 ///
 /// 内容：
-/// - 左轴（0-100）：CPU% / 内存% 折线（avg），GPU%（可选，Nullable 时跳过）。
-/// - 右轴（磁盘 B/s 自适应量程）：磁盘读 / 写 B/s 折线（量纲差异用双轴处理，详见
+/// - 左轴（0-100）：CPU% / 内存% 绘 min–max 浅色带（Polygon，同色调低 alpha）+ avg 实线，
+///   GPU%（可选，仅 avg 实线，Nullable 时跳过）；min–max 带保留尖峰，避免只画 avg 被抹平
+///   （PRD §6.3/§8 要求看出与卡顿尖峰的对应）。
+/// - 右轴（磁盘 B/s 自适应量程）：磁盘读 / 写 B/s avg 折线（量纲差异用双轴处理，详见
 ///   `ResourceData` 注释；不再归一到左轴以免 % 曲线被淹没）。
 /// - 卡顿事件竖线：在事件桶位置画浅红竖线，直观看卡顿是否对齐资源尖峰。
+/// - X 轴域用「完整桶数」（0..n_full），与 `data.points.x` / `data.event_x` 真实桶序号对齐。
 ///
 /// - 成功：回调收到 `Some(...)`；无采样点（points 为空）→ `None`（UI 占位）。
 pub(crate) fn render_resource_chart<F>(data: &ResourceData, w: u32, h: u32, on_done: F)
@@ -258,7 +264,10 @@ where
         let root = BitMapBackend::with_buffer(&mut rgb, (width, height)).into_drawing_area();
         root.fill(&WHITE).ok();
 
-        let n = data.points.len() as f64;
+        // X 轴域必须用「完整桶数」而非「非空桶数」：data.points.x 与 data.event_x
+        // 都是真实桶序号（0..n_full-1），只有用完整桶数做域，曲线与卡顿竖线才对齐，
+        // 否则（旧实现用非空桶数 n）曲线会被压缩、竖线错位到错误位置。
+        let n_full: f64 = (((data.span_secs + data.bucket_secs - 1) / data.bucket_secs) as f64) + 1.0;
         let max_disk = data.max_disk();
         let has_gpu = data.points.iter().any(|p| p.gpu_avg.is_some());
 
@@ -272,9 +281,9 @@ where
             .x_label_area_size(34)
             .y_label_area_size(44)
             .right_y_label_area_size(64)
-            .build_cartesian_2d(0f64..n, 0f64..100f64)
+            .build_cartesian_2d(0f64..n_full, 0f64..100f64)
             .unwrap()
-            .set_secondary_coord(0f64..n, 0f64..100f64);
+            .set_secondary_coord(0f64..n_full, 0f64..100f64);
 
         chart
             .configure_mesh()
@@ -304,6 +313,21 @@ where
                 .ok();
         }
 
+        // CPU% / 内存%：min–max 浅色带（Polygon 填充，比实线更浅的同色调、低 alpha）
+        // + avg 实线。只画 avg 会把尖峰抹平（PRD §6.3/§8 要求看出与卡顿尖峰的对应）。
+        chart
+            .draw_series(std::iter::once(Polygon::new(
+                band_polygon(&data.points, |p| p.cpu_min, |p| p.cpu_max),
+                RGBColor(0xc4, 0x4c, 0x4c).mix(0.15).filled(),
+            )))
+            .ok();
+        chart
+            .draw_series(std::iter::once(Polygon::new(
+                band_polygon(&data.points, |p| p.mem_min, |p| p.mem_max),
+                RGBColor(0x4c, 0x9a, 0xc4).mix(0.15).filled(),
+            )))
+            .ok();
+
         // 左轴：CPU% avg（红）
         chart
             .draw_series(LineSeries::new(
@@ -318,7 +342,7 @@ where
                 RGBColor(0x4c, 0x9a, 0xc4),
             ))
             .ok();
-        // 左轴：GPU%（可选，橙）
+        // 左轴：GPU%（可选，橙）—仅 avg 实线（GPU 仅有 avg，无 min/max）
         if has_gpu {
             chart
                 .draw_series(LineSeries::new(
@@ -330,7 +354,9 @@ where
                 .ok();
         }
 
-        // 磁盘读/写 B/s：归一到 0-100 后画在左轴坐标区（右轴标签已还原为 B/s）
+        // 磁盘读/写 B/s：归一到 0-100 后画在左轴坐标区（右轴标签已还原为 B/s）。
+        // 注：ResourceData 仅含磁盘 avg（B8 约定不新增字段），故磁盘只画 avg 实线，
+        // 不叠加 min–max 带。
         let norm = |b: f64| (b / max_disk * 100.0).clamp(0.0, 100.0);
         chart
             .draw_series(LineSeries::new(
@@ -374,18 +400,7 @@ where
     }
 
     // RGB → RGBA8（alpha=255 不透明）
-    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(width, height);
-    {
-        let slice = buffer.make_mut_slice();
-        for i in 0..(width * height) as usize {
-            slice[i] = Rgba8Pixel {
-                r: rgb[i * 3],
-                g: rgb[i * 3 + 1],
-                b: rgb[i * 3 + 2],
-                a: 0xFF,
-            };
-        }
-    }
+    let buffer = rgb_to_rgba8(&rgb, width, height);
 
     on_done(Some(buffer));
 }
@@ -401,4 +416,19 @@ fn fmt_bytes(b: f64) -> String {
     } else {
         format!("{:.0}", b)
     }
+}
+
+/// 构造 min–max 带的闭合坐标（正向 (x,min) 序列 + 反向 (x,max) 序列）。
+///
+/// 供资源图 `Polygon` 填充：CPU%/内存% 的 min–max 浅色带叠在 avg 实线之下，
+/// 把整段区间的波动（尖峰）显示出来（PRD §6.3/§8）。`data.points.x` 是真实桶序号，
+/// 与 X 轴域（完整桶数）对齐。
+fn band_polygon(
+    points: &[ResourcePoint],
+    min: fn(&ResourcePoint) -> f32,
+    max: fn(&ResourcePoint) -> f32,
+) -> Vec<(f64, f64)> {
+    let fwd: Vec<(f64, f64)> = points.iter().map(|p| (p.x as f64, min(p) as f64)).collect();
+    let rev: Vec<(f64, f64)> = points.iter().rev().map(|p| (p.x as f64, max(p) as f64)).collect();
+    fwd.into_iter().chain(rev).collect()
 }

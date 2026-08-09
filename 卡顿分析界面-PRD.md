@@ -89,8 +89,9 @@
 - ⚠️ **时区口径**：所有 `timestamp` 以 `to_rfc3339()` 存入，是 **UTC** 时间（`+00:00` 后缀）。
   分析页所有时间维度（时间轴、分桶、KPI「今日 / 高峰时段」、自定义范围）**必须按本地时区展示**，
   否则 UTC+8 用户会整体偏移 8 小时。推荐在 Rust 侧把 `timestamp` 解析为 `DateTime<Local>` 后分桶，
-  而非直接 `strftime` 分 UTC 小时；同时与悬浮窗 `event_count_today`（当前用 `Utc::now()` 日期，
-  见 `reader.rs`）的口径对齐——两处「今日卡顿 N 次」必须一致，否则用户会困惑。
+  而非直接 `strftime` 分 UTC 小时；同时与悬浮窗 `event_count_today`（用 `local_today_bounds()`
+  本地零点→现在，见 `crates/core/src/logger.rs`）的口径对齐——分析页 `load_kpi_today` / `TimeRange::Today`
+  共用同一边界——两处「今日卡顿 N 次」必须一致，否则用户会困惑。
 
 ---
 
