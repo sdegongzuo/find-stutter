@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use find_stutter_core::logger::LatestSampleSummary;
-use find_stutter_core::{Config, StutterEvent};
+use find_stutter_core::{Config, ProcessBrief, StutterEvent};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
@@ -168,39 +168,59 @@ impl DbReader {
             .unwrap_or(0)
         };
 
-        // 5) 读最近一次事件（用于「上次闪烁」提示）
+        // 5) 读最近一次事件（用于「上次闪烁」提示）。
+        // 旧库（P5 之前）没有 culprits 列，先探测列是否存在，存在才在 SELECT 里带上；
+        // 缺失时 culprits 回退为空列表，避免整条事件因缺列而读不出来（Spec 回归兜底）。
+        let has_culprits: bool = conn
+            .prepare("PRAGMA table_info(stutter_events)")
+            .and_then(|mut stmt| {
+                let names: Vec<String> = stmt
+                    .query_map([], |row| row.get::<_, String>(1))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(names.iter().any(|n| n == "culprits"))
+            })
+            .unwrap_or(false);
+        let event_sql = if has_culprits {
+            "SELECT timestamp, duration_ms, severity, causes, snapshot, culprits \
+             FROM stutter_events ORDER BY id DESC LIMIT 1"
+        } else {
+            "SELECT timestamp, duration_ms, severity, causes, snapshot \
+             FROM stutter_events ORDER BY id DESC LIMIT 1"
+        };
         let event: Option<StutterEvent> = conn
-            .query_row(
-                "SELECT timestamp, duration_ms, severity, causes, snapshot \
-                 FROM stutter_events ORDER BY id DESC LIMIT 1",
-                [],
-                |row| {
-                    let ts_str: String = row.get(0)?;
-                    let duration_ms: i64 = row.get(1)?;
-                    let severity_str: String = row.get(2)?;
-                    let causes_str: String = row.get(3)?;
-                    let snapshot_str: String = row.get(4)?;
-                    let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
-                        .map(|d| d.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now());
-                    let severity = match severity_str.as_str() {
-                        "critical" => find_stutter_core::Severity::Critical,
-                        "major" => find_stutter_core::Severity::Major,
-                        _ => find_stutter_core::Severity::Minor,
-                    };
-                    let causes: Vec<String> =
-                        serde_json::from_str(&causes_str).unwrap_or_default();
-                    let snapshot: find_stutter_core::Sample =
-                        serde_json::from_str(&snapshot_str).unwrap_or_default();
-                    Ok(StutterEvent {
-                        timestamp,
-                        duration_ms: duration_ms as u64,
-                        severity,
-                        causes,
-                        snapshot,
-                    })
-                },
-            )
+            .query_row(event_sql, [], |row| {
+                let ts_str: String = row.get(0)?;
+                let duration_ms: i64 = row.get(1)?;
+                let severity_str: String = row.get(2)?;
+                let causes_str: String = row.get(3)?;
+                let snapshot_str: String = row.get(4)?;
+                let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                    .map(|d| d.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now());
+                let severity = match severity_str.as_str() {
+                    "critical" => find_stutter_core::Severity::Critical,
+                    "major" => find_stutter_core::Severity::Major,
+                    _ => find_stutter_core::Severity::Minor,
+                };
+                let causes: Vec<String> =
+                    serde_json::from_str(&causes_str).unwrap_or_default();
+                let snapshot: find_stutter_core::Sample =
+                    serde_json::from_str(&snapshot_str).unwrap_or_default();
+                let culprits: Vec<ProcessBrief> = if has_culprits {
+                    let culprits_str: String = row.get(5)?;
+                    serde_json::from_str(&culprits_str).unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                Ok(StutterEvent {
+                    timestamp,
+                    duration_ms: duration_ms as u64,
+                    severity,
+                    causes,
+                    snapshot,
+                    culprits,
+                })
+            })
             .ok();
 
         // 6) 推算 health
@@ -368,6 +388,7 @@ mod tests {
                     severity: Severity::Major,
                     causes: vec!["test".into()],
                     snapshot: s,
+                    culprits: vec![],
                 })
                 .unwrap();
         }
@@ -416,6 +437,92 @@ mod tests {
         // 再次 poll：默认 5s 阈值，2h 前 → Stale
         let r = reader.poll();
         assert_eq!(r.health, ServiceHealth::Stale);
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// 验证：事件里的 culprits（卡顿元凶进程）能被 reader 正确读回
+    #[test]
+    fn poll_reads_culprits() {
+        let db = unique_db("culprits");
+        let cfg = StorageConfig {
+            db_path: db.clone(),
+            retention_days: 30,
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+
+        let mut s = Sample::default();
+        s.cpu_usage = 100.0;
+        let ev = find_stutter_core::StutterEvent {
+            timestamp: chrono::Utc::now(),
+            duration_ms: 5000,
+            severity: Severity::Major,
+            causes: vec!["CPU usage 95.0% > 90.0%".into()],
+            snapshot: s,
+            culprits: vec![find_stutter_core::ProcessBrief {
+                pid: 777,
+                name: "hog.exe".into(),
+                cpu_usage: 90.0,
+                mem_used_mb: 512,
+            }],
+        };
+        logger.write_event(&ev).unwrap();
+
+        let reader = DbReader::new(&db);
+        let event = reader.poll().event.expect("应读到最近事件");
+        assert_eq!(event.culprits.len(), 1);
+        assert_eq!(event.culprits[0].pid, 777);
+        assert_eq!(event.culprits[0].name, "hog.exe");
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// 回归：旧库（stutter_events 无 culprits 列）也能读回事件，culprits 为空列表
+    #[test]
+    fn poll_reads_event_from_legacy_schema_without_culprits() {
+        let db = unique_db("legacy_events");
+        // 手工构造旧版本库结构：stutter_events 不含 culprits 列，心跳表保留
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stutter_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                severity TEXT NOT NULL,
+                causes TEXT NOT NULL,
+                snapshot TEXT NOT NULL
+            );
+            CREATE TABLE service_heartbeat (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                timestamp TEXT NOT NULL,
+                pid INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                chrono::Utc::now().to_rfc3339(),
+                3000i64,
+                "major",
+                r#"["CPU usage 95.0% > 90.0%"]"#,
+                r#"{"cpu_usage":95.0}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO service_heartbeat (id, timestamp, pid) VALUES (1, ?1, ?2)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), 0i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = DbReader::new(&db);
+        let event = reader.poll().event.expect("旧库事件应能读回");
+        assert_eq!(event.duration_ms, 3000);
+        assert!(event.culprits.is_empty(), "旧库无 culprits 列应回退为空列表");
 
         std::fs::remove_file(&db).ok();
     }

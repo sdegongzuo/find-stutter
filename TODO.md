@@ -93,3 +93,62 @@
    - `Config::load` fallback 只查 binary 同目录（`target/release/config.toml` 不存在，config 在项目根）→ SCM 服务 CWD=System32 时加载失败用默认配置，db 写错位置。修复：从 binary 目录**逐级向上**找 config（target/release → target → 项目根）。
    - 顺带：主循环先 `collect()`（首次 WMI/COM 初始化卡数秒）再写心跳 → GUI 启动头几秒误判 Stopped/Stale。修复：心跳提到 `collect()` 之前写；`parse_with_base` 对相对 base 用 `current_dir` 绝对化（消除 "db_path 解析为绝对路径: stutter.db" 的假日志）。
    - `ensure_service_when_exe_missing` 原是环境耦合测试（假设机器上无 service exe），服务注册后必失败。修复：拆出 `ensure_service_running_with_exe(exe, db)` 可注入版本，测试传 `None` 断言 `ExeNotFound`，与真实环境彻底隔离。
+
+## P5 — 检测精度优化（贴近真实卡顿体验）— 2026-08-09
+
+> 背景：当前检测器把「资源活动突增」当「卡顿」。今日（08-09）13 次卡顿
+> 100% 由网络 spike 触发（下载/同步流量突增），但当时 CPU 仅 19–74%、内存
+> 44–67%，并不高；磁盘判据用「吞吐量 B/s」而非「繁忙度 %」，SSD 写 130MB/s
+> 根本不卡。目标：让「卡顿」更贴近真实卡顿体验（系统无响应 / 界面冻屏），
+> 并**记录造成卡顿的进程信息**。
+>
+> 设计参考：早期 `PLAN.md` §3.3 / §5 已设想 `detect_ui_freeze`（向前台窗口
+> 发消息超时判冻结）与 `cpu_spike_min_baseline` 等，本次据实落地并扩展。
+
+### A — 去网络误报（最小改动，先止血）
+- [ ] `DetectionConfig` 新增 `enable_network_spike: bool`（默认 false）：关闭后
+      Network spike 不再作为卡顿触发源（`detector.rs check_spike` 跳过 net 分支），
+      从源头消除「下载被当卡顿」这类误报。
+- [ ] `config.toml [detection]` 增加 `enable_network_spike` 字段 + 中文注释。
+- [ ] `spike_min_bps` 默认值由 2MB/s 上调至 10MB/s，减少零头波动误报。
+- [ ] 单测：`enable_network_spike=false` 时网络 spike 不触发卡顿。
+
+### B — 指标升级（直击根因）
+- [ ] `collector.rs` 新增 PDH 计数器（复用 `DiskPdh` 模式，新增 `SystemPdh`）：
+      - `\PhysicalDisk(_Total)\% Disk Time`（磁盘繁忙度，替代 B/s 吞吐）
+      - `\PhysicalDisk(_Total)\Avg. Disk sec/Transfer`（单次 IO 延迟）
+      - `\Processor Information(_Total)\% DPC Time`（系统底层卡顿信号）
+      - `\Processor Information(_Total)\% Interrupt Time`
+      - `\System\Context Switches/sec`（上下文切换风暴）
+- [ ] `Sample` 增加字段：`disk_busy_percent`、`disk_avg_io_ms`、`dpc_percent`、
+      `interrupt_percent`、`context_switches_per_sec`。
+- [ ] `detector.rs`：用 `disk_busy_percent > 95` 或 `disk_avg_io_ms > 50` 替代
+      磁盘 B/s spike；新增 DPC/中断/上下文切换作为「系统级卡顿」cause（带阈值 + 滞回）。
+- [ ] `config.toml [detection]` 增加对应阈值字段（默认合理值）与中文注释。
+- [ ] 单测覆盖新 cause 的触发与滞回。
+
+### C — 进程 culprit 记录（新需求）— 已实现（代码 + 单测通过）
+卡顿事件记录「造成卡顿的进程信息」，便于事后定位元凶。
+- [x] `collector.rs` 每 tick 采集 top 进程快照：sysinfo `Process::cpu_usage()` /
+      `Process::memory()`（bytes→MB）；取 CPU top8 + 内存 top8 去重合并最多 12 个，
+      存入 `Sample.top_processes`（`ProcessBrief` 列表）。磁盘/网络 per-process IO 仍进阶。
+- [x] 新增 `ProcessBrief` 结构（替代计划的 `ProcessCulprit`）：`pid: u32`、`name: String`、
+      `cpu_usage: f32`、`mem_used_mb: u64`（同时带 CPU/内存双维度用量，比单 `value` 更直观）。
+- [x] `StutterEvent` 增加 `culprits: Vec<ProcessBrief>`；`Sample` 增加 `top_processes`。
+- [x] `stutter_events` 表 `Logger::new` 内 `ALTER TABLE ... ADD COLUMN culprits TEXT`
+      （旧库自动迁移；忽略「列已存在」错误）；`write_event` 写入 culprits JSON；
+      `reader.rs` 读取并反序列化进 `StutterEvent.culprits`。
+- [x] `detector.rs`：卡顿持续期间用 `current_culprits: HashMap<u32, ProcessBrief>` 累积
+      top 进程（同 pid 取最大 CPU/内存用量），结束时 `extract_culprits` 取 CPU top3 +
+      内存 top3 去重（≤6 个）作为 culprits。
+- [x] **用户可见透出**：`notify.rs` 的卡顿气泡通知新增「元凶进程」行（top3，格式
+      `name (CPU%, MB)`），用户收到卡顿提醒时直接看到是谁造成的。
+- [x] 单测：`detector` 卡顿记录 culprit（CPU top 排第一）、空 top 不 panic；
+      `logger` culprits 落库回读；`reader` poll 读回 culprits（152 UI 测试全过）。
+
+### 部署约束
+- 检测逻辑跑在 `find-stutter-service.exe`；改完后**需管理员停服重装才生效**。
+- 已提供 `upgrade-service.ps1` 一键提权升级脚本（自提权 UAC → `sc stop` 释放 exe 锁
+  → `rtk cargo build --release` → `find-stutter-service.exe install-start` → 校验
+  RUNNING）；支持 `-NoBuild` 只重启。详见 `UPGRADE.md`。
+- 架构保持不变（按用户要求：**不**让 GUI 双采集，检测只在 service 进程跑）。

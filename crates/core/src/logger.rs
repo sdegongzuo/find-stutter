@@ -57,6 +57,13 @@ impl Logger {
                 pid INTEGER NOT NULL
             );",
         )?;
+
+        // 迁移：给历史库里的 stutter_events 补 culprits 列（旧库无此列）。
+        // SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，这里忽略「列已存在」错误。
+        let _ = conn.execute_batch(
+            "ALTER TABLE stutter_events ADD COLUMN culprits TEXT NOT NULL DEFAULT '[]';",
+        );
+
         Ok(Self {
             conn,
             buffer: Vec::new(),
@@ -128,15 +135,17 @@ impl Logger {
     pub fn write_event(&self, event: &StutterEvent) -> anyhow::Result<()> {
         let causes = serde_json::to_string(&event.causes)?;
         let snapshot = serde_json::to_string(&event.snapshot)?;
+        let culprits = serde_json::to_string(&event.culprits)?;
         self.conn.execute(
-            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot, culprits)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 event.timestamp.to_rfc3339(),
                 event.duration_ms as i64,
                 event.severity.to_string(),
                 causes,
                 snapshot,
+                culprits,
             ],
         )?;
         Ok(())
@@ -328,7 +337,7 @@ pub struct LatestSampleSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Severity;
+    use crate::types::{ProcessBrief, Severity};
 
     fn temp_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -370,6 +379,7 @@ mod tests {
             severity: Severity::Major,
             causes: vec!["CPU usage 95.0% > 90.0%".to_string()],
             snapshot: make_sample(),
+            culprits: vec![],
         }
     }
 
@@ -592,6 +602,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn logger_write_event_stores_culprits() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir
+            .join("test_culprits.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = StorageConfig {
+            db_path,
+            retention_days: 30,
+        };
+        let logger = Logger::new(&config).unwrap();
+
+        let mut ev = make_event();
+        ev.culprits = vec![ProcessBrief {
+            pid: 42,
+            name: "x.exe".into(),
+            cpu_usage: 50.0,
+            mem_used_mb: 100,
+        }];
+        logger.write_event(&ev).unwrap();
+
+        let culprits_json: String = logger
+            .conn
+            .query_row(
+                "SELECT culprits FROM stutter_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            culprits_json.contains("x.exe"),
+            "culprits 应写入 culprits 列: {}",
+            culprits_json
+        );
+        assert!(culprits_json.contains("42"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -38,6 +38,11 @@ pub struct Sample {
     // 进程
     pub process_count: usize,
     pub thread_count: usize,
+
+    // 进程快照：top N by CPU 与 top N by 内存的并集（去重），用于卡顿 culprit 归因
+    // serde(default)：旧库 snapshot JSON 无此字段时回退为空列表，避免反序列化失败
+    #[serde(default)]
+    pub top_processes: Vec<ProcessBrief>,
 }
 
 impl Default for Sample {
@@ -63,7 +68,60 @@ impl Default for Sample {
             gpu_temp: None,
             process_count: 0,
             thread_count: 0,
+            top_processes: Vec::new(),
         }
+    }
+}
+
+/// 单个进程的资源占用快照（用于卡顿 culprit 归因）。
+///
+/// 采集器每次采样本地按 CPU / 内存排序取 top 进程，检测器在卡顿持续期间
+/// 累积这些快照（按 pid 取最大用量），卡顿结束时提取 top 进程作为 culprits。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessBrief {
+    pub pid: u32,
+    pub name: String,
+    /// 该进程 CPU 占用（%，sysinfo 全局口径）
+    pub cpu_usage: f32,
+    /// 该进程内存占用（MB）
+    pub mem_used_mb: u64,
+}
+
+impl ProcessBrief {
+    /// 从给定进程快照集合中，按 CPU / 内存两个维度各取 top 并去重合并（最多 `max` 个）。
+    ///
+    /// 供两处复用（避免重复实现同一套「双维度 top + 去重」逻辑）：
+    /// - 采集器每 tick 取全局 top（CPU top8 + 内存 top8，≤12）；
+    /// - 检测器卡顿结束时提取元凶（CPU top3 + 内存 top3，≤6）。
+    pub fn merge_top(
+        mut all: Vec<ProcessBrief>,
+        cpu_take: usize,
+        mem_take: usize,
+        max: usize,
+    ) -> Vec<ProcessBrief> {
+        // CPU 维度降序截取
+        all.sort_by(|a, b| {
+            b.cpu_usage
+                .partial_cmp(&a.cpu_usage)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let cpu_top: Vec<ProcessBrief> = all.iter().take(cpu_take).cloned().collect();
+        // 内存维度降序截取
+        all.sort_by(|a, b| b.mem_used_mb.cmp(&a.mem_used_mb));
+        let mem_top: Vec<ProcessBrief> = all.into_iter().take(mem_take).collect();
+
+        // 按 pid 去重合并（CPU 维度优先），到上限即停
+        let mut result: Vec<ProcessBrief> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for p in cpu_top.into_iter().chain(mem_top) {
+            if seen.insert(p.pid) {
+                result.push(p);
+            }
+            if result.len() >= max {
+                break;
+            }
+        }
+        result
     }
 }
 
@@ -93,6 +151,8 @@ pub struct StutterEvent {
     pub severity: Severity,
     pub causes: Vec<String>,
     pub snapshot: Sample,
+    /// 造成本次卡顿的进程（CPU / 内存维度 top 进程，去重最多 ~6 个）
+    pub culprits: Vec<ProcessBrief>,
 }
 
 /// 检测器配置
@@ -404,6 +464,7 @@ mod tests {
         assert!(s.gpu_temp.is_none());
         assert_eq!(s.process_count, 0);
         assert_eq!(s.thread_count, 0);
+        assert!(s.top_processes.is_empty());
     }
 
     #[test]

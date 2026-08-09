@@ -1,4 +1,4 @@
-use crate::types::Sample;
+use crate::types::{ProcessBrief, Sample};
 use chrono::Utc;
 use log::warn;
 use std::collections::HashMap;
@@ -203,6 +203,10 @@ impl Collector {
             (None, None, None)
         };
 
+        // 进程快照：取 top by CPU 与 top by 内存的并集（去重），最多 12 个，
+        // 用于卡顿 culprit 归因（detector 在卡顿持续期间累积，结束时提取 top）。
+        let top_processes = Self::collect_top_processes(&self.sys);
+
         Sample {
             timestamp: Utc::now(),
             cpu_usage,
@@ -224,7 +228,27 @@ impl Collector {
             gpu_temp: None,
             process_count,
             thread_count: 0,
+            top_processes,
         }
+    }
+
+    /// 从 `sysinfo::System` 取 top 进程快照（CPU / 内存维度各取前 8，去重合并最多 12）。
+    ///
+    /// sysinfo 0.39：`process.memory()` 返回字节，`/ (1024*1024)` 转 MB；
+    /// `process.cpu_usage()` 为全局 CPU 百分比；`pid.as_u32()` 取进程 ID。
+    fn collect_top_processes(sys: &System) -> Vec<ProcessBrief> {
+        let all: Vec<ProcessBrief> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| ProcessBrief {
+                pid: pid.as_u32(),
+                name: p.name().to_string_lossy().into_owned(),
+                cpu_usage: p.cpu_usage(),
+                mem_used_mb: p.memory() / (1024 * 1024),
+            })
+            .collect();
+
+        ProcessBrief::merge_top(all, 8, 8, 12)
     }
 
     fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>) {

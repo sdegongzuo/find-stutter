@@ -76,10 +76,22 @@ pub fn show_stutter_notification(event: &StutterEvent) {
         Severity::Critical => "find-stutter: 检测到严重卡顿 (Critical)",
         Severity::Minor => "find-stutter: 检测到卡顿 (Minor)",
     };
+    let mut culprit_lines = String::new();
+    if !event.culprits.is_empty() {
+        let top: Vec<String> = event
+            .culprits
+            .iter()
+            .take(3)
+            // 格式对齐 P5-C 规格：`name (CPU%, MB)`
+            .map(|p| format!("{} ({:.0}%, {}MB)", p.name, p.cpu_usage, p.mem_used_mb))
+            .collect();
+        culprit_lines = format!("\n元凶进程: {}", top.join("; "));
+    }
     let body = format!(
-        "持续 {}ms\n{}",
+        "持续 {}ms\n{}{}",
         event.duration_ms,
-        event.causes.join("; ")
+        event.causes.join("; "),
+        culprit_lines
     );
 
     #[cfg(windows)]
@@ -176,6 +188,7 @@ mod tests {
             severity: sev,
             causes: vec!["CPU usage 95.0% > 90.0%".into()],
             snapshot: Sample::default(),
+            culprits: vec![],
         }
     }
 

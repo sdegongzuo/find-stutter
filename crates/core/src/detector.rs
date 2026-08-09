@@ -1,5 +1,6 @@
-use crate::types::{DetectionConfig, Sample, Severity, StutterEvent};
+use crate::types::{DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
 use chrono::Utc;
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 pub struct Detector {
@@ -18,6 +19,9 @@ pub struct Detector {
     disk_spike_active: bool,
     net_spike_active: bool,
     mem_spike_active: bool,
+    /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
+    /// 卡顿结束时提取 top 作为 culprits。
+    current_culprits: HashMap<u32, ProcessBrief>,
 }
 
 impl Detector {
@@ -33,6 +37,7 @@ impl Detector {
             disk_spike_active: false,
             net_spike_active: false,
             mem_spike_active: false,
+            current_culprits: HashMap::new(),
         }
     }
 
@@ -47,6 +52,15 @@ impl Detector {
         causes.extend(self.check_spike());
 
         if !causes.is_empty() {
+            // 累积当前样本 top 进程（卡顿元凶候选）：同 pid 取最大 CPU / 内存用量
+            for p in &sample.top_processes {
+                let entry = self
+                    .current_culprits
+                    .entry(p.pid)
+                    .or_insert_with(|| p.clone());
+                entry.cpu_usage = entry.cpu_usage.max(p.cpu_usage);
+                entry.mem_used_mb = entry.mem_used_mb.max(p.mem_used_mb);
+            }
             if self.stutter_start.is_none() {
                 self.stutter_start = Some(SystemTime::now());
                 self.current_causes = causes;
@@ -71,17 +85,20 @@ impl Detector {
             self.stutter_start = None;
 
             if duration_ms >= self.config.sustained_seconds as u64 * 1000 {
+                let culprits = self.extract_culprits();
                 let event = StutterEvent {
                     timestamp: Utc::now(),
                     duration_ms,
                     severity: Self::determine_severity(&self.current_causes, duration_ms),
                     causes: self.current_causes.clone(),
                     snapshot: sample.clone(),
+                    culprits,
                 };
                 self.current_causes.clear();
                 return Some(event);
             }
             self.current_causes.clear();
+            self.current_culprits.clear();
             None
         } else {
             None
@@ -274,6 +291,15 @@ impl Detector {
         } else {
             Severity::Minor
         }
+    }
+
+    /// 从累积的 `current_culprits` 提取卡顿元凶：
+    /// 按 CPU 维度取 top 3、内存维度取 top 3，去重合并（最多 6 个）。
+    /// 提取同时清空 `current_culprits`，避免污染下一次卡顿。
+    fn extract_culprits(&mut self) -> Vec<ProcessBrief> {
+        let all: Vec<ProcessBrief> = self.current_culprits.values().cloned().collect();
+        self.current_culprits.clear();
+        ProcessBrief::merge_top(all, 3, 3, 6)
     }
 }
 
@@ -842,5 +868,57 @@ mod tests {
         Detector::spike_check(&mut causes3, "Network", "B/s", &recent3, &baseline, 3.0, 2.0, &mut active);
         assert!(!active, "明显回落后应解除");
         assert!(causes3.is_empty());
+    }
+
+    // --- C 档：卡顿事件记录 culprit 进程 ---
+
+    /// 卡顿激活期间采到的 top 进程应在事件中以 culprits 形式落库，
+    /// 且 CPU 维度最高者应排第一。
+    #[test]
+    fn analyze_records_culprits() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(95.0, 2000, 10.0); // 触发 CPU 卡顿
+        s.top_processes = vec![
+            ProcessBrief {
+                pid: 1001,
+                name: "heavy.exe".into(),
+                cpu_usage: 88.0,
+                mem_used_mb: 1024,
+            },
+            ProcessBrief {
+                pid: 1002,
+                name: "bg.exe".into(),
+                cpu_usage: 5.0,
+                mem_used_mb: 2048,
+            },
+        ];
+        for _ in 0..3 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(!event.culprits.is_empty(), "应记录 culprit 进程");
+        assert_eq!(event.culprits[0].name, "heavy.exe");
+        assert_eq!(event.culprits[0].pid, 1001);
+    }
+
+    /// 无 top 进程（默认采样）时 culprits 应为空，不应 panic。
+    #[test]
+    fn analyze_empty_culprits_when_no_top_processes() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let high = make_sample(95.0, 2000, 10.0);
+        for _ in 0..3 {
+            d.analyze(&high);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(event.culprits.is_empty());
     }
 }
