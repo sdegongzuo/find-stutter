@@ -170,12 +170,13 @@ impl DbReader {
             )
             .ok();
 
-        // 4) 读今日事件数
+        // 4) 读今日事件数（按用户本地时区「今日」：本地零点 → 现在，BETWEEN UTC 边界；
+        //     与 logger.event_count_today 共用 local_today_bounds，保证悬浮窗与分析页一致）
         let today_event_count: u32 = {
-            let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            let (start, end) = find_stutter_core::logger::local_today_bounds();
             conn.query_row(
-                "SELECT COUNT(*) FROM stutter_events WHERE timestamp LIKE ?1",
-                rusqlite::params![format!("{}%", today)],
+                "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
+                rusqlite::params![start, end],
                 |row| row.get::<_, i64>(0),
             )
             .map(|n| n as u32)

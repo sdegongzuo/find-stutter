@@ -1,5 +1,5 @@
 use crate::types::{Sample, StutterEvent, StorageConfig};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{Duration as ChronoDuration, Local, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
 
@@ -244,10 +244,13 @@ impl Logger {
     }
 
     pub fn event_count_today(&self) -> anyhow::Result<u32> {
-        let today = Utc::now().format("%Y-%m-%d").to_string();
+        // 按用户本地时区的「今日」[当地 00:00, 当前时刻] 统计：
+        // 库里 timestamp 统一存 UTC（`+00:00`），故把本地零点换算成 UTC 后再用
+        // BETWEEN 比较——不能用本地日期前缀去 LIKE（会与 UTC 串前缀对不上）。
+        let (start, end) = local_today_bounds();
         let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM stutter_events WHERE timestamp LIKE ?1",
-            params![format!("{}%", today)],
+            "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
+            params![start, end],
             |row| row.get(0),
         )?;
         Ok(count)
@@ -341,6 +344,23 @@ pub struct LatestSampleSummary {
     pub disk_write_bps: u64,
     pub gpu_usage: Option<f32>,
     pub cpu_temp: Option<f32>,
+}
+
+/// 本地时区「今日」的 UTC RFC3339 边界：`(当地 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
+///
+/// 供「今日卡顿次数」等按用户本地日统计使用。库里 `timestamp` 统一存 UTC（`+00:00`），
+/// 故这里把本地零点换算成 UTC 后再用 `BETWEEN` 比较，避免直接拿本地日期前缀去 `LIKE`
+/// （会与 `+00:00` 的 UTC 串前缀不匹配，导致跨时区错位）。
+pub fn local_today_bounds() -> (String, String) {
+    let now_local = Local::now();
+    let midnight_local = now_local.date_naive().and_hms_opt(0, 0, 0).unwrap();
+    let start = Local
+        .from_local_datetime(&midnight_local)
+        .single()
+        .unwrap_or(now_local)
+        .with_timezone(&Utc);
+    let end = Utc::now();
+    (start.to_rfc3339(), end.to_rfc3339())
 }
 
 #[cfg(test)]

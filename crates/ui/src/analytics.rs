@@ -15,13 +15,13 @@
 
 use std::path::Path;
 
-use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
 use find_stutter_core::ProcessBrief;
 use rusqlite::{params, Connection, OpenFlags};
 
 /// 时间范围选择器（PRD F7）。
 ///
-/// - `Today`：今日（UTC 日期，对齐 `event_count_today`）
+/// - `Today`：今日（本地时区零点，与 `local_today_bounds` 对齐）
 /// - `Last7` / `Last30`：近 7 / 30 天（按 UTC 当前时刻往前推）
 /// - `Custom(from, to)`：自定义 RFC3339 区间
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,8 +39,14 @@ impl TimeRange {
         let now = Utc::now();
         let start = match self {
             TimeRange::Today => {
-                // 今日 00:00:00 UTC（与 event_count_today 的日期前缀一致）
-                now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
+                // 今日「本地」00:00:00 对应的 UTC 时刻（按用户本地时区），
+                // 与 local_today_bounds() 口径一致，保证「今日」范围与今日计数对齐。
+                let midnight_local = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+                Local
+                    .from_local_datetime(&midnight_local)
+                    .single()
+                    .map(|d| d.with_timezone(&Utc))
+                    .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc())
             }
             TimeRange::Last7 => now - ChronoDuration::days(7),
             TimeRange::Last30 => now - ChronoDuration::days(30),
@@ -365,21 +371,23 @@ pub fn load_cause_types(
 
 /// 今日 KPI 汇总（基础模式 4 卡片）。
 ///
-/// 全部按「今日」口径：today_count 与悬浮窗 `event_count_today` 用同一个
-/// `Utc::now()` 日期前缀查询，保证两处「今日卡顿 N 次」一致。
+/// 全部按「今日」口径：today_count 与悬浮窗 `event_count_today` 共用
+/// `local_today_bounds()`（本地零点 → 现在），保证两处「今日卡顿 N 次」一致。
 pub fn load_kpi_today(conn: &Connection) -> anyhow::Result<KpiSummary> {
-    // 1) 今日次数：与 reader.event_count_today 完全一致（Utc 日期前缀 LIKE）
-    let today = Utc::now().format("%Y-%m-%d").to_string();
+    // 今日范围（本地零点 → 现在）；今日计数与范围聚合共用同一边界，保证口径一致。
+    let (start, end) = TimeRange::Today.bounds();
+
+    // 1) 今日次数：与 reader.event_count_today / logger.event_count_today 一致
+    //    （本地零点 → 现在，BETWEEN UTC 边界）
     let today_count: u32 = conn
         .query_row(
-            "SELECT COUNT(*) FROM stutter_events WHERE timestamp LIKE ?1",
-            params![format!("{}%", today)],
+            "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
+            params![start, end],
             |row| row.get::<_, i64>(0).map(|n| n as u32),
         )
         .unwrap_or(0);
 
     // 2) 今日最严重一次持续时长
-    let (start, end) = TimeRange::Today.bounds();
     let worst_duration_ms: u64 = conn
         .query_row(
             "SELECT COALESCE(MAX(duration_ms), 0) FROM stutter_events \
@@ -846,6 +854,17 @@ mod tests {
             .to_string()
     }
 
+    /// 测试用：本地零点对应的 UTC 时刻。替换 `Utc::now().date_naive()...and_utc()`，
+    /// 保证各时区下 seed 的「今日」数据都落在 `local_today_bounds` / `TimeRange::Today` 范围内。
+    fn local_midnight_utc() -> DateTime<Utc> {
+        let midnight_local = Local::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+        Local
+            .from_local_datetime(&midnight_local)
+            .single()
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now)
+    }
+
     /// 写入若干今日事件（不同 local 小时桶），返回 db 路径。
     fn seed_today(db: &str, hours: &[u32], severities: &[Severity]) {
         let cfg = StorageConfig {
@@ -854,7 +873,7 @@ mod tests {
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
-        let base = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let base = local_midnight_utc();
         for (i, (h, sev)) in hours.iter().zip(severities.iter()).enumerate() {
             let ts = base + ChronoDuration::hours(*h as i64) + ChronoDuration::minutes(i as i64);
             let mut s = Sample::default();
@@ -937,9 +956,21 @@ mod tests {
     }
 
     #[test]
-    fn time_range_bounds_today_starts_at_midnight_utc() {
-        let (start, _end) = TimeRange::Today.bounds();
-        assert!(start.ends_with("T00:00:00+00:00"), "今日起点应为 UTC 零点: {}", start);
+    fn time_range_bounds_today_starts_at_local_midnight() {
+        use chrono::Timelike;
+        let (start, end) = TimeRange::Today.bounds();
+        // 今日起点应为「本地零点」换算成的 UTC 时刻（偏移 +00:00），
+        // 其本地时区下的时:分:秒应为 00:00:00。
+        let start_dt = DateTime::parse_from_rfc3339(&start).unwrap();
+        let start_local = start_dt.with_timezone(&Local);
+        assert_eq!(
+            (start_local.hour(), start_local.minute(), start_local.second()),
+            (0, 0, 0),
+            "今日起点应为本地零点: {}",
+            start
+        );
+        let end_dt = DateTime::parse_from_rfc3339(&end).unwrap();
+        assert!(end_dt >= start_dt, "结束应不早于起点: {} ~ {}", start, end);
     }
 
     #[test]
@@ -987,7 +1018,7 @@ mod tests {
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
-        let base = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let base = local_midnight_utc();
         for (i, (cs, caz)) in culprits_per_event.iter().zip(causes_per_event.iter()).enumerate() {
             let ts = base + ChronoDuration::minutes(i as i64);
             let mut s = Sample::default();
@@ -1186,7 +1217,7 @@ mod tests {
     fn load_resource_downsamples_to_bucket_count() {
         // 3600 个采样跨 1 小时（今日），验证降采样把点数压到桶数量级
         let db = unique_db("res_down");
-        let base = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let base = local_midnight_utc();
         let mut samples = Vec::new();
         for i in 0..3600 {
             let mut s = Sample::default();
@@ -1238,7 +1269,7 @@ mod tests {
     fn load_resource_maps_event_timestamps_to_buckets() {
         // 60 个采样 + 1 个卡顿事件，验证 event_x 折算到 [0, 桶数-1]
         let db = unique_db("res_ev");
-        let base = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let base = local_midnight_utc();
         let mut samples = Vec::new();
         for i in 0..60 {
             let mut s = Sample::default();
@@ -1397,7 +1428,7 @@ mod tests {
             let cfg = StorageConfig { db_path: db.clone(), retention_days: 30 };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();
-            let base = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let base = local_midnight_utc();
             let sevs = [Severity::Minor, Severity::Major, Severity::Critical];
             let durs = [1000u64, 3000, 2000];
             for (i, (sev, dur)) in sevs.iter().zip(durs.iter()).enumerate() {
