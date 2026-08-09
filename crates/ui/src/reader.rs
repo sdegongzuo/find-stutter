@@ -76,8 +76,22 @@ impl DbReader {
         }
     }
 
+    /// 完整轮询（含事件 snapshot/culprits 反序列化）——供测试与需要事件详情的调用方使用。
     /// 1Hz tick：读最新 sample + 心跳 + 今日事件数，返回 `PollResult`。
     pub fn poll(&self) -> PollResult {
+        self.poll_impl(true)
+    }
+
+    /// 轻量轮询：事件只读 timestamp（overlay「上次卡顿」提示用，省大 JSON 解析）
+    pub fn poll_light(&self) -> PollResult {
+        self.poll_impl(false)
+    }
+
+    /// 轮询实现。
+    ///
+    /// `want_event_detail == false` 时事件段只 SELECT timestamp 一列，
+    /// 不反序列化 snapshot/culprits 两个大 JSON 字段（overlay 只显示「上次卡顿时间」）。
+    fn poll_impl(&self, want_event_detail: bool) -> PollResult {
         // 1) 拿到（或建立）连接
         let mut guard = self.conn.lock();
         if guard.is_none() {
@@ -171,24 +185,27 @@ impl DbReader {
         // 5) 读最近一次事件（用于「上次闪烁」提示）。
         // 旧库（P5 之前）没有 culprits 列，先探测列是否存在，存在才在 SELECT 里带上；
         // 缺失时 culprits 回退为空列表，避免整条事件因缺列而读不出来（Spec 回归兜底）。
-        let has_culprits: bool = conn
-            .prepare("PRAGMA table_info(stutter_events)")
-            .and_then(|mut stmt| {
-                let names: Vec<String> = stmt
-                    .query_map([], |row| row.get::<_, String>(1))?
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(names.iter().any(|n| n == "culprits"))
-            })
-            .unwrap_or(false);
-        let event_sql = if has_culprits {
-            "SELECT timestamp, duration_ms, severity, causes, snapshot, culprits \
-             FROM stutter_events ORDER BY id DESC LIMIT 1"
-        } else {
-            "SELECT timestamp, duration_ms, severity, causes, snapshot \
-             FROM stutter_events ORDER BY id DESC LIMIT 1"
-        };
-        let event: Option<StutterEvent> = conn
-            .query_row(event_sql, [], |row| {
+        //
+        // overlay 只展示「上次卡顿时间」：轻量路径（want_event_detail == false）只取
+        // timestamp 列，避免每 tick 反序列化 snapshot/culprits 两个大 JSON 字段。
+        let event: Option<StutterEvent> = if want_event_detail {
+            let has_culprits: bool = conn
+                .prepare("PRAGMA table_info(stutter_events)")
+                .and_then(|mut stmt| {
+                    let names: Vec<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(1))?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(names.iter().any(|n| n == "culprits"))
+                })
+                .unwrap_or(false);
+            let event_sql = if has_culprits {
+                "SELECT timestamp, duration_ms, severity, causes, snapshot, culprits \
+                 FROM stutter_events ORDER BY id DESC LIMIT 1"
+            } else {
+                "SELECT timestamp, duration_ms, severity, causes, snapshot \
+                 FROM stutter_events ORDER BY id DESC LIMIT 1"
+            };
+            conn.query_row(event_sql, [], |row| {
                 let ts_str: String = row.get(0)?;
                 let duration_ms: i64 = row.get(1)?;
                 let severity_str: String = row.get(2)?;
@@ -221,7 +238,30 @@ impl DbReader {
                     culprits,
                 })
             })
-            .ok();
+            .ok()
+        } else {
+            // overlay 只展示「上次卡顿时间」：轻量路径只取 timestamp，
+            // 避免每 tick 反序列化 snapshot/culprits 两个大 JSON。
+            conn.query_row(
+                "SELECT timestamp FROM stutter_events ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    let ts_str: String = row.get(0)?;
+                    let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
+                        .map(|d| d.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    Ok(StutterEvent {
+                        timestamp,
+                        duration_ms: 0,
+                        severity: find_stutter_core::Severity::Minor,
+                        causes: Vec::new(),
+                        snapshot: find_stutter_core::Sample::default(),
+                        culprits: Vec::new(),
+                    })
+                },
+            )
+            .ok()
+        };
 
         // 6) 推算 health
         let health = if let Some((ts, _)) = &heartbeat {
@@ -523,6 +563,47 @@ mod tests {
         let event = reader.poll().event.expect("旧库事件应能读回");
         assert_eq!(event.duration_ms, 3000);
         assert!(event.culprits.is_empty(), "旧库无 culprits 列应回退为空列表");
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// 轻量轮询（overlay 用）：事件只读 timestamp 一列，
+    /// duration_ms==0 / culprits 为空证明没有走全量反序列化路径。
+    #[test]
+    fn poll_light_returns_timestamp_only() {
+        let db = unique_db("light");
+        let cfg = StorageConfig {
+            db_path: db.clone(),
+            retention_days: 30,
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+
+        let timestamp = chrono::Utc::now();
+        let ev = find_stutter_core::StutterEvent {
+            timestamp,
+            duration_ms: 5000,
+            severity: Severity::Major,
+            causes: vec!["CPU usage 95.0% > 90.0%".into()],
+            snapshot: Sample::default(),
+            culprits: vec![find_stutter_core::ProcessBrief {
+                pid: 777,
+                name: "hog.exe".into(),
+                cpu_usage: 90.0,
+                mem_used_mb: 512,
+            }],
+        };
+        logger.write_event(&ev).unwrap();
+
+        let reader = DbReader::new(&db);
+        let event = reader
+            .poll_light()
+            .event
+            .expect("轻量轮询应读到最近事件");
+        assert_eq!(event.timestamp, timestamp, "timestamp 应正确读回");
+        assert_eq!(event.duration_ms, 0, "轻量路径不读 duration_ms");
+        assert!(event.causes.is_empty(), "轻量路径不读 causes");
+        assert!(event.culprits.is_empty(), "轻量路径不读 culprits");
 
         std::fs::remove_file(&db).ok();
     }

@@ -22,6 +22,9 @@ pub struct Detector {
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
+    /// 下一帧 collect 是否需要构建 top_processes 快照。
+    /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
+    need_process_snapshot: bool,
 }
 
 impl Detector {
@@ -38,7 +41,13 @@ impl Detector {
             net_spike_active: false,
             mem_spike_active: false,
             current_culprits: HashMap::new(),
+            need_process_snapshot: false,
         }
+    }
+
+    /// 下一帧 collect 是否需要构建 top_processes（卡顿进行中或刚结束一帧）
+    pub fn needs_process_snapshot(&self) -> bool {
+        self.need_process_snapshot
     }
 
     pub fn analyze(&mut self, sample: &Sample) -> Option<StutterEvent> {
@@ -52,6 +61,11 @@ impl Detector {
         causes.extend(self.check_spike());
 
         if !causes.is_empty() {
+            // 时序权衡：analyze 在 collect 之后被调用，这里设置的标志影响的是
+            // **下一帧**的 collect——卡顿触发的那一帧 top_processes 会为空，
+            // 峰值归因靠后续帧的累积取 max 兜底（current_culprits 按 pid 取最大），
+            // 因此这是可接受的；从第二帧起进程快照才开始累积。
+            self.need_process_snapshot = true;
             // 累积当前样本 top 进程（卡顿元凶候选）：同 pid 取最大 CPU / 内存用量
             for p in &sample.top_processes {
                 let entry = self
@@ -95,10 +109,15 @@ impl Detector {
                     culprits,
                 };
                 self.current_causes.clear();
+                // 卡顿已结束：下一帧 collect 不再需要进程快照。
+                // 时序权衡见上方 causes 分支：analyze 设置的标志影响下一帧。
+                self.need_process_snapshot = false;
                 return Some(event);
             }
             self.current_causes.clear();
             self.current_culprits.clear();
+            // 卡顿不足 sustained 秒即结束：同样不再需要下一帧进程快照。
+            self.need_process_snapshot = false;
             None
         } else {
             None
@@ -920,5 +939,43 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(event.culprits.is_empty());
+    }
+
+    /// need_process_snapshot 标志随卡顿状态切换：
+    /// 初始 false → 高 CPU 触发卡顿后 true（下一帧 collect 需要快照）
+    /// → 卡顿结束（生成事件）后复位为 false。
+    /// 用 CPU 硬阈值路径触发（无需 spike 的 70 帧历史预热）。
+    #[test]
+    fn need_process_snapshot_tracks_stutter_state() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+        assert!(
+            !d.needs_process_snapshot(),
+            "初始（无卡顿）不需要进程快照"
+        );
+
+        // CPU 硬阈值触发卡顿：analyze 返回 None（卡顿开始），
+        // 标志置 true（下一帧 collect 需要 top_processes）。
+        let high = make_sample(95.0, 2000, 10.0);
+        assert!(d.analyze(&high).is_none());
+        assert!(
+            d.needs_process_snapshot(),
+            "卡顿进行中：下一帧需要进程快照"
+        );
+
+        // 持续卡顿期间标志保持 true
+        for _ in 0..2 {
+            d.analyze(&high);
+        }
+        assert!(d.needs_process_snapshot());
+
+        // 正常样本结束卡顿 → 生成事件，标志复位为 false
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        assert!(d.analyze(&make_sample(20.0, 2000, 10.0)).is_some());
+        assert!(
+            !d.needs_process_snapshot(),
+            "卡顿结束后不再需要进程快照"
+        );
     }
 }

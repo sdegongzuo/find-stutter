@@ -125,7 +125,9 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
             }
         }
 
-        let sample = collector.collect();
+        // 非卡顿时跳过 top_processes 构建（collect_with(false)），
+        // 卡顿进行中/刚结束一帧时才构建（detector.needs_process_snapshot()）。
+        let sample = collector.collect_with(detector.needs_process_snapshot());
 
         if let Some(event) = detector.analyze(&sample) {
             info!(

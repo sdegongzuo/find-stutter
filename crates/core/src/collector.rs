@@ -144,7 +144,18 @@ impl Collector {
         }
     }
 
+    /// 兼容入口：完整采集（含 top_processes 快照）。
+    /// 等价于 `collect_with(true)`，现有调用方（测试等）行为不变。
     pub fn collect(&mut self) -> Sample {
+        self.collect_with(true)
+    }
+
+    /// 采集一帧系统指标。
+    ///
+    /// `need_processes == false` 时跳过全进程遍历构建 top_processes（空列表）——
+    /// 平时（无卡顿）detector 不消费它，省掉每 tick 的进程排序开销；
+    /// 卡顿进行中或刚结束一帧才需要快照（见 `Detector::needs_process_snapshot`）。
+    pub fn collect_with(&mut self, need_processes: bool) -> Sample {
         self.sys.refresh_all();
         self.networks.refresh(true);
 
@@ -205,7 +216,12 @@ impl Collector {
 
         // 进程快照：取 top by CPU 与 top by 内存的并集（去重），最多 12 个，
         // 用于卡顿 culprit 归因（detector 在卡顿持续期间累积，结束时提取 top）。
-        let top_processes = Self::collect_top_processes(&self.sys);
+        // 非卡顿时跳过（need_processes == false），省掉每 tick 的全进程遍历排序。
+        let top_processes = if need_processes {
+            Self::collect_top_processes(&self.sys)
+        } else {
+            Vec::new()
+        };
 
         Sample {
             timestamp: Utc::now(),
@@ -364,6 +380,22 @@ mod tests {
         for usage in &sample.cpu_per_core {
             assert!(*usage >= 0.0 && *usage <= 100.0);
         }
+    }
+
+    /// `collect_with(false)`：非卡顿时跳过 top_processes 构建（空列表）；
+    /// `collect_with(true)`：完整快照（真实进程数 > 0）。
+    #[test]
+    fn collector_collect_with_controls_top_processes() {
+        let mut collector = Collector::new();
+
+        let sparse = collector.collect_with(false);
+        assert!(sparse.top_processes.is_empty(), "非卡顿帧不应构建 top_processes");
+
+        let full = collector.collect_with(true);
+        assert!(
+            !full.top_processes.is_empty(),
+            "卡顿帧应构建 top_processes（真实进程数 > 0）"
+        );
     }
 
     // ===== aggregate_gpu_utilization（P2 GPU 采集，纯逻辑）=====

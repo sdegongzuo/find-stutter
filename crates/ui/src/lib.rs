@@ -295,7 +295,9 @@ pub fn run() -> anyhow::Result<()> {
             }
 
             let paused = state_for_tick.lock().paused;
-            let poll: PollResult = reader_for_tick.poll();
+            // overlay 只显示上次卡顿时间，走轻量查询（只读 timestamp 列，
+            // 省掉 snapshot/culprits 两个大 JSON 的每 tick 反序列化）。
+            let poll: PollResult = reader_for_tick.poll_light();
             // 1) 更新共享状态（暂停时也保持数据新鲜，恢复后立即显示最新值）
             state_for_tick.lock().update_from_poll(&poll);
             // 1b) P2：检测到新的 Major/Critical 事件 → 弹系统通知（暂停时不弹）
