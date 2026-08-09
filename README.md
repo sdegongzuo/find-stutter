@@ -131,16 +131,7 @@ target/release/find-stutter.exe
 
 #### 方式 2：服务化（推荐）
 
-```bash
-# 1. 构建
-cargo build --release
-
-# 2. 注册并启动 Windows 服务（需管理员权限；仅第一次需要）
-target/release/find-stutter-service.exe install-start
-
-# 3. 启动 GUI（普通用户即可；后台服务会自动检测 + 启动）
-target/release/find-stutter.exe
-```
+> 部署三步（构建 → 注册并启动服务 → 启动 GUI）与上文[快速开始](#快速开始)完全一致，此处不再重复贴代码。下面重点说明 GUI 启动时的自动启动逻辑。
 
 GUI 启动时**自动**做的事（在 `crates/ui/src/auto_start.rs`）：
 
