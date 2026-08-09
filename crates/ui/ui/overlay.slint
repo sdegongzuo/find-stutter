@@ -17,6 +17,11 @@
 // 默认值与 skins/default/skin.toml 保持一致。
 
 import { Button, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
+// 卡顿分析页面组件（PRD M1）：直接作为顶层组件定义在本文件末尾（export component
+// Analysis）。原因：slint 1.17 的 `include_modules!()` 只导出「传给 slint_build::compile
+// 的根文件」的顶层组件，被 `import` 的子文件组件不会进入 Rust 侧生成代码；若拆成独立
+// 文件再 import，Rust 端 `crate::Analysis` 取不到。故内联于此（避免与 src/analysis.rs 的
+// `analysis` Rust 模块混淆——slint 按 `export component` 名生成 `Analysis` 类型）。
 
 export component Overlay inherits Window {
     width: root.skin-width;
@@ -808,6 +813,614 @@ export component ProcessList inherits Window {
             font-size: 12px;
             x: 2px;
             y: 0px;
+        }
+    }
+}
+
+// ================================================================
+// PRD M1 / M2：卡顿分析窗口（右键菜单 / 托盘「卡顿分析」打开）。
+// 独立的置顶窗口，打开/刷新时只读查询 stutter.db 一次（不常驻采样）。
+// 白色背景 + 深色文字，沿用进程详情页风格。
+//
+// 拖动仅限标题栏（与 ProcessList 一致），避免全窗口 TouchArea 拦截按钮。
+// 趋势图由 Rust 端用 plotters 渲染位图（后台线程），经 slint::Image 推回。
+// ================================================================
+
+// 单个 KPI 卡片（标签 + 大号数值）
+component KpiCard inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    // 皮肤：背景 / 边框 / 文字色跟随 Analysis 注入（默认与浅色皮肤一致）
+    in property <brush> card-bg: #f5f6fa;
+    in property <color> card-border: #e2e4ea;
+    in property <color> text-color: #1e1e2e;
+    in property <color> sub-color: #606066;
+    height: 84px;
+    background: root.card-bg;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.card-border;
+    VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        Text {
+            text: root.label;
+            color: root.sub-color;
+            font-size: 12px;
+        }
+        Text {
+            text: root.value;
+            color: root.text-color;
+            font-size: 22px;
+            font-weight: 700;
+            horizontal-stretch: 1;
+        }
+    }
+}
+
+// 元凶进程榜一行数据（Rust 端按此结构填充 culprit-model）
+struct CulpritRow {
+    name: string,          // 进程名（同名不同 PID 已合并）
+    count: string,         // "12 次"
+    duration: string,      // "3.5min"（关联卡顿累计时长）
+    max-cpu: string,       // "95.0%" 最高单次 CPU
+    max-mem: string,       // "512 MB" 最高单次内存
+    bar-fraction: float,   // 0..1，相对最大出现次数的条形宽度比例
+}
+
+// 原始事件表一行数据（Rust 端按此结构填充 event-model；高级模式 F5）
+struct EventRow {
+    time: string,          // 本地时区时间 "YYYY-MM-DD HH:MM:SS"
+    duration: string,      // "1500" 持续毫秒（数字串，便于排序显示）
+    duration-ms: int,      // 原始毫秒（备用，当前未直接用于排序）
+    severity: string,      // 严重程度中文标签（轻微/严重/危急）
+    causes: string,        // 触发原因（「；」拼接）
+    culprits: string,      // 元凶进程（「,」拼接）
+}
+
+// 元凶进程榜单行（slint 原生 Rectangle 拼条形，可随主题、可交互）
+component CulpritBar inherits Rectangle {
+    in property <CulpritRow> data;
+    // 点击钻取（高级模式）：把进程名抛给 Analysis 根组件 → Rust 端按名过滤事件表
+    callback culprit-clicked(string);
+    height: 22px;
+    TouchArea {
+        // 整行可点：高级模式点击 → 钻取到该进程参与的事件
+        clicked => { root.culprit-clicked(data.name); }
+    }
+    HorizontalLayout {
+        height: 22px;
+        padding-left: 6px;
+        spacing: 6px;
+        Text {
+            width: 130px;
+            text: data.name;
+            color: #1e1e2e;
+            font-size: 12px;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-alignment: left;
+        }
+        // 条形槽 + 实际条形（宽度按比例）
+        Rectangle {
+            width: 150px;
+            height: 12px;
+            background: #eceef3;
+            border-radius: 3px;
+            Rectangle {
+                height: 100%;
+                width: parent.width * data.bar-fraction;
+                background: #4c9ac4;
+                border-radius: 3px;
+            }
+        }
+        Text {
+            width: 52px;
+            text: data.count;
+            color: #1e1e2e;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+        Text {
+            width: 56px;
+            text: data.duration;
+            color: #606066;
+            font-size: 11px;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            Tooltip { text: @markdown("最高 CPU: \{data.max-cpu}\n最高内存: \{data.max-mem}"); }
+        }
+    }
+}
+
+export component Analysis inherits Window {
+    width: 880px;
+    height: 720px;
+    always-on-top: true;
+    title: "find-stutter - 卡顿分析";
+    no-frame: true;
+    background: transparent;
+
+    // === 皮肤（Rust 端注入，对齐 Overlay / ProcessList 风格）===
+    // 主框架背景 / 边框 / 圆角 / 文字色跟随 skin.toml；内部面板沿用固定浅色中性色
+    // （与进程详情页内部区域一致，M5 仅把外框接入皮肤系统，细节深浅色留待打磨）。
+    in property <brush> skin-bg: #ffffff;
+    in property <color> skin-border-color: #c0c0c0;
+    in property <length> skin-border-radius: 8px;
+    in property <color> skin-text-color: #1e1e2e;
+    in property <color> skin-subtext-color: #606066;
+    in property <color> skin-panel-bg: #fafbfc;
+    in property <color> skin-panel-border: #e2e4ea;
+
+    // === 状态（Rust 端注入 / 读取）===
+    // 高级模式（基础=false / 高级=true）；in-out 以便 slint 端标题栏按钮本地翻转，
+    // 翻转后通过 toggle-mode-changed 通知 Rust 端记录。
+    in-out property <bool> advanced-mode: false;
+    // 当前时间范围索引（0今日/1近7天/2近30天/3自定义）；仅状态保留，Rust 端以
+    // range-changed 的选中文本为准映射。
+    in-out property <int> time-range-index: 0;
+    // 4 张 KPI 卡片文本（Rust 端 set_kpi_* 写入）
+    in property <string> kpi-today: "—";
+    in property <string> kpi-worst: "—";
+    in property <string> kpi-peak: "—";
+    in property <string> kpi-top: "—";
+    // 趋势图位图（Rust 端后台线程渲染后 set_trend_image 写入）
+    in property <image> trend-image;
+    // 是否有趋势图（无数据时保持占位文本）
+    in property <bool> has-chart: false;
+    // F2：元凶进程 Top N 榜模型（Rust 端 set_culprit_model 写入；基础 Top5 / 高级 Top10）
+    in property <[CulpritRow]> culprit-model: [];
+    // F2：是否有元凶数据（无数据时榜区显示占位文本）
+    in property <bool> has-culprits: false;
+    // F2：基础模式一句话结论（Rust 端生成，如「XX 是今日最大的卡顿元凶」）
+    in property <string> culprit-conclusion: "";
+    // F4：卡顿类型占比饼图位图（Rust 端后台线程渲染后 set_cause_image 写入）
+    in property <image> cause-image;
+    // F4：是否有类型占比图（无数据时保持占位文本）
+    in property <bool> has-cause: false;
+    // F3：系统资源关联图位图（Rust 端后台线程渲染后 set_resource_image 写入）
+    in property <image> resource-image;
+    // F3：是否有资源图（无 samples 时保持占位文本）
+    in property <bool> has-resource: false;
+    // F5：原始事件表模型（高级模式，Rust 端 set_event_model 写入）
+    in property <[EventRow]> event-model: [];
+    // F5：事件表当前条数文案（如「共 12 条」/「筛选：app.exe（3 条）」）
+    in property <string> event-count-text: "";
+    // F5：钻取筛选中的进程名（空串=不过滤）；由 Rust 端写回用于显示筛选条
+    in property <string> drill-name: "";
+    // F8：导出状态提示（如「已导出：卡顿事件_今日.csv」/ 失败原因）
+    in property <string> export-status: "";
+    // F5：自定义范围编辑区是否可见（仅「自定义」被选中且高级模式时显示）
+    in-out property <bool> show-custom-editor: false;
+    // F5：自定义范围起止（本地时区文本，如 "2026-08-01 00:00:00"）
+    in-out property <string> custom-from: "";
+    in-out property <string> custom-to: "";
+    // F5：事件表排序列 + 方向（Rust 端维护，用于列头箭头显示）。
+    // 列名取值：time / duration / severity / causes / culprits
+    in property <string> sort-column: "time";
+    in property <bool> sort-ascending: true;
+
+    callback close-requested();
+    callback refresh-requested();
+    callback toggle-mode-changed(bool);
+    callback range-changed(string);
+    callback drag-moved(length, length);
+    // F8：点击「导出 CSV」→ Rust 端执行导出（写到用户可写目录）
+    callback export-csv-requested();
+    // F5：点击元凶榜某进程 → Rust 端按 name 过滤事件表（高级模式钻取）
+    callback culprit-clicked(string);
+    // F5：自定义范围「应用」→ Rust 端以自定义区间重查
+    callback custom-range-applied(string, string);
+    // F5：清除钻取筛选
+    callback clear-drill-requested();
+    // F5：事件表列头点击排序（传列名 time/duration/severity/causes/culprits）
+    callback sort-requested(string);
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.skin-bg;
+        border-radius: root.skin-border-radius;
+        border-width: 1px;
+        border-color: root.skin-border-color;
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 6px;
+
+            // 标题栏：标题 + 基础/高级 + 时间范围 + 刷新 + 关闭
+            Rectangle {
+                height: 30px;
+                TouchArea {
+                    z: 0;
+                    moved => {
+                        root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                    }
+                }
+                HorizontalLayout {
+                    z: 1;
+                    height: 30px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "卡顿分析";
+                        color: root.skin-text-color;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle { width: 1px; height: 100%; background: #d0d0d0; }
+
+                    // 基础/高级 切换：点击翻转 advanced-mode 并通知 Rust 端
+                    Button {
+                        text: root.advanced-mode ? "基础" : "高级";
+                        clicked => {
+                            root.advanced-mode = !root.advanced-mode;
+                            root.toggle-mode-changed(root.advanced-mode);
+                        }
+                    }
+
+                    // 时间范围下拉（选中文本经 range-changed 传 Rust 端映射索引）
+                    ComboBox {
+                        width: 110px;
+                        model: ["今日", "近7天", "近30天", "自定义"];
+                        current-index: root.time-range-index;
+                        selected(value) => {
+                            root.range-changed(value);
+                            root.show-custom-editor = (value == "自定义");
+                        }
+                    }
+
+                    Button {
+                        text: "刷新";
+                        clicked => { root.refresh-requested(); }
+                    }
+
+                    Button {
+                        text: "关闭";
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            // KPI 卡片行（4 张）
+            HorizontalLayout {
+                height: 96px;
+                spacing: 6px;
+                KpiCard { label: "今日卡顿次数"; value: root.kpi-today; text-color: root.skin-text-color; sub-color: root.skin-subtext-color; card-bg: #f5f6fa; card-border: root.skin-panel-border; }
+                KpiCard { label: "最严重一次"; value: root.kpi-worst; text-color: root.skin-text-color; sub-color: root.skin-subtext-color; card-bg: #f5f6fa; card-border: root.skin-panel-border; }
+                KpiCard { label: "高峰时段"; value: root.kpi-peak; text-color: root.skin-text-color; sub-color: root.skin-subtext-color; card-bg: #f5f6fa; card-border: root.skin-panel-border; }
+                KpiCard { label: "头号元凶"; value: root.kpi-top; text-color: root.skin-text-color; sub-color: root.skin-subtext-color; card-bg: #f5f6fa; card-border: root.skin-panel-border; }
+            }
+
+            // 自定义范围编辑区（仅高级模式 + 选中「自定义」时显示；F5 时间范围自定义）
+            Rectangle {
+                visible: root.advanced-mode && root.show-custom-editor;
+                height: 34px;
+                background: root.skin-panel-bg;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: root.skin-panel-border;
+                HorizontalLayout {
+                    padding: 4px;
+                    spacing: 6px;
+                    Text { text: "起"; color: root.skin-subtext-color; font-size: 12px; }
+                    LineEdit {
+                        width: 180px;
+                        text: root.custom-from;
+                        placeholder-text: "2026-08-01 00:00:00";
+                        edited(text) => { root.custom-from = text; }
+                    }
+                    Text { text: "止"; color: root.skin-subtext-color; font-size: 12px; }
+                    LineEdit {
+                        width: 180px;
+                        text: root.custom-to;
+                        placeholder-text: "2026-08-09 23:59:59";
+                        edited(text) => { root.custom-to = text; }
+                    }
+                    Button {
+                        text: "应用范围";
+                        clicked => { root.custom-range-applied(root.custom-from, root.custom-to); }
+                    }
+                }
+            }
+
+            // 下部：左列（趋势图 + 元凶榜）｜ 右列（类型占比 + 结论/高级表）
+            HorizontalLayout {
+                spacing: 6px;
+                vertical-stretch: 1;
+
+                // === 左列：趋势图 + 元凶进程 Top N 榜 ===
+                VerticalLayout {
+                    spacing: 6px;
+                    // 趋势图区（占主要高度）
+                    Rectangle {
+                        min-height: 150px;
+                        vertical-stretch: 1.3;
+                        background: root.skin-panel-bg;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.skin-panel-border;
+                        // 有图时显示位图，无数据时显示占位文本
+                        Image {
+                            visible: root.has-chart;
+                            source: root.trend-image;
+                            width: 100%;
+                            height: 100%;
+                            image-fit: contain;
+                        }
+                        Text {
+                            visible: !root.has-chart;
+                            text: "暂无趋势数据";
+                            color: #909098;
+                            font-size: 14px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    // 元凶进程 Top N 榜（基础 Top5 / 高级 Top10，由 Rust 端模型长度决定）
+                    Rectangle {
+                        min-height: 150px;
+                        vertical-stretch: 1;
+                        background: root.skin-panel-bg;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.skin-panel-border;
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 4px;
+                            Text {
+                                text: "元凶进程 Top N";
+                                color: root.skin-text-color;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            ListView {
+                                for row in root.culprit-model : CulpritBar {
+                                    data: row;
+                                    culprit-clicked(name) => { root.culprit-clicked(name); }
+                                }
+                            }
+                            Text {
+                                visible: !root.has-culprits;
+                                text: "暂无元凶数据";
+                                color: #909098;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                // === 右列：卡顿类型占比 + 结论/高级表 ===
+                VerticalLayout {
+                    width: 360px;
+                    spacing: 6px;
+                    // 卡顿类型占比图（F4，plotters 饼图；注明粗糙归类）
+                    Rectangle {
+                        min-height: 150px;
+                        vertical-stretch: 1;
+                        background: root.skin-panel-bg;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.skin-panel-border;
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 2px;
+                            Text {
+                                text: "卡顿类型占比";
+                                color: root.skin-text-color;
+                                font-size: 13px;
+                                font-weight: 700;
+                            }
+                            Image {
+                                visible: root.has-cause;
+                                source: root.cause-image;
+                                width: 100%;
+                                height: 230px;
+                                image-fit: contain;
+                            }
+                            Text {
+                                visible: !root.has-cause;
+                                text: "暂无类型数据";
+                                color: #909098;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                            }
+                            Text {
+                                text: "（粗糙归类，随检测器文案可能漂移）";
+                                color: #a0a0a8;
+                                font-size: 11px;
+                                horizontal-alignment: center;
+                                Tooltip { text: @markdown("卡顿原因由检测器自由文本产出，按关键词归类；文案变化可能导致归类漂移，详见 PRD §6.4。"); }
+                            }
+                        }
+                    }
+                    // 基础模式：一句话结论（隐藏原始表/钻取/导出）
+                    Rectangle {
+                        visible: !root.advanced-mode;
+                        background: #eef4f8;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: #cfe0ea;
+                        VerticalLayout {
+                            padding: 10px;
+                            Text {
+                                text: root.culprit-conclusion == "" ? "—" : root.culprit-conclusion;
+                                color: root.skin-text-color;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                    // 高级模式：原始事件表（时间|时长|等级|原因|元凶）+ 导出 + 钻取筛选条
+                    Rectangle {
+                        visible: root.advanced-mode;
+                        min-height: 150px;
+                        vertical-stretch: 1;
+                        background: root.skin-panel-bg;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.skin-panel-border;
+                        VerticalLayout {
+                            padding: 6px;
+                            spacing: 4px;
+                            // 标题行：表名 + 导出按钮 + 清除筛选
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: "原始事件表";
+                                    color: root.skin-text-color;
+                                    font-size: 13px;
+                                    font-weight: 700;
+                                    vertical-alignment: center;
+                                }
+                                // 弹性占位把按钮推到右端
+                                Rectangle { min-width: 4px; }
+                                HorizontalLayout {
+                                    horizontal-stretch: 0;
+                                    Button {
+                                        text: "导出 CSV";
+                                        // F8：点击 → Rust 端导出当前范围事件
+                                        clicked => { root.export-csv-requested(); }
+                                    }
+                                    Button {
+                                        visible: root.drill-name != "";
+                                        text: "清除筛选";
+                                        clicked => { root.clear-drill-requested(); }
+                                    }
+                                }
+                            }
+                            // 钻取筛选条：点击元凶榜后显示「筛选：name」
+                            Text {
+                                visible: root.drill-name != "";
+                                text: "筛选：" + root.drill-name;
+                                color: root.skin-subtext-color;
+                                font-size: 12px;
+                            }
+                            // 事件表（可滚动）。列头可点击排序，箭头显示当前排序列与方向
+                            Rectangle {
+                                height: 18px;
+                                background: #eef0f4;
+                                border-radius: 3px;
+                                HorizontalLayout {
+                                    padding-left: 4px;
+                                    spacing: 4px;
+                                    Rectangle {
+                                        width: 130px;
+                                        TouchArea { clicked => { root.sort-requested("time"); } }
+                                        Text {
+                                            text: "时间" + (root.sort-column == "time" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                                            color: #50505a; font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 60px;
+                                        TouchArea { clicked => { root.sort-requested("duration"); } }
+                                        Text {
+                                            text: "时长(ms)" + (root.sort-column == "duration" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                                            color: #50505a; font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 44px;
+                                        TouchArea { clicked => { root.sort-requested("severity"); } }
+                                        Text {
+                                            text: "等级" + (root.sort-column == "severity" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                                            color: #50505a; font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        width: 200px;
+                                        TouchArea { clicked => { root.sort-requested("causes"); } }
+                                        Text {
+                                            text: "原因" + (root.sort-column == "causes" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                                            color: #50505a; font-size: 11px; overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Rectangle {
+                                        TouchArea { clicked => { root.sort-requested("culprits"); } }
+                                        Text {
+                                            text: "元凶" + (root.sort-column == "culprits" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                                            color: #50505a; font-size: 11px; overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                            ListView {
+                                for row in root.event-model : Rectangle {
+                                    height: 20px;
+                                    HorizontalLayout {
+                                        padding-left: 4px;
+                                        spacing: 4px;
+                                        Text { width: 130px; text: row.time; color: root.skin-text-color; font-size: 11px; overflow: elide; }
+                                        Text { width: 60px; text: row.duration; color: root.skin-text-color; font-size: 11px; }
+                                        Text { width: 44px; text: row.severity; color: root.skin-text-color; font-size: 11px; }
+                                        Text { width: 200px; text: row.causes; color: root.skin-subtext-color; font-size: 11px; overflow: elide; }
+                                        Text { text: row.culprits; color: root.skin-subtext-color; font-size: 11px; overflow: elide; }
+                                    }
+                                }
+                            }
+                            // 条数提示 + 导出状态
+                            Text {
+                                text: root.event-count-text;
+                                color: root.skin-subtext-color;
+                                font-size: 11px;
+                            }
+                            Text {
+                                visible: root.export-status != "";
+                                text: root.export-status;
+                                color: #2c7a3d;
+                                font-size: 11px;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // F3：系统资源关联图（全宽底部区；双轴：左 CPU%/内存%，右 磁盘 B/s）
+            Rectangle {
+                min-height: 210px;
+                vertical-stretch: 0;
+                background: #fafbfc;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: #e2e4ea;
+                VerticalLayout {
+                    padding: 6px;
+                    spacing: 4px;
+                    Text {
+                        text: "系统资源关联图（CPU/内存% · 磁盘 B/s · 卡顿竖线）";
+                        color: root.skin-text-color;
+                        font-size: 13px;
+                        font-weight: 700;
+                    }
+                    Image {
+                        visible: root.has-resource;
+                        source: root.resource-image;
+                        width: 100%;
+                        height: 100%;
+                        image-fit: contain;
+                    }
+                    Text {
+                        visible: !root.has-resource;
+                        text: "暂无采样数据";
+                        color: #909098;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
         }
     }
 }

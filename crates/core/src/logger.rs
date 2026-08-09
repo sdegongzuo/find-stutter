@@ -64,6 +64,15 @@ impl Logger {
             "ALTER TABLE stutter_events ADD COLUMN culprits TEXT NOT NULL DEFAULT '[]';",
         );
 
+        // M6：时间戳索引真正落地（PRD §3.3）。
+        // 分析页严格只读 stutter.db，无法在只读连接上 CREATE INDEX，故索引必须在
+        // service 端（本建表逻辑）创建——service 有写权限，重启/重装即生效。
+        // 表必须已存在，索引用 IF NOT EXISTS 保证幂等（重复执行不报错）。
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(timestamp); \
+             CREATE INDEX IF NOT EXISTS idx_events_ts ON stutter_events(timestamp);",
+        )?;
+
         Ok(Self {
             conn,
             buffer: Vec::new(),
@@ -404,6 +413,59 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // --- 时间戳索引（M6 / PRD §3.3）---
+
+    #[test]
+    fn logger_new_creates_timestamp_indexes() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir
+            .join("test_indexes.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = StorageConfig {
+            db_path: db_path.clone(),
+            retention_days: 30,
+        };
+
+        // Logger::new 建表 + 迁移 + 建索引后，sqlite_master 里应存在两个时间戳索引
+        let logger = Logger::new(&config).unwrap();
+
+        let idx_samples: u32 = logger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_samples_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let idx_events: u32 = logger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_events_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_samples, 1, "samples 时间戳索引应存在");
+        assert_eq!(idx_events, 1, "stutter_events 时间戳索引应存在");
+
+        // 幂等：再次打开同一库（已含索引）不应报错
+        let logger2 = Logger::new(&config).unwrap();
+        let idx_events2: u32 = logger2
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='idx_events_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx_events2, 1, "重启后索引应存在且唯一");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn logger_new_creates_tables() {
         let dir = temp_dir();
@@ -711,7 +773,7 @@ mod tests {
         assert!(result.is_ok(), "CSV export should succeed now that Vec<f32> is handled");
 
         let content = std::fs::read_to_string(&csv_path).unwrap();
-        assert!(content.contains("cpu_usage"));
+        assert!(content.contains("CPU 使用率")); // 表头已中文化（AGENTS.md：导出表头用中文）
         assert!(content.contains("45.5"));
 
         std::fs::remove_dir_all(&dir).ok();

@@ -30,6 +30,7 @@ use crate::Overlay;
 pub mod menu_id {
     pub const SHOW_HIDE: &str = "show_hide";
     pub const TOGGLE_PAUSE: &str = "toggle_pause";
+    pub const ANALYSIS: &str = "analysis";
     pub const QUIT: &str = "quit";
 }
 
@@ -40,6 +41,8 @@ pub enum TrayCommand {
     ShowHide,
     /// 暂停 / 恢复监控（UI 只读模式：切换 paused 标志，暂停刷新显示）
     TogglePause,
+    /// 打开卡顿分析窗口（PRD M1 F6）
+    Analysis,
     /// 退出程序（quit_event_loop）
     Quit,
 }
@@ -123,6 +126,7 @@ fn run_tray_loop(tx: Sender<TrayCommand>) -> anyhow::Result<()> {
                     let cmd = match ev.id().0.as_str() {
                         menu_id::SHOW_HIDE => Some(TrayCommand::ShowHide),
                         menu_id::TOGGLE_PAUSE => Some(TrayCommand::TogglePause),
+                        menu_id::ANALYSIS => Some(TrayCommand::Analysis),
                         menu_id::QUIT => Some(TrayCommand::Quit),
                         _ => None,
                     };
@@ -165,9 +169,10 @@ fn build_menu() -> anyhow::Result<tray_icon::menu::Menu> {
     let menu = Menu::new();
     let show_hide = MenuItem::with_id(menu_id::SHOW_HIDE, "显示/隐藏悬浮窗", true, None);
     let toggle_pause = MenuItem::with_id(menu_id::TOGGLE_PAUSE, "暂停/恢复监控", true, None);
+    let analysis = MenuItem::with_id(menu_id::ANALYSIS, "卡顿分析", true, None);
     let sep = PredefinedMenuItem::separator();
     let quit = MenuItem::with_id(menu_id::QUIT, "退出", true, None);
-    menu.append_items(&[&show_hide, &toggle_pause, &sep, &quit])?;
+    menu.append_items(&[&show_hide, &toggle_pause, &analysis, &sep, &quit])?;
     Ok(menu)
 }
 
@@ -208,7 +213,15 @@ fn build_icon() -> anyhow::Result<tray_icon::Icon> {
 /// 把托盘命令应用到 UI。
 ///
 /// 在 UI 线程调用（通过 `slint::invoke_from_event_loop` 或直接主线程）。
-pub fn apply_command(ui: &Overlay, state: &mut crate::overlay::OverlayState, cmd: TrayCommand) {
+/// `analysis_win`：卡顿分析窗口复用槽（托盘「卡顿分析」与它共用一个实例）。
+pub fn apply_command(
+    ui: &Overlay,
+    state: &mut crate::overlay::OverlayState,
+    cmd: TrayCommand,
+    analysis_win: &std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<crate::analysis::AnalysisWindow>>>,
+    >,
+) {
     match cmd {
         TrayCommand::ShowHide => {
             if ui.window().is_visible() {
@@ -219,6 +232,24 @@ pub fn apply_command(ui: &Overlay, state: &mut crate::overlay::OverlayState, cmd
         }
         TrayCommand::TogglePause => {
             state.paused = !state.paused;
+        }
+        TrayCommand::Analysis => {
+            // 复用「首次创建 + 复用」模式（与右键菜单一致）
+            let mut guard = analysis_win.lock().unwrap();
+            if guard.is_none() {
+                match crate::analysis::AnalysisWindow::show() {
+                    Ok(w) => {
+                        log::info!("托盘：卡顿分析窗口已打开");
+                        *guard = Some(std::sync::Arc::new(w));
+                    }
+                    Err(e) => {
+                        log::warn!("托盘：卡顿分析窗口打开失败: {}", e);
+                    }
+                }
+            }
+            if let Some(w) = guard.as_ref() {
+                w.refresh();
+            }
         }
         TrayCommand::Quit => {
             let _ = slint::quit_event_loop();
@@ -235,6 +266,7 @@ mod tests {
     fn menu_ids_are_stable() {
         assert_eq!(menu_id::SHOW_HIDE, "show_hide");
         assert_eq!(menu_id::TOGGLE_PAUSE, "toggle_pause");
+        assert_eq!(menu_id::ANALYSIS, "analysis");
         assert_eq!(menu_id::QUIT, "quit");
     }
 

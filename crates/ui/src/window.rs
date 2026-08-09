@@ -120,6 +120,8 @@ pub enum NativeMenuCmd {
     Quit = 3,
     /// 显示进程详情列表（P2）
     ProcessList = 4,
+    /// 打开卡顿分析窗口（PRD M1 F6）
+    Analysis = 5,
 }
 
 /// 在鼠标位置弹出 Windows 原生右键菜单（`TrackPopupMenu`）。
@@ -170,6 +172,12 @@ pub fn show_context_menu(
             NativeMenuCmd::ProcessList as usize,
             wide("进程详情"),
         );
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            NativeMenuCmd::Analysis as usize,
+            wide("卡顿分析"),
+        );
         let _ = AppendMenuW(hmenu, MF_STRING, NativeMenuCmd::Quit as usize, wide("退出"));
 
         // 屏幕坐标 = 窗口物理位置 + 逻辑坐标 × 缩放
@@ -198,6 +206,7 @@ pub fn show_context_menu(
             2 => Some(NativeMenuCmd::ToggleClickThrough),
             3 => Some(NativeMenuCmd::Quit),
             4 => Some(NativeMenuCmd::ProcessList),
+            5 => Some(NativeMenuCmd::Analysis),
             _ => None,
         }
     }
@@ -489,6 +498,7 @@ mod tests {
         assert_eq!(NativeMenuCmd::ToggleClickThrough as u32, 2);
         assert_eq!(NativeMenuCmd::Quit as u32, 3);
         assert_eq!(NativeMenuCmd::ProcessList as u32, 4);
+        assert_eq!(NativeMenuCmd::Analysis as u32, 5);
     }
 
     #[test]
@@ -506,12 +516,14 @@ mod tests {
             2 => Some(NativeMenuCmd::ToggleClickThrough),
             3 => Some(NativeMenuCmd::Quit),
             4 => Some(NativeMenuCmd::ProcessList),
+            5 => Some(NativeMenuCmd::Analysis),
             _ => None,
         };
         assert_eq!(map(1), Some(NativeMenuCmd::TogglePause));
         assert_eq!(map(2), Some(NativeMenuCmd::ToggleClickThrough));
         assert_eq!(map(3), Some(NativeMenuCmd::Quit));
         assert_eq!(map(4), Some(NativeMenuCmd::ProcessList));
+        assert_eq!(map(5), Some(NativeMenuCmd::Analysis));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
     }

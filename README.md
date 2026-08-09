@@ -9,7 +9,12 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 - [功能特性](#功能特性)
 - [架构](#架构)
 - [安装与构建](#安装与构建)
+  - [构建产物](#构建产物)
+  - [开发者注意](#开发者注意)
 - [使用指南](#使用指南)
+  - [服务管理与排障](#服务管理与排障)
+  - [交互操作](#交互操作)
+  - [进程详情页](#进程详情页)
 - [命令行参考](#命令行参考)
 - [配置](#配置)
 - [开发指南](#开发指南)
@@ -17,21 +22,18 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 
 ## 快速开始
 
-最短路径：先构建，再把采集逻辑注册为 Windows 服务（仅首次需管理员），最后启动悬浮窗。
+最短路径：先构建，再启动悬浮窗即可——首次运行会自动弹 UAC 注册并启动后台采集服务，之后开机自启。
 
 ```bash
 # 1. 构建（需 Windows + MSVC target 的 Rust 工具链）
 cargo build --release
 
-# 2. 注册并启动后台采集服务（仅需一次，会弹 UAC 申请管理员权限）
-target/release/find-stutter-service.exe install-start
-
-# 3. 启动悬浮窗（普通用户即可，服务已开机自启）
+# 2. 启动悬浮窗（首次运行会自动弹 UAC 注册并启动后台采集服务，之后开机自启）
 target/release/find-stutter.exe
 ```
 
 之后每次只需双击 `find-stutter.exe`；若服务未运行，GUI 会自动尝试启动。
-不想装服务、只想看只读监控，见[使用指南 → 运行方式](#运行方式)。
+需要手动停止 / 重启服务（例如升级二进制后），见[使用指南 → 服务管理与排障](#服务管理与排障)。
 
 ## 功能特性
 
@@ -91,18 +93,6 @@ target/release/find-stutter.exe
 
 ## 安装与构建
 
-需要 Rust 工具链（Windows + MSVC target）。
-
-### 构建
-
-```bash
-# 调试构建
-cargo build
-
-# 发布构建（推荐）
-cargo build --release
-```
-
 ### 构建产物
 
 - `target/release/find-stutter.exe`（GUI 端；由 `crates/bin` 入口编译，link `find-stutter-ui` 库）
@@ -114,38 +104,6 @@ cargo build --release
 > （不要只编 `-p find-stutter-ui`，那不会更新 `find-stutter.exe`）。
 
 ## 使用指南
-
-### 运行方式
-
-#### 方式 1：纯 GUI（不安装服务）
-
-> GUI 设计为只读模式：读 `stutter.db` 展示指标与卡顿。若 `stutter.db` 不存在，状态条显示
-> 「● 服务未注册（请运行 find-stutter-service install）」。采集由后台服务负责，未安装服务时
-> GUI 仅显示占位状态，不采集数据。
-
-```bash
-cargo run --release
-# 或
-target/release/find-stutter.exe
-```
-
-#### 方式 2：服务化（推荐）
-
-> 部署三步（构建 → 注册并启动服务 → 启动 GUI）与上文[快速开始](#快速开始)完全一致，此处不再重复贴代码。下面重点说明 GUI 启动时的自动启动逻辑。
-
-GUI 启动时**自动**做的事（在 `crates/ui/src/auto_start.rs`）：
-
-1. 在 GUI exe 同目录 / CWD / PATH 里找 `find-stutter-service.exe`
-2. 调 `status` 子命令查 SCM（退出码 0 = 在跑）
-3. 没在跑就调 `start` 子命令尝试启动
-4. 失败也不阻塞 GUI 启动，只在日志 + 顶部状态条提示
-
-完整 service 子命令见[命令行参考](#命令行参考)。
-
-#### 方式 3：服务前台调试（不注册 SCM）
-
-在终端前台运行服务循环（`run` 子命令，不注册为系统服务），`Ctrl-C` 优雅退出。
-详见[命令行参考 → service 子命令](#find-stutter-serviceexe-service-端)。
 
 ### 服务管理与排障
 
@@ -175,8 +133,13 @@ set FIND_STUTTER_SKIP_SERVICE=1 && find-stutter.exe
 # 用管理员身份打开 cmd，cd 到 target/release
 find-stutter-service.exe start      # 或 sc start FindStutter
 find-stutter-service.exe status     # 查询；退出码 0=在跑，非 0=未运行/未注册
-find-stutter-service.exe stop
+find-stutter-service.exe stop       # 或 sc stop FindStutter
 find-stutter-service.exe uninstall
+
+# 重启服务（service 端无单独的 restart 子命令，用 stop + start 两步）
+# 升级二进制后想让服务用上新 exe，也可直接 install-start（已注册则仅重启）
+sc stop FindStutter && sc start FindStutter
+# 或：find-stutter-service.exe install-start
 ```
 
 > **SCM 服务名**：`FindStutter`，显示名 `Find Stutter Monitor`。

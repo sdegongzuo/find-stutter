@@ -21,7 +21,10 @@
 //! - `Stopped` / `NoDatabase` → 红色 "● 服务已停止"
 //! - 暂停按钮在非 Running 时禁用
 
+pub mod analysis;
+pub mod analytics;
 pub mod auto_start;
+pub mod chart;
 pub mod elevate;
 pub mod hotreload;
 pub mod notify;
@@ -32,6 +35,13 @@ pub mod skin;
 pub mod taskbar;
 pub mod tray;
 pub mod window;
+
+/// 趋势图渲染入口（chart.rs；M2 用 plotters 实现，M1 为桩）。
+pub(crate) use chart::render_trend_chart;
+/// F4 卡顿类型占比饼图渲染入口（chart.rs；M3）。
+pub(crate) use chart::render_cause_pie;
+/// F3 系统资源关联图渲染入口（chart.rs；M4，双轴：CPU%/内存% + 磁盘 B/s）。
+pub(crate) use chart::render_resource_chart;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,6 +146,11 @@ pub fn run() -> anyhow::Result<()> {
         std::sync::Mutex<Option<std::sync::Arc<crate::process_list::ProcessListWindow>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let process_win_for_menu = process_win.clone();
+    // 卡顿分析窗口：复用进程详情页的「首次创建 + 复用 + refresh」模式（PRD M1 F6）
+    let analysis_win: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<crate::analysis::AnalysisWindow>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let analysis_win_for_menu = analysis_win.clone();
     ui.on_menu_requested(move |x: f32, y: f32| {
         let paused = state_for_menu.lock().paused;
         if let Some(ui) = weak_ui_for_menu.upgrade() {
@@ -186,6 +201,24 @@ pub fn run() -> anyhow::Result<()> {
                 Some(crate::window::NativeMenuCmd::Quit) => {
                     log::info!("右键菜单退出");
                     let _ = slint::quit_event_loop();
+                }
+                Some(crate::window::NativeMenuCmd::Analysis) => {
+                    let mut guard = analysis_win_for_menu.lock().unwrap();
+                    if guard.is_none() {
+                        match crate::analysis::AnalysisWindow::show() {
+                            Ok(w) => {
+                                log::info!("卡顿分析窗口已打开");
+                                *guard = Some(std::sync::Arc::new(w));
+                            }
+                            Err(e) => {
+                                log::warn!("卡顿分析窗口打开失败: {}", e);
+                                return;
+                            }
+                        }
+                    }
+                    if let Some(w) = guard.as_ref() {
+                        w.refresh(); // 立即查询 + 渲染
+                    }
                 }
                 None => {} // 用户取消（点空白 / Esc）
             }
@@ -239,6 +272,7 @@ pub fn run() -> anyhow::Result<()> {
     let tray_for_tick = tray.clone();
     let taskbar_for_tick = taskbar.clone();
     let process_win_for_tick = process_win.clone();
+    let analysis_win_for_tick = analysis_win.clone();
     timer.start(
         slint::TimerMode::Repeated,
         POLL_INTERVAL,
@@ -255,13 +289,16 @@ pub fn run() -> anyhow::Result<()> {
                 if let Some(pw) = process_win_for_tick.lock().unwrap().as_ref() {
                     crate::window::ensure_tool_window_for(pw.window());
                 }
+                if let Some(aw) = analysis_win_for_tick.lock().unwrap().as_ref() {
+                    crate::window::ensure_tool_window_for(aw.window());
+                }
             }
             // -1) 消费托盘命令（后台线程投递）
             if let Some(tray) = &tray_for_tick {
                 while let Some(cmd) = tray.try_recv() {
                     if let Some(ui) = weak_ui.upgrade() {
                         let mut s = state_for_tick.lock();
-                        crate::tray::apply_command(&ui, &mut s, cmd);
+                        crate::tray::apply_command(&ui, &mut s, cmd, &analysis_win_for_tick);
                     }
                 }
             }

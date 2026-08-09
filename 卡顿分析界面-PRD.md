@@ -1,8 +1,9 @@
 # 卡顿分析界面 — 产品需求文档（PRD）
 
-> 版本：v0.1（草案）
+> 版本：v0.2（评审修订）
 > 起草日期：2026-08-09
 > 状态：待评审
+> 修订：纳入代码评审意见（时区口径 / F3 降采样 / F4 现实预期 / hover 静态图缓存 / 索引提前到 M2 / 验收补 rtk 与本地时区）
 > 关联文档：`README.md`、`PLAN.md`、`TODO.md`、`crates/core/src/types.rs`、`crates/core/src/logger.rs`、`crates/ui/src/reader.rs`
 
 ---
@@ -83,7 +84,13 @@
 
 - 1Hz × 30 天 ≈ **259 万行** `samples`。分析查询必须**带时间范围**且依赖时间戳索引。
 - 当前建表**没有** `samples.timestamp` / `stutter_events.timestamp` 的索引（建表语句仅主键自增）。**建议本期新增** `CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(timestamp)` 与 `idx_events_ts ON stutter_events(timestamp)`，否则按时间范围聚合会全表扫描。
+- ⚠️ **索引落地归属（实施修订）**：分析页严格「只读 stutter.db」（§1.4/§8），以 `SQLITE_OPEN_READ_ONLY` 打开连接，`CREATE INDEX` 在只读连接下必然失败。故真正的索引由 **service 端建表逻辑 `crates/core/src/logger.rs`** 以 `CREATE INDEX IF NOT EXISTS` 创建（service 重启/重装即生效），分析页只读消费；`analytics.rs::ensure_indexes` 仅在连接可写时真正执行，只读连接下对 `ReadOnly` 错误优雅降级为全表扫描（不影响功能，仅大范围查询稍慢，待 service 端索引生效消除）。
 - 旧库（P5 前）`stutter_events` 无 `culprits` 列，读取需做列存在性探测（reader 已有先例，沿用即可）。
+- ⚠️ **时区口径**：所有 `timestamp` 以 `to_rfc3339()` 存入，是 **UTC** 时间（`+00:00` 后缀）。
+  分析页所有时间维度（时间轴、分桶、KPI「今日 / 高峰时段」、自定义范围）**必须按本地时区展示**，
+  否则 UTC+8 用户会整体偏移 8 小时。推荐在 Rust 侧把 `timestamp` 解析为 `DateTime<Local>` 后分桶，
+  而非直接 `strftime` 分 UTC 小时；同时与悬浮窗 `event_count_today`（当前用 `Utc::now()` 日期，
+  见 `reader.rs`）的口径对齐——两处「今日卡顿 N 次」必须一致，否则用户会困惑。
 
 ---
 
@@ -191,7 +198,7 @@ slint 1.x **没有内置图表控件**。三个候选：
 | B. slint 原生图元手绘 | 用 `Path`/`Rectangle` 在 slint 里拼折线/柱状 | 可与 slint 主题/皮肤统一、可交互 | 开发量大、饼图/坐标轴都要自己算 |
 | C. 嵌入 WebView | 用 web 技术画图 | 生态成熟 | slint 无官方 webview，需额外 crate，体积/复杂度高，偏离现有技术栈 |
 
-**建议默认 A**（plotters → Image），hover/钻取交互通过在 slint 端叠加透明 `TouchArea` 命中分区实现；若后续交互要求高再考虑 B。请在评审时确认。
+**建议默认 A**（plotters → Image）。hover/钻取交互**不必重绘整图**：plotters 把图表一次性渲染为静态 `slint::Image` 缓存，slint 端叠加透明 `TouchArea`，命中分区后用 tooltip 覆盖层（十字线 + 文本）显示该点数据——交互只更新覆盖层、不重绘位图。位图渲染（尤其近 30 天 259 万点）建议放后台线程，渲染完成后把 `Image` 传回 UI 线程显示，避免分析页打开时窗口冻结。若后续交互要求高再考虑 B。请在评审时确认。
 
 ### 6.3 性能与刷新
 
@@ -199,13 +206,16 @@ slint 1.x **没有内置图表控件**。三个候选：
 - 新增时间戳索引（见 §3.3）。
 - 聚合在打开/刷新时**一次性**执行，结果缓存在窗口状态里；高级模式自动刷新默认 30s，且只对当前时间范围重查。
 - 进程归因（解析 `culprits`）在内存聚合，数据量 = 时间范围内事件数（通常几千以内），开销可控。
+- ⚠️ **资源曲线降采样（F3 必做）**：1 天 ≈ 86400 点、30 天 ≈ 259 万点，plotters 直接绘制会卡 UI 线程。绘制前**按显示像素宽度降采样**（每像素桶取 min/max/avg 构成折线，或降点采样），近 30 天范围必须对 `samples` 做分桶聚合后再喂给图表，而非回查全量原始点。
 
 ### 6.4 卡顿类型细分的数据基础（⚠️ 待确认）
 
-当前 `causes` 是自由文本数组，样例形如 `"CPU usage 95.0% > 90.0%"`、`"Disk Spike"`、`"Mem Low"` 等，**没有统一枚举**。做可靠的「类型占比」有两种路线：
+当前 `causes` 是自由文本数组，样例形如 `"CPU usage 95.0% > 90.0%"`、`"Disk Spike"`、`"Mem Low"` 等，**没有统一枚举**。实际产出的文案以 `detector.rs` 当前检测逻辑为准（主要源于 CPU 阈值、内存不足、磁盘/网络 spike 等），不要臆造枚举值。做可靠的「类型占比」有两种路线：
 
 - **路线 1（推荐，需小改 service）**：在 `DetectionConfig`/检测器里定义结构化 `CauseKind` 枚举（如 `CpuHigh` / `MemLow` / `DiskBusy` / `DiskSpike` / `GpuHigh` / `NetworkSpike` / `DpcInterrupt` / `ContextSwitchStorm`），`StutterEvent` 新增 `cause_kinds: Vec<CauseKind>`，`write_event` 一并落库。分析页直接按枚举聚合，语义干净。**代价**：改检测器 + schema 迁移 + 需重装服务（P5 部署约束）。
 - **路线 2（零改造，向后兼容）**：分析页侧做「文本 → 类型」关键词归类（正则/包含匹配），对旧库也有效。**代价**：脆弱、原因文案一改就漏归类。
+
+- ⚠️ **F4 现实预期**：P5-A（`enable_network_spike` 默认关、降低网络误报）尚未落地，当前卡顿大量由「网络 spike」触发（实测单日 13 次卡顿 100% 由网络 spike 触发），故 F4 饼图短期会「网络一家独大」；`DPC/中断`、`上下文切换` 等类型在当前数据源中**不存在**（依赖 P5-B 未落地）。路线 2 的关键词表须按 `detector.rs` 当前实际文案编写，并在界面注明「粗糙归类、随检测器文案可能漂移」。
 
 **建议**：本期先用路线 2 跑通界面（零改造、可立即验证），同时在 PRD 备注路线 1 作为 P5 协同项；待检测器结构化改造落地后无缝切换。请确认是否接受「先 2 后 1」。
 
@@ -217,7 +227,8 @@ slint 1.x **没有内置图表控件**。三个候选：
 
 **F1 时间趋势（按小时分桶）：**
 ```sql
-SELECT strftime('%Y-%m-%d %H:00', timestamp) AS bucket,
+-- 按本地时区分桶（见 §3.3 时区口径）；亦可选择在 Rust 侧解析 DateTime<Local> 后分桶
+SELECT strftime('%Y-%m-%d %H:00', datetime(timestamp, 'localtime')) AS bucket,
        COUNT(*)                                            AS cnt,
        SUM(duration_ms)                                    AS total_ms,
        SUM(CASE severity WHEN 'critical' THEN 1 ELSE 0 END) AS c_crit,
@@ -234,7 +245,7 @@ GROUP BY bucket ORDER BY bucket;
 SELECT id, timestamp, duration_ms, severity, culprits
 FROM stutter_events
 WHERE timestamp BETWEEN ?1 AND ?2
-ORDER BY id;
+ORDER BY timestamp;
 -- Rust: 对每个 culprit 累加 (出现次数, 累计时长, 最大 cpu/mem) → 按 name 排序取 Top N
 ```
 
@@ -244,7 +255,7 @@ SELECT timestamp, cpu_usage, mem_usage_percent,
        disk_read_bps, disk_write_bps, gpu_usage
 FROM samples
 WHERE timestamp BETWEEN ?1 AND ?2
-ORDER BY id;
+ORDER BY timestamp;
 -- 同时在同范围取 stutter_events.timestamp 作为标记点
 ```
 
@@ -266,7 +277,9 @@ WHERE timestamp BETWEEN ?1 AND ?2;
 - [ ] 自定义时间范围（如近 7 天）查询在合理耗时内返回（依赖 §3.3 索引）。
 - [ ] 旧库（无 `culprits` 列）打开分析页不崩溃，缺失字段回退为空/0。
 - [ ] 全程只读 `stutter.db`，不新增写操作、不干扰后台服务。
-- [ ] 新增代码通过 `rtk cargo test -p find-stutter-ui` 且 `cargo build --release` 零警告。
+- [ ] 新增代码通过 `rtk cargo test -p find-stutter-ui` 且 `rtk cargo build --release` 零警告（所有 cargo 命令遵循 rtk 包裹约定）。
+- [ ] 分析页所有时间维度（时间轴 / 分桶 / KPI「今日」「高峰时段」/ 自定义范围）按**本地时区**展示，与悬浮窗 `event_count_today` 的「今日卡顿 N 次」口径一致。
+- [ ] 近 30 天资源曲线已按像素宽度降采样，打开 / 刷新时窗口不冻结（位图渲染不阻塞 UI 线程）。
 
 ---
 
@@ -280,16 +293,18 @@ WHERE timestamp BETWEEN ?1 AND ?2;
 | R4 | 默认时间范围 | 今日 | 体验与性能平衡点 |
 | R5 | 磁盘繁忙度/DPC 等深层信号 | 依赖 P5-B 落地，本期不做 | 限制 F3 深度 |
 | R6 | 入口形式 | 右键菜单 + 托盘菜单（复用进程详情页模式） | 一致性 |
+| R7 | 时区口径 | 按本地时区展示，并与悬浮窗 `event_count_today` 对齐 | 影响时间轴 /「今日」/ 高峰时段正确性，否则偏移 8h |
+| R8 | 资源曲线降采样 | F3 按像素宽度 min/max/avg 桶降采样 + 后台线程渲染 | 影响大范围查询流畅度与 UI 响应 |
 
 ---
 
 ## 10. 实施里程碑（建议）
 
 1. **M1 骨架**：`analysis.slint` + `analysis.rs` 窗口封装 + 右键/托盘入口 + 只读查询层（F6/F7），空页面跑通。
-2. **M2 趋势与 KPI**（F1）：时间分桶聚合 + plotters 折线/柱状 + KPI 卡片。
+2. **M2 趋势与 KPI（F1）**：时间分桶聚合（本地时区）+ plotters 折线/柱状 + KPI 卡片；引入 `ensure_indexes` 骨架（只读连接下对 `ReadOnly` 错误优雅降级，真正索引由 service 端 `logger.rs` 建表逻辑创建，见 §3.3）。
 3. **M3 归因与类型**（F2/F4）：culprits 内存聚合 Top N + 原因归类占比。
 4. **M4 资源关联**（F3）：samples 曲线 + 事件标记叠加。
 5. **M5 双模式与导出**（F5/F8）：基础/高级开关、原始事件表、CSV 导出、皮肤适配。
-6. **M6 打磨**：索引、性能、旧库兼容、测试、零警告构建。
+6. **M6 打磨**：性能复核（降采样生效）、旧库兼容、测试、零警告构建。
 
 > 备注：M3 的 F4 若采用 §6.4 路线 1，则需与 `TODO.md` §P5 的检测器结构化改造协同排期。
