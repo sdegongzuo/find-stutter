@@ -7,7 +7,7 @@
 
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 
-use crate::analytics::{CauseTypeCount, ResourceData, ResourcePoint, TrendPoint};
+use crate::analytics::{CauseTypeCount, ResourceData, ResourcePoint, ResourceView, TrendPoint};
 
 /// 把 plotters 的 RGB（3 字节/像素）缓冲转成 slint 可用的 RGBA8 缓冲（alpha=255 不透明）。
 ///
@@ -243,11 +243,19 @@ fn short_label(bucket: &str) -> String {
 /// - 右轴（磁盘 B/s 自适应量程）：磁盘读 / 写 B/s avg 折线（量纲差异用双轴处理，详见
 ///   `ResourceData` 注释；不再归一到左轴以免 % 曲线被淹没）。
 /// - 卡顿事件竖线：在事件桶位置画浅红竖线，直观看卡顿是否对齐资源尖峰。
-/// - X 轴域用「完整桶数」（0..n_full），与 `data.points.x` / `data.event_x` 真实桶序号对齐。
+/// - X 轴域用「完整桶数」（0..bucket_count），与 `data.points.x` / `data.event_x` 真实桶序号对齐。
+/// - `view`：高级模式可选指标 + 对数轴（PRD §4 F3）：仅绘制 `view` 中启用的系列；
+///   磁盘读/写 B/s 在 `view.log_disk` 为真时改用对数归一（仍落在左轴 0-100 区，
+///   右轴 formatter 还原 B/s 不变），使数量级悬殊的磁盘尖峰可见。
 ///
 /// - 成功：回调收到 `Some(...)`；无采样点（points 为空）→ `None`（UI 占位）。
-pub(crate) fn render_resource_chart<F>(data: &ResourceData, w: u32, h: u32, on_done: F)
-where
+pub(crate) fn render_resource_chart<F>(
+    data: &ResourceData,
+    w: u32,
+    h: u32,
+    view: &ResourceView,
+    on_done: F,
+) where
     F: FnOnce(Option<SharedPixelBuffer<Rgba8Pixel>>) + Send + 'static,
 {
     if data.points.is_empty() {
@@ -265,11 +273,13 @@ where
         root.fill(&WHITE).ok();
 
         // X 轴域必须用「完整桶数」而非「非空桶数」：data.points.x 与 data.event_x
-        // 都是真实桶序号（0..n_full-1），只有用完整桶数做域，曲线与卡顿竖线才对齐，
+        // 都是真实桶序号（0..bucket_count-1），只有用完整桶数做域，曲线与卡顿竖线才对齐，
         // 否则（旧实现用非空桶数 n）曲线会被压缩、竖线错位到错误位置。
-        let n_full: f64 = (((data.span_secs + data.bucket_secs - 1) / data.bucket_secs) as f64) + 1.0;
+        // 桶数 = 覆盖整段需 floor(span/bucket_secs)+1（含起止桶，故 +1）
+        let bucket_count: f64 =
+            (((data.span_secs + data.bucket_secs - 1) / data.bucket_secs) as f64) + 1.0;
         let max_disk = data.max_disk();
-        let has_gpu = data.points.iter().any(|p| p.gpu_avg.is_some());
+        let has_gpu = view.gpu && data.points.iter().any(|p| p.gpu_avg.is_some());
 
         // 双轴处理量纲差异（PRD F3）：左轴 0-100 画 CPU%/内存%/GPU%；
         // 磁盘 B/s 与 % 差几个数量级，单独放右轴。为兼容 plotters 0.3.7 的 API，
@@ -281,9 +291,9 @@ where
             .x_label_area_size(34)
             .y_label_area_size(44)
             .right_y_label_area_size(64)
-            .build_cartesian_2d(0f64..n_full, 0f64..100f64)
+            .build_cartesian_2d(0f64..bucket_count, 0f64..100f64)
             .unwrap()
-            .set_secondary_coord(0f64..n_full, 0f64..100f64);
+            .set_secondary_coord(0f64..bucket_count, 0f64..100f64);
 
         chart
             .configure_mesh()
@@ -315,33 +325,37 @@ where
 
         // CPU% / 内存%：min–max 浅色带（Polygon 填充，比实线更浅的同色调、低 alpha）
         // + avg 实线。只画 avg 会把尖峰抹平（PRD §6.3/§8 要求看出与卡顿尖峰的对应）。
-        chart
-            .draw_series(std::iter::once(Polygon::new(
-                band_polygon(&data.points, |p| p.cpu_min, |p| p.cpu_max),
-                RGBColor(0xc4, 0x4c, 0x4c).mix(0.15).filled(),
-            )))
-            .ok();
-        chart
-            .draw_series(std::iter::once(Polygon::new(
-                band_polygon(&data.points, |p| p.mem_min, |p| p.mem_max),
-                RGBColor(0x4c, 0x9a, 0xc4).mix(0.15).filled(),
-            )))
-            .ok();
-
-        // 左轴：CPU% avg（红）
-        chart
-            .draw_series(LineSeries::new(
-                data.points.iter().map(|p| (p.x as f64, p.cpu_avg as f64)),
-                RGBColor(0xc4, 0x4c, 0x4c),
-            ))
-            .ok();
-        // 左轴：内存% avg（蓝）
-        chart
-            .draw_series(LineSeries::new(
-                data.points.iter().map(|p| (p.x as f64, p.mem_avg as f64)),
-                RGBColor(0x4c, 0x9a, 0xc4),
-            ))
-            .ok();
+        // 仅当 view 对应开关开启时绘制（F3 高级可选指标）。
+        if view.cpu {
+            chart
+                .draw_series(std::iter::once(Polygon::new(
+                    band_polygon(&data.points, |p| p.cpu_min, |p| p.cpu_max),
+                    RGBColor(0xc4, 0x4c, 0x4c).mix(0.15).filled(),
+                )))
+                .ok();
+            // 左轴：CPU% avg（红）
+            chart
+                .draw_series(LineSeries::new(
+                    data.points.iter().map(|p| (p.x as f64, p.cpu_avg as f64)),
+                    RGBColor(0xc4, 0x4c, 0x4c),
+                ))
+                .ok();
+        }
+        if view.mem {
+            chart
+                .draw_series(std::iter::once(Polygon::new(
+                    band_polygon(&data.points, |p| p.mem_min, |p| p.mem_max),
+                    RGBColor(0x4c, 0x9a, 0xc4).mix(0.15).filled(),
+                )))
+                .ok();
+            // 左轴：内存% avg（蓝）
+            chart
+                .draw_series(LineSeries::new(
+                    data.points.iter().map(|p| (p.x as f64, p.mem_avg as f64)),
+                    RGBColor(0x4c, 0x9a, 0xc4),
+                ))
+                .ok();
+        }
         // 左轴：GPU%（可选，橙）—仅 avg 实线（GPU 仅有 avg，无 min/max）
         if has_gpu {
             chart
@@ -355,29 +369,52 @@ where
         }
 
         // 磁盘读/写 B/s：归一到 0-100 后画在左轴坐标区（右轴标签已还原为 B/s）。
-        // 注：ResourceData 仅含磁盘 avg（B8 约定不新增字段），故磁盘只画 avg 实线，
-        // 不叠加 min–max 带。
-        let norm = |b: f64| (b / max_disk * 100.0).clamp(0.0, 100.0);
-        chart
-            .draw_series(LineSeries::new(
-                data.points.iter().map(|p| (p.x as f64, norm(p.disk_read_avg))),
-                RGBColor(0x6a, 0xb1, 0x4c),
-            ))
-            .ok();
-        chart
-            .draw_series(LineSeries::new(
-                data.points.iter().map(|p| (p.x as f64, norm(p.disk_write_avg))),
-                RGBColor(0xb0, 0x7c, 0xc4),
-            ))
-            .ok();
+        // view.log_disk 为真时改用对数归一：norm(b)=log10(b+1)/log10(max_disk+1)*100，
+        // 仍落在 0-100 左轴坐标区，使数量级悬殊的磁盘尖峰可见。
+        // 注：ResourceData 仅含磁盘 avg（不新增字段），故磁盘只画 avg 实线，不叠加 min–max 带。
+        let denom = if view.log_disk {
+            (max_disk + 1.0).log10().max(f64::MIN_POSITIVE)
+        } else {
+            1.0
+        };
+        let norm = |b: f64| {
+            if view.log_disk {
+                ((b + 1.0).log10() / denom * 100.0).clamp(0.0, 100.0)
+            } else {
+                (b / max_disk * 100.0).clamp(0.0, 100.0)
+            }
+        };
+        if view.disk_read {
+            chart
+                .draw_series(LineSeries::new(
+                    data.points.iter().map(|p| (p.x as f64, norm(p.disk_read_avg))),
+                    RGBColor(0x6a, 0xb1, 0x4c),
+                ))
+                .ok();
+        }
+        if view.disk_write {
+            chart
+                .draw_series(LineSeries::new(
+                    data.points.iter().map(|p| (p.x as f64, norm(p.disk_write_avg))),
+                    RGBColor(0xb0, 0x7c, 0xc4),
+                ))
+                .ok();
+        }
 
-        // 图例（右上角）
-        let mut legend: Vec<(RGBColor, &str)> = vec![
-            (RGBColor(0xc4, 0x4c, 0x4c), "CPU%"),
-            (RGBColor(0x4c, 0x9a, 0xc4), "内存%"),
-            (RGBColor(0x6a, 0xb1, 0x4c), "磁盘读"),
-            (RGBColor(0xb0, 0x7c, 0xc4), "磁盘写"),
-        ];
+        // 图例（右上角）：仅列已启用的系列
+        let mut legend: Vec<(RGBColor, &str)> = Vec::new();
+        if view.cpu {
+            legend.push((RGBColor(0xc4, 0x4c, 0x4c), "CPU%"));
+        }
+        if view.mem {
+            legend.push((RGBColor(0x4c, 0x9a, 0xc4), "内存%"));
+        }
+        if view.disk_read {
+            legend.push((RGBColor(0x6a, 0xb1, 0x4c), "磁盘读"));
+        }
+        if view.disk_write {
+            legend.push((RGBColor(0xb0, 0x7c, 0xc4), "磁盘写"));
+        }
         if has_gpu {
             legend.push((RGBColor(0xe0, 0xa8, 0x30), "GPU%"));
         }

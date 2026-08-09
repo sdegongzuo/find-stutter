@@ -8,7 +8,7 @@
 //!
 //! - `timestamp` 落库是 UTC RFC3339。
 //! - KPI「今日卡顿 N 次」**必须与悬浮窗 `event_count_today` 完全一致**：
-//!   两者共用核心单一来源 `local_today_bounds()`（本地零点→现在，BETWEEN UTC 边界，
+//!   两者共用核心单一来源 `local_today_bounds_utc()`（本地零点→现在，BETWEEN UTC 边界，
 //!   见 `crates/core/src/logger.rs`），分析页 `load_kpi_today` / `TimeRange::Today` 都走它，
 //!   任何一处「今日卡顿 N 次」口径都一致，用户不会困惑。
 //! - 趋势分桶按**本地时区**：`strftime('%Y-%m-%d %H:00', datetime(timestamp,'localtime'))`，
@@ -23,7 +23,7 @@ use rusqlite::{params, Connection, OpenFlags};
 
 /// 时间范围选择器（PRD F7）。
 ///
-/// - `Today`：今日（本地时区零点，与 `local_today_bounds` 对齐）
+/// - `Today`：今日（本地时区零点，与 `local_today_bounds_utc` 对齐）
 /// - `Last7` / `Last30`：近 7 / 30 天（按 UTC 当前时刻往前推）
 /// - `Custom(from, to)`：自定义 RFC3339 区间
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,7 +404,7 @@ pub fn load_cause_types(
 /// 今日 KPI 汇总（基础模式 4 卡片）。
 ///
 /// 全部按「今日」口径：today_count 与悬浮窗 `event_count_today` 共用
-/// `local_today_bounds()`（本地零点 → 现在），保证两处「今日卡顿 N 次」一致。
+/// `local_today_bounds_utc()`（本地零点 → 现在），保证两处「今日卡顿 N 次」一致。
 pub fn load_kpi_today(conn: &Connection) -> anyhow::Result<KpiSummary> {
     // 今日范围（本地零点 → 现在）；今日计数与范围聚合共用同一边界，保证口径一致。
     let (start, end) = TimeRange::Today.bounds();
@@ -540,6 +540,113 @@ impl ResourceData {
     }
 }
 
+/// F3（高级）：单次卡顿事件的资源快照（事件瞬间前后采样窗口的均值，PRD §4 F3）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSnapshot {
+    /// CPU 平均使用率 %
+    pub cpu: f32,
+    /// 内存平均使用率 %
+    pub mem: f32,
+    /// 磁盘读平均速率 B/s
+    pub disk_read: f64,
+    /// 磁盘写平均速率 B/s
+    pub disk_write: f64,
+    /// GPU 平均利用率 %（可能为空）
+    pub gpu: Option<f32>,
+}
+
+/// F3（高级）：读取某次卡顿时刻前后 [ts-3s, ts+3s] 的采样均值，作为该次卡顿的资源快照。
+///
+/// 全程只读 `stutter.db`。优先取窗口内 `AVG`；窗口内无采样（如事件落点附近无 1Hz 数据）
+/// 时回退取「最接近 ts 的一条」采样（PRD §4 F3 高级模式 hover 看事件点资源状态）。
+pub fn load_event_snapshot(conn: &Connection, ts_secs: i64) -> Option<EventSnapshot> {
+    let lo = ts_secs - 3;
+    let hi = ts_secs + 3;
+    // 1) 窗口内 AVG
+    let avg = conn
+        .query_row(
+            "SELECT AVG(cpu_usage), AVG(mem_usage_percent), AVG(disk_read_bps),
+                    AVG(disk_write_bps), AVG(gpu_usage)
+             FROM samples
+             WHERE CAST(strftime('%s', timestamp) AS INTEGER) BETWEEN ?1 AND ?2",
+            params![lo, hi],
+            |row| {
+                Ok((
+                    row.get::<_, Option<f64>>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, Option<f64>>(2)?,
+                    row.get::<_, Option<f64>>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                ))
+            },
+        )
+        .ok();
+    if let Some((Some(c), Some(m), Some(dr), Some(dw), gpu)) = avg {
+        return Some(EventSnapshot {
+            cpu: c as f32,
+            mem: m as f32,
+            disk_read: dr,
+            disk_write: dw,
+            gpu: gpu.map(|v| v as f32),
+        });
+    }
+    // 2) 回退：取最接近 ts 的一条采样
+    let nearest = conn
+        .query_row(
+            "SELECT cpu_usage, mem_usage_percent, disk_read_bps, disk_write_bps, gpu_usage
+             FROM samples
+             ORDER BY ABS(CAST(strftime('%s', timestamp) AS INTEGER) - ?1) ASC
+             LIMIT 1",
+            params![ts_secs],
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, Option<f64>>(4)?,
+                ))
+            },
+        )
+        .ok();
+    nearest.map(|(c, m, dr, dw, gpu)| EventSnapshot {
+        cpu: c as f32,
+        mem: m as f32,
+        disk_read: dr,
+        disk_write: dw,
+        gpu: gpu.map(|v| v as f32),
+    })
+}
+
+/// F3（高级）：资源图可选显示指标 + 对数轴视图（PRD §4 F3 / §5）。
+///
+/// 由 slint 端 5 个 CheckBox（cpu/mem/disk_read/disk_write/gpu）与「对数轴（磁盘）」
+/// CheckBox 驱动；`render_resource_chart` 据此决定绘制哪些系列、磁盘轴是否取对数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceView {
+    pub cpu: bool,
+    pub mem: bool,
+    pub disk_read: bool,
+    pub disk_write: bool,
+    pub gpu: bool,
+    /// 磁盘读/写 B/s 改用对数归一（数量级悬殊的尖峰可见）
+    pub log_disk: bool,
+}
+
+impl Default for ResourceView {
+    /// 默认全部指标勾选、对数轴关闭（与 slint 端 CheckBox 默认态一致）。
+    fn default() -> Self {
+        ResourceView {
+            cpu: true,
+            mem: true,
+            disk_read: true,
+            disk_write: true,
+            gpu: true,
+            log_disk: false,
+        }
+    }
+}
+
 /// F3：读取时间范围内的 `samples` 并按显示宽度降采样（PRD §6.3 / §7 F3 草稿）。
 ///
 /// - `width_px`：资源图显示像素宽度，决定桶数（PRD「按显示像素宽度降采样」）。
@@ -643,6 +750,9 @@ pub fn load_resource_samples(
 pub struct EventRow {
     /// 本地时区格式化时间 `YYYY-MM-DD HH:MM:SS`（PRD §3.3 时区口径）。
     pub time_local: String,
+    /// 卡顿发生时刻（UTC epoch 秒）；用于按时刻对齐资源采样与加载 snapshot。
+    /// 解析失败 / 旧库异常填 0。
+    pub ts_secs: i64,
     /// 持续时长（ms）
     pub duration_ms: u64,
     /// 严重程度中文标签（轻微 / 严重 / 危急）
@@ -790,10 +900,15 @@ pub fn load_events_sorted(
         let time_local = DateTime::parse_from_rfc3339(&ts)
             .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|_| ts.clone());
+        // 解析 UTC epoch 秒（供 hover/snapshot 按时刻对齐资源采样）；失败填 0。
+        let ts_secs = DateTime::parse_from_rfc3339(&ts)
+            .map(|d| d.timestamp())
+            .unwrap_or(0);
         let causes_text = join_causes(&causes_json);
         let (culprit_names, culprits_text) = parse_culprits(&culprits_json);
         out.push(EventRow {
             time_local,
+            ts_secs,
             duration_ms: dur,
             severity_cn: severity_cn(&sev),
             causes_text,

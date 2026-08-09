@@ -16,7 +16,7 @@
 // 皮肤：所有颜色/字号/尺寸均为 in property（由 Rust 端按 skin.toml 注入），
 // 默认值与 skins/default/skin.toml 保持一致。
 
-import { Button, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
 // 卡顿分析页面组件（PRD M1）：直接作为顶层组件定义在本文件末尾（export component
 // Analysis）。原因：slint 1.17 的 `include_modules!()` 只导出「传给 slint_build::compile
 // 的根文件」的顶层组件，被 `import` 的子文件组件不会进入 Rust 侧生成代码；若拆成独立
@@ -1005,6 +1005,10 @@ export component Analysis inherits Window {
     // 列名取值：time / duration / severity / causes / culprits
     in property <string> sort-column: "time";
     in property <bool> sort-ascending: true;
+    // F3（高级）：资源图 hover 最近卡顿事件信息面板文本（Rust 端 on_resource_hover 写入）
+    in-out property <string> resource-hover-info: "";
+    // F3（高级）：点击原始事件表某行 → 该次卡顿的 snapshot 详情面板文本
+    in-out property <string> event-detail: "";
 
     callback close-requested();
     callback refresh-requested();
@@ -1025,6 +1029,14 @@ export component Analysis inherits Window {
     callback clear-drill-requested();
     // F5：事件表列头点击排序（传列名 time/duration/severity/causes/culprits）
     callback sort-requested(string);
+    // F3（高级）：资源图 hover 触发（传鼠标 X 比例 0..1），Rust 端据此定位最近卡顿事件
+    callback resource-hover(float);
+    // F3（高级）：点击原始事件表某行（传该行在模型中的序号），Rust 端加载 snapshot 详情
+    callback row-clicked(int);
+    // F3（高级）：切换某资源指标显隐（名 "cpu"/"mem"/"disk_read"/"disk_write"/"gpu"，状态）
+    callback metric-toggled(string, bool);
+    // F3（高级）：切换磁盘对数轴
+    callback log-axis-changed(bool);
 
     Rectangle {
         width: 100%;
@@ -1383,8 +1395,12 @@ export component Analysis inherits Window {
                                 }
                             }
                             ListView {
-                                for row in root.event-model : Rectangle {
+                                for row[index] in root.event-model : Rectangle {
                                     height: 20px;
+                                    // F3（高级）：点击整行 → 该次卡顿 snapshot 详情（index 为模型序号）
+                                    TouchArea {
+                                        clicked => { root.row-clicked(index); }
+                                    }
                                     HorizontalLayout {
                                         padding-left: 4px;
                                         spacing: 4px;
@@ -1408,6 +1424,14 @@ export component Analysis inherits Window {
                                 color: #2c7a3d;
                                 font-size: 11px;
                             }
+                            // F3（高级）：点击事件行后显示该次卡顿的 snapshot 资源详情
+                            Text {
+                                visible: root.advanced-mode && root.event-detail != "";
+                                text: root.event-detail;
+                                color: root.skin-text-color;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
                         }
                     }
                 }
@@ -1430,12 +1454,23 @@ export component Analysis inherits Window {
                         font-size: 13px;
                         font-weight: 700;
                     }
-                    Image {
+                    // F3（高级）：资源图 hover 看最近卡顿事件。外包 TouchArea 捕获 pointer-event；
+                    // 悬停（kind==move）时按鼠标 X 比例触发 resource-hover 回调；离开（cancel）清空。
+                    TouchArea {
                         visible: root.has-resource && root.advanced-mode;
-                        source: root.resource-image;
-                        width: 100%;
-                        height: 100%;
-                        image-fit: contain;
+                        Image {
+                            source: root.resource-image;
+                            width: 100%;
+                            height: 100%;
+                            image-fit: contain;
+                        }
+                        pointer-event(ev) => {
+                            if (ev.kind == PointerEventKind.move) {
+                                root.resource-hover(self.mouse-x / self.width);
+                            } else if (ev.kind == PointerEventKind.cancel) {
+                                root.resource-hover-info = "";
+                            }
+                        }
                     }
                     Text {
                         visible: !root.has-resource;
@@ -1444,6 +1479,25 @@ export component Analysis inherits Window {
                         font-size: 13px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
+                    }
+                    // F3（高级）：hover 信息面板（最近卡顿事件的时间/等级/原因/元凶）
+                    Text {
+                        visible: root.advanced-mode && root.resource-hover-info != "";
+                        text: root.resource-hover-info;
+                        color: root.skin-subtext-color;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    // F3（高级）：可选指标 + 对数轴（仅高级模式出现，基础模式不触发）
+                    HorizontalLayout {
+                        visible: root.advanced-mode;
+                        spacing: 8px;
+                        CheckBox { text: "CPU%"; checked: true; toggled => { root.metric-toggled("cpu", self.checked); } }
+                        CheckBox { text: "内存%"; checked: true; toggled => { root.metric-toggled("mem", self.checked); } }
+                        CheckBox { text: "磁盘读"; checked: true; toggled => { root.metric-toggled("disk_read", self.checked); } }
+                        CheckBox { text: "磁盘写"; checked: true; toggled => { root.metric-toggled("disk_write", self.checked); } }
+                        CheckBox { text: "GPU%"; checked: true; toggled => { root.metric-toggled("gpu", self.checked); } }
+                        CheckBox { text: "对数轴（磁盘）"; checked: false; toggled => { root.log-axis-changed(self.checked); } }
                     }
                 }
             }
