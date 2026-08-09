@@ -240,8 +240,9 @@ fn short_label(bucket: &str) -> String {
 /// - 左轴（0-100）：CPU% / 内存% 绘 min–max 浅色带（Polygon，同色调低 alpha）+ avg 实线，
 ///   GPU%（可选，仅 avg 实线，Nullable 时跳过）；min–max 带保留尖峰，避免只画 avg 被抹平
 ///   （PRD §6.3/§8 要求看出与卡顿尖峰的对应）。
-/// - 右轴（磁盘 B/s 自适应量程）：磁盘读 / 写 B/s avg 折线（量纲差异用双轴处理，详见
-///   `ResourceData` 注释；不再归一到左轴以免 % 曲线被淹没）。
+/// - 右轴（磁盘 B/s 自适应量程）：磁盘读 / 写 B/s 同样绘 min–max 浅色带 + avg 实线
+///   （`ResourcePoint` 含 disk_read/write 的 min/max/avg，PRD §6.3「每像素桶取 min/max/avg」）；
+///   量纲差异用双轴处理（详见 `ResourceData` 注释；不再归一到左轴以免 % 曲线被淹没）。
 /// - 卡顿事件竖线：在事件桶位置画浅红竖线，直观看卡顿是否对齐资源尖峰。
 /// - X 轴域用「完整桶数」（0..bucket_count），与 `data.points.x` / `data.event_x` 真实桶序号对齐。
 /// - `view`：高级模式可选指标 + 对数轴（PRD §4 F3）：仅绘制 `view` 中启用的系列；
@@ -329,7 +330,7 @@ pub(crate) fn render_resource_chart<F>(
         if view.cpu {
             chart
                 .draw_series(std::iter::once(Polygon::new(
-                    band_polygon(&data.points, |p| p.cpu_min, |p| p.cpu_max),
+                    band_polygon(&data.points, |p| p.cpu_min as f64, |p| p.cpu_max as f64),
                     RGBColor(0xc4, 0x4c, 0x4c).mix(0.15).filled(),
                 )))
                 .ok();
@@ -344,7 +345,7 @@ pub(crate) fn render_resource_chart<F>(
         if view.mem {
             chart
                 .draw_series(std::iter::once(Polygon::new(
-                    band_polygon(&data.points, |p| p.mem_min, |p| p.mem_max),
+                    band_polygon(&data.points, |p| p.mem_min as f64, |p| p.mem_max as f64),
                     RGBColor(0x4c, 0x9a, 0xc4).mix(0.15).filled(),
                 )))
                 .ok();
@@ -371,7 +372,8 @@ pub(crate) fn render_resource_chart<F>(
         // 磁盘读/写 B/s：归一到 0-100 后画在左轴坐标区（右轴标签已还原为 B/s）。
         // view.log_disk 为真时改用对数归一：norm(b)=log10(b+1)/log10(max_disk+1)*100，
         // 仍落在 0-100 左轴坐标区，使数量级悬殊的磁盘尖峰可见。
-        // 注：ResourceData 仅含磁盘 avg（不新增字段），故磁盘只画 avg 实线，不叠加 min–max 带。
+        // 磁盘同样含 min/max/avg：先画 min–max 浅色带（同色调低 alpha），再画 avg 实线，
+        // 保留尖峰（PRD §6.3/§8）。norm 闭包统一处理线性/对数归一，min/max/avg 共用之。
         let denom = if view.log_disk {
             (max_disk + 1.0).log10().max(f64::MIN_POSITIVE)
         } else {
@@ -386,6 +388,16 @@ pub(crate) fn render_resource_chart<F>(
         };
         if view.disk_read {
             chart
+                .draw_series(std::iter::once(Polygon::new(
+                    band_polygon(
+                        &data.points,
+                        |p| norm(p.disk_read_min),
+                        |p| norm(p.disk_read_max),
+                    ),
+                    RGBColor(0x6a, 0xb1, 0x4c).mix(0.15).filled(),
+                )))
+                .ok();
+            chart
                 .draw_series(LineSeries::new(
                     data.points.iter().map(|p| (p.x as f64, norm(p.disk_read_avg))),
                     RGBColor(0x6a, 0xb1, 0x4c),
@@ -393,6 +405,16 @@ pub(crate) fn render_resource_chart<F>(
                 .ok();
         }
         if view.disk_write {
+            chart
+                .draw_series(std::iter::once(Polygon::new(
+                    band_polygon(
+                        &data.points,
+                        |p| norm(p.disk_write_min),
+                        |p| norm(p.disk_write_max),
+                    ),
+                    RGBColor(0xb0, 0x7c, 0xc4).mix(0.15).filled(),
+                )))
+                .ok();
             chart
                 .draw_series(LineSeries::new(
                     data.points.iter().map(|p| (p.x as f64, norm(p.disk_write_avg))),
@@ -462,10 +484,10 @@ fn fmt_bytes(b: f64) -> String {
 /// 与 X 轴域（完整桶数）对齐。
 fn band_polygon(
     points: &[ResourcePoint],
-    min: fn(&ResourcePoint) -> f32,
-    max: fn(&ResourcePoint) -> f32,
+    min: impl Fn(&ResourcePoint) -> f64,
+    max: impl Fn(&ResourcePoint) -> f64,
 ) -> Vec<(f64, f64)> {
-    let fwd: Vec<(f64, f64)> = points.iter().map(|p| (p.x as f64, min(p) as f64)).collect();
-    let rev: Vec<(f64, f64)> = points.iter().rev().map(|p| (p.x as f64, max(p) as f64)).collect();
+    let fwd: Vec<(f64, f64)> = points.iter().map(|p| (p.x as f64, min(p))).collect();
+    let rev: Vec<(f64, f64)> = points.iter().rev().map(|p| (p.x as f64, max(p))).collect();
     fwd.into_iter().chain(rev).collect()
 }

@@ -499,7 +499,11 @@ pub struct ResourcePoint {
     pub mem_min: f32,
     pub mem_max: f32,
     pub disk_read_avg: f64,
+    pub disk_read_min: f64,
+    pub disk_read_max: f64,
     pub disk_write_avg: f64,
+    pub disk_write_min: f64,
+    pub disk_write_max: f64,
     pub gpu_avg: Option<f32>,
 }
 
@@ -682,7 +686,11 @@ pub fn load_resource_samples(
                 MIN(mem_usage_percent) AS mem_min,
                 MAX(mem_usage_percent) AS mem_max,
                 AVG(disk_read_bps)     AS dr_avg,
+                MIN(disk_read_bps)     AS dr_min,
+                MAX(disk_read_bps)     AS dr_max,
                 AVG(disk_write_bps)    AS dw_avg,
+                MIN(disk_write_bps)    AS dw_min,
+                MAX(disk_write_bps)    AS dw_max,
                 AVG(gpu_usage)         AS gpu_avg
          FROM samples
          WHERE timestamp BETWEEN ?1 AND ?2
@@ -700,11 +708,15 @@ pub fn load_resource_samples(
             row.get::<_, Option<f64>>(7)?,
             row.get::<_, Option<f64>>(8)?,
             row.get::<_, Option<f64>>(9)?,
+            row.get::<_, Option<f64>>(10)?,
+            row.get::<_, Option<f64>>(11)?,
+            row.get::<_, Option<f64>>(12)?,
+            row.get::<_, Option<f64>>(13)?,
         ))
     })?;
     let mut points: Vec<ResourcePoint> = Vec::new();
     for r in rows {
-        let (b, ca, cmi, cma, ma, mmi, mma, dr, dw, ga) = r?;
+        let (b, ca, cmi, cma, ma, mmi, mma, dr, dr_min, dr_max, dw, dw_min, dw_max, ga) = r?;
         let x = b.clamp(0, n - 1);
         points.push(ResourcePoint {
             x,
@@ -716,7 +728,11 @@ pub fn load_resource_samples(
             mem_min: mmi.unwrap_or(0.0) as f32,
             mem_max: mma.unwrap_or(0.0) as f32,
             disk_read_avg: dr.unwrap_or(0.0),
+            disk_read_min: dr_min.unwrap_or(0.0),
+            disk_read_max: dr_max.unwrap_or(0.0),
             disk_write_avg: dw.unwrap_or(0.0),
+            disk_write_min: dw_min.unwrap_or(0.0),
+            disk_write_max: dw_max.unwrap_or(0.0),
             gpu_avg: ga.map(|v| v as f32),
         });
     }

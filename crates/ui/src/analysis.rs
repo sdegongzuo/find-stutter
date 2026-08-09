@@ -20,7 +20,8 @@ use std::time::Duration;
 use slint::{Brush, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::analytics::{
-    self, parse_event_sort_column, EventRow, EventSort, ResourceView, TimeRange, TrendBucket,
+    self, parse_event_sort_column, EventRow, EventSnapshot, EventSort, ResourceView, TimeRange,
+    TrendBucket,
 };
 
 /// 卡顿分析窗口句柄。
@@ -63,6 +64,10 @@ pub struct AnalysisWindow {
     /// F3（高级 hover）：每个 `hover_events` 对应事件的桶序号（clamp 到 [0,bucket_count-1]）。
     #[allow(dead_code)]
     hover_buckets: Arc<Mutex<Vec<i64>>>,
+    /// F3（高级 hover）：与 `hover_events` 同序的每个事件快照（事件瞬间资源全字段）。
+    /// 由资源后台线程按 `hover_events` 同序计算并写入，供 `on_resource_hover` 末尾追加快照行。
+    #[allow(dead_code)]
+    hover_snaps: Arc<Mutex<Vec<Option<EventSnapshot>>>>,
     /// F3（高级 snapshot）：当前事件表显示的事件（表序、含钻取筛选与排序），供 on_row_clicked
     /// 按序号取该次卡顿的 ts_secs 加载 snapshot。
     #[allow(dead_code)]
@@ -94,6 +99,8 @@ impl AnalysisWindow {
         // F3：资源图 hover / 事件行 snapshot 所需的共享状态（高级模式）
         let hover_events: Arc<Mutex<Vec<EventRow>>> = Arc::new(Mutex::new(Vec::new()));
         let hover_buckets: Arc<Mutex<Vec<i64>>> = Arc::new(Mutex::new(Vec::new()));
+        let hover_snaps: Arc<Mutex<Vec<Option<EventSnapshot>>>> =
+            Arc::new(Mutex::new(Vec::new()));
         let table_events: Arc<Mutex<Vec<EventRow>>> = Arc::new(Mutex::new(Vec::new()));
         let resource_view: Arc<Mutex<ResourceView>> = Arc::new(Mutex::new(ResourceView::default()));
 
@@ -137,6 +144,7 @@ impl AnalysisWindow {
         let auto_interval_for_toggle = auto_interval.clone();
         let he_for_toggle = hover_events.clone();
         let hb_for_toggle = hover_buckets.clone();
+        let hs_for_toggle = hover_snaps.clone();
         let te_for_toggle = table_events.clone();
         let rv_for_toggle = resource_view.clone();
         let weak_toggle = ui.as_weak();
@@ -159,6 +167,7 @@ impl AnalysisWindow {
                     &timer_for_toggle,
                     &he_for_toggle,
                     &hb_for_toggle,
+                    &hs_for_toggle,
                     &te_for_toggle,
                     &rv_for_toggle,
                     secs,
@@ -177,6 +186,7 @@ impl AnalysisWindow {
                     b,
                     &he_for_toggle,
                     &hb_for_toggle,
+                    &hs_for_toggle,
                     &te_for_toggle,
                     &rv_for_toggle,
                 );
@@ -194,6 +204,7 @@ impl AnalysisWindow {
         let advanced_for_range = advanced.clone();
         let he_for_range = hover_events.clone();
         let hb_for_range = hover_buckets.clone();
+        let hs_for_range = hover_snaps.clone();
         let te_for_range = table_events.clone();
         let rv_for_range = resource_view.clone();
         ui.on_range_changed(move |value: SharedString| {
@@ -223,6 +234,7 @@ impl AnalysisWindow {
                     b,
                     &he_for_range,
                     &hb_for_range,
+                    &hs_for_range,
                     &te_for_range,
                     &rv_for_range,
                 );
@@ -237,6 +249,7 @@ impl AnalysisWindow {
         let advanced_for_bucket = advanced.clone();
         let he_for_bucket = hover_events.clone();
         let hb_for_bucket = hover_buckets.clone();
+        let hs_for_bucket = hover_snaps.clone();
         let te_for_bucket = table_events.clone();
         let rv_for_bucket = resource_view.clone();
         let weak_bucket = ui.as_weak();
@@ -257,6 +270,7 @@ impl AnalysisWindow {
                     b,
                     &he_for_bucket,
                     &hb_for_bucket,
+                    &hs_for_bucket,
                     &te_for_bucket,
                     &rv_for_bucket,
                 );
@@ -273,6 +287,7 @@ impl AnalysisWindow {
         let advanced_for_auto = advanced.clone();
         let he_for_auto = hover_events.clone();
         let hb_for_auto = hover_buckets.clone();
+        let hs_for_auto = hover_snaps.clone();
         let te_for_auto = table_events.clone();
         let rv_for_auto = resource_view.clone();
         ui.on_auto_refresh_changed(move |value: SharedString| {
@@ -300,6 +315,7 @@ impl AnalysisWindow {
                         &timer_for_auto,
                         &he_for_auto,
                         &hb_for_auto,
+                        &hs_for_auto,
                         &te_for_auto,
                         &rv_for_auto,
                         secs,
@@ -313,6 +329,7 @@ impl AnalysisWindow {
         let weak_hover = ui.as_weak();
         let he_for_hover = hover_events.clone();
         let hb_for_hover = hover_buckets.clone();
+        let hs_for_hover = hover_snaps.clone();
         ui.on_resource_hover(move |ratio: f32| {
             let events = he_for_hover.lock().unwrap().clone();
             let buckets = hb_for_hover.lock().unwrap().clone();
@@ -338,10 +355,24 @@ impl AnalysisWindow {
                 }
             }
             let e = &events[best];
-            let info = format!(
+            let mut info = format!(
                 "{} | {} | 原因：{} | 元凶：{}",
                 e.time_local, e.severity_cn, e.causes_text, e.culprits_text
             );
+            // 追加该次 snapshot 资源全字段（与 hover_events 同序，PRD §4 F3）
+            let snaps = hs_for_hover.lock().unwrap().clone();
+            if let Some(Some(snap)) = snaps.get(best) {
+                info.push_str(&format!(
+                    " | 采样 CPU {:.1}% 内存 {:.1}% 磁盘读 {} 写 {}",
+                    snap.cpu,
+                    snap.mem,
+                    fmt_bytes(snap.disk_read),
+                    fmt_bytes(snap.disk_write)
+                ));
+                if let Some(g) = snap.gpu {
+                    info.push_str(&format!(" GPU {:.1}%", g));
+                }
+            }
             if let Some(ui) = weak_hover.upgrade() {
                 ui.set_resource_hover_info(SharedString::from(info));
             }
@@ -480,6 +511,7 @@ impl AnalysisWindow {
         let bucket_for_apply = bucket.clone();
         let he_for_apply = hover_events.clone();
         let hb_for_apply = hover_buckets.clone();
+        let hs_for_apply = hover_snaps.clone();
         let te_for_apply = table_events.clone();
         let rv_for_apply = resource_view.clone();
         let weak_apply = ui.as_weak();
@@ -499,6 +531,7 @@ impl AnalysisWindow {
                     b,
                     &he_for_apply,
                     &hb_for_apply,
+                    &hs_for_apply,
                     &te_for_apply,
                     &rv_for_apply,
                 );
@@ -566,6 +599,7 @@ impl AnalysisWindow {
         let bucket_refresh = bucket.clone();
         let he_for_refresh = hover_events.clone();
         let hb_for_refresh = hover_buckets.clone();
+        let hs_for_refresh = hover_snaps.clone();
         let te_for_refresh = table_events.clone();
         let rv_for_refresh = resource_view.clone();
         // 闭包捕获 db_path 副本（move 后原 db_path 仍留给下方 refresh_window 与结构体）
@@ -584,6 +618,7 @@ impl AnalysisWindow {
                     b,
                     &he_for_refresh,
                     &hb_for_refresh,
+                    &hs_for_refresh,
                     &te_for_refresh,
                     &rv_for_refresh,
                 );
@@ -610,6 +645,7 @@ impl AnalysisWindow {
             TrendBucket::Hour,
             &hover_events,
             &hover_buckets,
+            &hover_snaps,
             &table_events,
             &resource_view,
         );
@@ -627,6 +663,7 @@ impl AnalysisWindow {
             auto_interval,
             hover_events,
             hover_buckets,
+            hover_snaps,
             table_events,
             resource_view,
         })
@@ -651,6 +688,7 @@ impl AnalysisWindow {
             b,
             &self.hover_events,
             &self.hover_buckets,
+            &self.hover_snaps,
             &self.table_events,
             &self.resource_view,
         );
@@ -672,6 +710,8 @@ impl AnalysisWindow {
 /// `hover_events` / `hover_buckets` / `table_events` / `view` 为 F3 高级交互所需的
 /// 共享状态（分别供 hover 定位、snapshot 取行、资源图可选指标）。各回调已克隆 Arcs
 /// 传入，避免持有窗口强引用。
+/// `hover_events` / `hover_buckets` 为 F3 hover 定位的卡顿事件列表与桶序号；
+/// `hover_snaps` 与 `hover_events` 同序，存每次卡顿的资源快照全字段（hover 信息末尾追加快照）。
 fn refresh_window(
     ui: &crate::Analysis,
     db_path: &PathBuf,
@@ -680,6 +720,7 @@ fn refresh_window(
     bucket: TrendBucket,
     hover_events: &Arc<Mutex<Vec<EventRow>>>,
     hover_buckets: &Arc<Mutex<Vec<i64>>>,
+    hover_snaps: &Arc<Mutex<Vec<Option<EventSnapshot>>>>,
     table_events: &Arc<Mutex<Vec<EventRow>>>,
     view: &Arc<Mutex<ResourceView>>,
 ) {
@@ -831,6 +872,7 @@ fn refresh_window(
     let view_res = view.clone();
     let he_res = hover_events.clone();
     let hb_res = hover_buckets.clone();
+    let hs_res = hover_snaps.clone();
     std::thread::Builder::new()
         .name("analysis-resource-chart".into())
         .spawn(move || {
@@ -847,8 +889,15 @@ fn refresh_window(
                             ((e.ts_secs - data.base_secs) / data.bucket_secs).clamp(0, n - 1)
                         })
                         .collect();
+                    // 与 hover_evs 同序计算每个事件的资源快照（事件瞬间全字段），
+                    // 供 on_resource_hover 末尾追加快照行（PRD §4 F3）。
+                    let hover_snps: Vec<Option<EventSnapshot>> = hover_evs
+                        .iter()
+                        .map(|e| analytics::load_event_snapshot(&c, e.ts_secs))
+                        .collect();
                     *he_res.lock().unwrap() = hover_evs;
                     *hb_res.lock().unwrap() = hover_bks;
+                    *hs_res.lock().unwrap() = hover_snps;
 
                     // 按当前 ResourceView（可选指标 + 对数轴）渲染
                     let v = *view_res.lock().unwrap();
@@ -868,6 +917,7 @@ fn refresh_window(
                 } else {
                     *he_res.lock().unwrap() = Vec::new();
                     *hb_res.lock().unwrap() = Vec::new();
+                    *hs_res.lock().unwrap() = Vec::new();
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak_res.upgrade() {
                             ui.set_has_resource(false);
@@ -969,6 +1019,7 @@ fn start_auto_refresh(
     timer: &Arc<Mutex<Timer>>,
     hover_events: &Arc<Mutex<Vec<EventRow>>>,
     hover_buckets: &Arc<Mutex<Vec<i64>>>,
+    hover_snaps: &Arc<Mutex<Vec<Option<EventSnapshot>>>>,
     table_events: &Arc<Mutex<Vec<EventRow>>>,
     view: &Arc<Mutex<ResourceView>>,
     secs: u64,
@@ -981,6 +1032,7 @@ fn start_auto_refresh(
     let tmr = timer.clone();
     let he = hover_events.clone();
     let hb = hover_buckets.clone();
+    let hs = hover_snaps.clone();
     let te = table_events.clone();
     let rv = view.clone();
     // 单次创建、长期持有的定时器：start 覆盖上一次设置（切模式/改间隔时复用同一实例）。
@@ -989,7 +1041,7 @@ fn start_auto_refresh(
             let range = rng.lock().unwrap().clone();
             let b = *bk.lock().unwrap();
             let a = *adv.lock().unwrap();
-            refresh_window(&ui, &db, range, a, b, &he, &hb, &te, &rv);
+            refresh_window(&ui, &db, range, a, b, &he, &hb, &hs, &te, &rv);
         }
     });
 }

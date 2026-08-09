@@ -1438,7 +1438,9 @@ export component Analysis inherits Window {
             }
 
             // F3：系统资源关联图（全宽底部区；双轴：左 CPU%/内存%，右 磁盘 B/s）
+            // 基础模式整区（标题 + 图 + hover 信息 + 可选指标）一并隐藏（PRD F5「隐藏资源图」）
             Rectangle {
+                visible: root.advanced-mode;
                 min-height: 210px;
                 vertical-stretch: 0;
                 background: #fafbfc;
