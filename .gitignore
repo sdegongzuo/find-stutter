@@ -23,6 +23,10 @@ test.log
 test_*.log
 final_test.log
 test2.log
+build_gui.log
+build_release.log
+check_ws.log
+gui_run.log
 stutter.db-shm
 stutter.db-wal
 *.diag.log
