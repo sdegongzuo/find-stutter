@@ -163,11 +163,11 @@ impl Logger {
 
         let mut wtr = csv::Writer::from_path(output)?;
         wtr.write_record([
-            "timestamp", "cpu_usage", "cpu_freq_mhz", "mem_usage_percent",
-            "mem_used_mb", "mem_total_mb", "mem_available_mb", "swap_usage_percent",
-            "disk_read_bps", "disk_write_bps", "net_sent_bps", "net_recv_bps",
-            "net_sent_total", "net_recv_total", "gpu_usage", "cpu_temp", "gpu_temp",
-            "process_count", "thread_count",
+            "时间戳", "CPU 使用率(%)", "CPU 频率(MHz)", "内存使用率(%)",
+            "内存已用(MB)", "内存总量(MB)", "内存可用(MB)", "交换分区使用率(%)",
+            "磁盘读速率(B/s)", "磁盘写速率(B/s)", "网络发送速率(B/s)", "网络接收速率(B/s)",
+            "网络累计发送(B)", "网络累计接收(B)", "GPU 使用率(%)", "CPU 温度(°C)", "GPU 温度(°C)",
+            "进程数", "线程数",
         ])?;
 
         let rows = stmt.query_map(params![from, to], |row| {

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "find-stutter", about = "System stutter monitor with floating overlay")]
+#[command(name = "find-stutter", about = "系统卡顿监控悬浮窗")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -9,9 +9,9 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Run with floating overlay (default)
+    /// 启动悬浮窗监控（默认）
     Run,
-    /// Export data to CSV
+    /// 导出采样数据为 CSV
     Export {
         #[arg(long)]
         from: String,
@@ -20,6 +20,6 @@ pub enum Commands {
         #[arg(short, long, default_value = "export.csv")]
         output: String,
     },
-    /// Show statistics
+    /// 打印今日卡顿统计
     Stats,
 }

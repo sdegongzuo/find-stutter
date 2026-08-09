@@ -12,14 +12,14 @@ fn main() -> anyhow::Result<()> {
             match find_stutter_core::Logger::new(&config.storage) {
                 Ok(logger) => {
                     if let Err(e) = logger.export_csv(&from, &to, &output) {
-                        eprintln!("Export failed: {}", e);
+                        eprintln!("导出失败: {}", e);
                         std::process::exit(1);
                     } else {
-                        println!("Exported to {}", output);
+                        println!("已导出到 {}", output);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Failed to open database: {}", e);
+                    eprintln!("打开数据库失败: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -28,14 +28,14 @@ fn main() -> anyhow::Result<()> {
             let config = find_stutter_core::Config::load("config.toml").unwrap_or_default();
             match find_stutter_core::Logger::new(&config.storage) {
                 Ok(logger) => match logger.event_count_today() {
-                    Ok(count) => println!("Stutter events today: {}", count),
+                    Ok(count) => println!("今日卡顿次数: {}", count),
                     Err(e) => {
-                        eprintln!("Query failed: {}", e);
+                        eprintln!("查询失败: {}", e);
                         std::process::exit(1);
                     }
                 },
                 Err(e) => {
-                    eprintln!("Failed to open database: {}", e);
+                    eprintln!("打开数据库失败: {}", e);
                     std::process::exit(1);
                 }
             }
