@@ -16,10 +16,17 @@
       > 新增 `collect_process_tree`（按深度降序枚举后代，保证子先于父）/ `kill_process_tree`
       > （逐个终止 + 权限错误优先级修正，确保 Permission 不被 NotFound 掩盖）/
       > `prompt_kill_tree_failure`，并提取 `confirm_elevate` 复用。已补单测，174 全过。
-- [ ] **应用友好名** — 列表/聚合行优先显示友好名（UWP 包显示名或 exe 的
+- [x] **应用友好名** — 列表/聚合行优先显示友好名（UWP 包显示名或 exe 的
       `GetFileVersionInfo` `FileDescription`），原始 exe 名作为悬浮/备用；对齐任务管理器
       「进程」页默认显示。需改造 `ProcessRow.name` 采集与 `row_to_slint` / `group_display`
       的展示逻辑。
+      > 实现：`ProcessRow` 新增 `display_name`；`process_list.rs` 新增
+      > `file_description`（`GetFileVersionInfoW`+`VerQueryValueW` 取 `FileDescription`）/
+      > `friendly_name_for` / `cached_display_name`（按 pid 缓存于 `ProcessSampler.name_cache`，
+      > sample 后裁剪防 pid 复用串味）；`row_display`/`group_display` 优先用 `display_name`，
+      > `name_full`/聚合 `full_name` 保留原始 exe 名，`group_key` 仍用 exe 名（展开不变）。
+      > UWP 包显示名按 spec「或」未单独实现（FileDescription 路径已满足），后续可用 WinRT
+      > PackageManager 扩展；svchost 仍走服务名聚合（合理例外）。已补单测，176 测试全过。
 
 ### P7 — 卡顿根因分析（深度归因）— 2026-08-11
 > 背景：卡顿分析界面-PRD(F1–F8) 已覆盖趋势/归因/资源关联，但根因只到「卡顿时谁在场/什么高」，

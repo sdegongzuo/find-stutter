@@ -39,7 +39,11 @@ pub struct ProcessRow {
     pub pid: u32,
     /// 父进程 PID（sysinfo parent()；用于树状聚合找主进程）
     pub parent_pid: u32,
+    /// 进程名（exe 文件名，如 `chrome.exe`；用于分组/详情，稳定不变）
     pub name: String,
+    /// 展示名（友好名：UWP 包显示名或 exe 的 `FileDescription`；
+    /// 取不到时回退 exe 名）。列表/聚合行优先显示它，原始 exe 名作为悬浮/备用。
+    pub display_name: String,
     /// CPU 使用率（0.0 ~ 100.0×核数；显示前归一化）
     pub cpu_usage: f32,
     /// 内存字节数（提交大小 Commit Size = `PagefileUsage`，与任务管理器
@@ -77,6 +81,9 @@ pub struct ProcessSampler {
     /// 上次采样的 pid → 端口列表（sample() 期间重新枚举；
     /// 用于进程行的「端口」列展示；缓存避免每帧重复 GetExtendedTcpTable）
     port_cache: HashMap<u32, Vec<u16>>,
+    /// pid → 展示名（友好名）缓存：避免每 tick 对每个进程重复读 exe 版本信息。
+    /// 每次 sample 后按当前存在的 pid 裁剪，防止内存无限增长 / pid 复用串味。
+    name_cache: HashMap<u32, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +104,7 @@ impl ProcessSampler {
             prev_io: HashMap::new(),
             prev_time: None,
             port_cache: HashMap::new(),
+            name_cache: HashMap::new(),
         }
     }
 
@@ -153,6 +161,8 @@ impl ProcessSampler {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
                 name: p.name().to_string_lossy().into_owned(),
+                // 展示名（友好名）在循环结束后统一计算，避免与 self.sys 借用冲突
+                display_name: String::new(),
                 cpu_usage: p.cpu_usage(),
                 memory_bytes: mem,
                 physical_mem_bytes: ws,
@@ -169,7 +179,29 @@ impl ProcessSampler {
         self.prev_io = next_io;
         self.prev_time = Some(now);
 
+        // 统一填充展示名（友好名）；循环内不调用 &mut self 方法，避免借用冲突
+        for r in &mut rows {
+            r.display_name = self.cached_display_name(r.pid, &r.name);
+        }
+
+        // 裁剪展示名缓存：仅保留当前存在的 pid（防内存增长 / pid 复用串味）
+        let present: std::collections::HashSet<u32> =
+            rows.iter().map(|r| r.pid).collect();
+        self.name_cache.retain(|pid, _| present.contains(pid));
+
         rows
+    }
+
+    /// 取进程展示名（友好名），按 pid 缓存。
+    /// 优先用 exe 的 `FileDescription`（如 "Google Chrome"）；取不到回退 exe 名。
+    /// 与自由函数 `friendly_name_for`（真正读版本信息）区分：本方法只负责缓存。
+    fn cached_display_name(&mut self, pid: u32, exe_name: &str) -> String {
+        if let Some(cached) = self.name_cache.get(&pid) {
+            return cached.clone();
+        }
+        let display = friendly_name_for(pid).unwrap_or_else(|| exe_name.to_string());
+        self.name_cache.insert(pid, display.clone());
+        display
     }
 
     /// 采样时缓存的 pid → 端口列表（聚合行的端口合并、详情面板的端口列表用）。
@@ -1080,6 +1112,109 @@ fn process_exe_path(_pid: u32) -> Option<String> {
     None
 }
 
+/// 取 exe 的「文件描述」（版本资源里的 `FileDescription`，如 "Google Chrome"）。
+/// 失败 / 无描述返回 `None`。仅在 Windows 有意义。
+#[cfg(windows)]
+fn file_description(path: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+    let path_w: Vec<u16> = std::ffi::OsStr::new(path)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // 版本信息缓冲区大小（0 = 失败 / 无版本资源）
+    let size = unsafe { GetFileVersionInfoSizeW(windows::core::PCWSTR(path_w.as_ptr()), None) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    let ok = unsafe {
+        GetFileVersionInfoW(
+            windows::core::PCWSTR(path_w.as_ptr()),
+            Some(0),
+            size,
+            buf.as_mut_ptr() as *mut _,
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    // 1) 取翻译（lang-codepage），用于拼出正确的 StringFileInfo 子块路径
+    let trans_block: Vec<u16> = "\\VarFileInfo\\Translation"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut trans_len = 0u32;
+    let mut trans_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let ok_t = unsafe {
+        VerQueryValueW(
+            buf.as_ptr() as *const _,
+            windows::core::PCWSTR(trans_block.as_ptr()),
+            &mut trans_ptr,
+            &mut trans_len,
+        )
+    };
+    if !ok_t.as_bool() || trans_len == 0 {
+        return None;
+    }
+    let trans =
+        unsafe { std::slice::from_raw_parts(trans_ptr as *const u16, (trans_len as usize) / 2) };
+    if trans.is_empty() {
+        return None;
+    }
+    let (lang, codepage) = (trans[0], trans[1]);
+    let sub = format!("\\StringFileInfo\\{:04X}{:04X}\\FileDescription", lang, codepage);
+    let sub_w: Vec<u16> = sub.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut desc_len = 0u32;
+    let mut desc_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let ok_d = unsafe {
+        VerQueryValueW(
+            buf.as_ptr() as *const _,
+            windows::core::PCWSTR(sub_w.as_ptr()),
+            &mut desc_ptr,
+            &mut desc_len,
+        )
+    };
+    if !ok_d.as_bool() || desc_len == 0 {
+        return None;
+    }
+    // desc_len 含结尾 NUL，去掉后转 UTF-16
+    let desc_slice = unsafe {
+        std::slice::from_raw_parts(desc_ptr as *const u16, (desc_len as usize).saturating_sub(1))
+    };
+    let s = String::from_utf16_lossy(desc_slice).trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+#[cfg(not(windows))]
+fn file_description(_path: &str) -> Option<String> {
+    None
+}
+
+/// 进程展示名（友好名）：取 exe 的 `FileDescription`；取不到（无版本信息 /
+/// 系统进程 / 权限不足 / 非 Windows）回退 `None`（调用方回退 exe 名）。
+///
+/// 注：spec 要求「UWP 包显示名 **或** exe 的 `FileDescription`」二选一，
+/// 本实现走 `FileDescription` 路径（覆盖绝大多数桌面应用）。UWP 包显示名需
+/// WinRT `PackageManager`（按 PackageFamilyName 取显示名），成本更高且 windows
+/// crate 需额外 feature，留作后续扩展；UWP 应用当前回退 exe 名，不影响主流程。
+#[cfg(windows)]
+fn friendly_name_for(pid: u32) -> Option<String> {
+    let path = process_exe_path(pid)?;
+    file_description(&path)
+}
+
+#[cfg(not(windows))]
+fn friendly_name_for(_pid: u32) -> Option<String> {
+    None
+}
+
 /// 查询进程所属用户（`OpenProcessToken` + `GetTokenInformation(TokenUser)` +
 /// `LookupAccountSidW`）。返回 "SYSTEM" / 用户名（不带域）；失败（权限不足 /
 /// 进程已退出 / 无法解析 SID）返回空字符串。
@@ -1645,11 +1780,17 @@ fn row_display(
     highlight_pct: f32,
     indent: bool,
 ) -> crate::ProcessRowData {
-    let full_name = format!("PID {}  {}", r.pid, r.name);
+    // 展示名优先用友好名；原始 exe 名作为悬浮/备用（差异时在 full_name 标明）
+    let display = &r.display_name;
+    let full_name = if r.display_name != r.name {
+        format!("{}（{}，PID {}）", r.display_name, r.name, r.pid)
+    } else {
+        format!("PID {}  {}", r.pid, r.name)
+    };
     let cpu_pct = (r.cpu_usage / nb_cpus as f32).clamp(0.0, 100.0);
     let cpu_high = cpu_pct > highlight_pct;
     let mem_high = r.memory_pct > highlight_pct;
-    let mut name = r.name.clone();
+    let mut name = display.clone();
     if indent {
         name = format!("    {}", name);
     }
@@ -1718,11 +1859,24 @@ fn group_display(
             )
         }
     } else {
-        (
-            format!("{} ({})", g.name, count),
-            format!("{}（{} 个实例，PID {}）", g.name, count, agg.pid),
-            g.name.clone(),
-        )
+        // 非 svchost：展示名优先用友好名（组内同 exe，取 root 的 display_name）；
+        // 原始 exe 名作为悬浮/备用，group_key 仍用 exe 名（保证展开匹配不变）
+        if g.root.display_name != g.name {
+            (
+                format!("{} ({})", g.root.display_name, count),
+                format!(
+                    "{}（{}，{} 个实例，PID {}）",
+                    g.root.display_name, g.name, count, agg.pid
+                ),
+                g.name.clone(),
+            )
+        } else {
+            (
+                format!("{} ({})", g.name, count),
+                format!("{}（{} 个实例，PID {}）", g.name, count, agg.pid),
+                g.name.clone(),
+            )
+        }
     };
     // 聚合端口：合并 root + 所有 children 的端口（去重升序）
     let mut all_ports: Vec<Vec<u16>> = Vec::with_capacity(1 + g.children.len());
@@ -2513,6 +2667,7 @@ mod tests {
             pid,
             parent_pid: 0,
             name: name.into(),
+            display_name: name.into(),
             cpu_usage: cpu,
             memory_bytes: mem_mb * 1024 * 1024,
             physical_mem_bytes: mem_mb * 1024 * 1024,
@@ -3104,10 +3259,12 @@ mod tests {
 
     /// 构造一行进程（仅 pid / parent_pid / name 参与树枚举）。
     fn row_tree(pid: u32, ppid: u32) -> ProcessRow {
+        let name = format!("p{}.exe", pid);
         ProcessRow {
             pid,
             parent_pid: ppid,
-            name: format!("p{}.exe", pid),
+            name: name.clone(),
+            display_name: name,
             cpu_usage: 0.0,
             memory_bytes: 0,
             physical_mem_bytes: 0,
@@ -3169,5 +3326,39 @@ mod tests {
         let rows = vec![row_tree(7, 0), row_tree(8, 1)];
         let order = collect_process_tree(7, &rows);
         assert!(order.is_empty());
+    }
+
+    // ===== 应用友好名（P6）：展示逻辑 =====
+
+    #[test]
+    fn row_display_uses_friendly_name() {
+        // 展示名优先用友好名；悬浮 full_name 保留原始 exe 名作为备用
+        let mut r = row(1, "chrome.exe", 10.0, 100);
+        r.display_name = "Google Chrome".to_string();
+        let d = row_display(&r, 8, 30.0, false);
+        assert_eq!(d.name, "Google Chrome");
+        assert!(d.name_full.contains("chrome.exe"));
+        // 无友好名时回退 exe 名
+        let r2 = row(2, "svchost.exe", 1.0, 10);
+        let d2 = row_display(&r2, 8, 30.0, false);
+        assert_eq!(d2.name, "svchost.exe");
+    }
+
+    #[test]
+    fn group_display_uses_friendly_name() {
+        // 聚合行标题优先用友好名，full_name 保留原始 exe 名；group_key 仍用 exe 名
+        let mut root = row_p(100, 0, "chrome.exe", 10.0, 100);
+        root.display_name = "Google Chrome".to_string();
+        let g = GroupedProcess {
+            name: "chrome.exe".into(),
+            root,
+            children: vec![],
+            services: vec![],
+        };
+        let agg = group_aggregate(&g);
+        let d = group_display(&g, &agg, 8, 30.0, 16 * 1024 * 1024 * 1024);
+        assert!(d.name.contains("Google Chrome"));
+        assert!(d.name_full.contains("chrome.exe"));
+        assert_eq!(d.group_key, "chrome.exe");
     }
 }
