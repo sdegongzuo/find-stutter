@@ -550,52 +550,169 @@ pub fn kill_process(pid: u32) -> Result<(), KillError> {
     }
 }
 
+/// 枚举 `root` 的全部后代（子、孙…），返回**杀戮顺序**（不含 root 自身）：
+/// 按「距 root 的层数（深度）降序」排列——任何节点的所有后代都排在它前面，
+/// 确保「子先于父」被终止，避免父先死导致子进程被 reparent 残留。
+///
+/// 纯函数、可单测；防环（沿父链形成的环不会死循环，也不会重复收集）。
+#[cfg(windows)]
+pub fn collect_process_tree(root: u32, rows: &[ProcessRow]) -> Vec<u32> {
+    use std::collections::HashMap;
+    // 1) 构建 parent -> children 映射
+    let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+    for r in rows {
+        children_of.entry(r.parent_pid).or_default().push(r.pid);
+    }
+    // 2) BFS 收集全部后代（不含 root）并记录深度（距 root 的层数），用集合去重防环
+    let mut order: Vec<(u32, u32)> = Vec::new(); // (pid, depth)
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut queue: Vec<(u32, u32)> = vec![(root, 0)];
+    while let Some((pid, depth)) = queue.pop() {
+        if let Some(kids) = children_of.get(&pid) {
+            for k in kids {
+                // 跳过 root 自身；用 seen 防环导致的重复/死循环
+                if *k != root && seen.insert(*k) {
+                    order.push((*k, depth + 1));
+                    queue.push((*k, depth + 1));
+                }
+            }
+        }
+    }
+    // 3) 深度降序排序（稳定）：深层（叶子/更晚代）先杀，保证子先于父
+    order.sort_by(|a, b| b.1.cmp(&a.1));
+    order.into_iter().map(|(pid, _)| pid).collect()
+}
+
+#[cfg(not(windows))]
+pub fn collect_process_tree(_root: u32, _rows: &[ProcessRow]) -> Vec<u32> {
+    Vec::new()
+}
+
+/// 终止进程树（连子进程一起终止）。
+///
+/// 从给定进程快照 `rows` 中沿 `parent_pid` 递归收集 `root` 的全部后代
+/// （子、孙…），按「深者先杀」顺序逐个调用 [`kill_process`]（叶子先死，
+/// 避免父先死后子进程被 reparent 残留），最后杀根进程本身。
+///
+/// 返回 `(尝试终止的进程数, 首个遇到的权限错误)`。权限错误（部分子树属
+/// SYSTEM / 高权限）由调用方决定后续是否走 UAC 提权重试（见
+/// [`prompt_kill_tree_failure`]），本函数本身不弹窗。
+#[cfg(windows)]
+pub fn kill_process_tree(root: u32, rows: &[ProcessRow]) -> (usize, Option<KillError>) {
+    let to_kill = collect_process_tree(root, rows);
+    let mut killed = 0usize;
+    // 错误优先级：优先记录 `Permission`（决定后续是否走 UAC 提权）。
+    // 否则若靠前的子进程先报 NotFound/Other，会掩盖真正需提权的权限错误，
+    // 导致 UAC 提示不触发（spec 要求「权限不足时复用现有 UAC 提权路径」）。
+    let mut first_err: Option<KillError> = None;
+    let mut record_err = |e: KillError| {
+        match e {
+            KillError::Permission => first_err = Some(e),
+            _ => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    };
+    for pid in &to_kill {
+        match kill_process(*pid) {
+            Ok(()) => killed += 1,
+            Err(e) => {
+                log::warn!("结束进程树：终止子进程 {} 失败: {:?}", pid, e);
+                record_err(e);
+            }
+        }
+    }
+    // 最后杀根
+    match kill_process(root) {
+        Ok(()) => killed += 1,
+        Err(e) => {
+            log::warn!("结束进程树：终止根进程 {} 失败: {:?}", root, e);
+            record_err(e);
+        }
+    }
+    (killed, first_err)
+}
+
+#[cfg(not(windows))]
+pub fn kill_process_tree(_root: u32, _rows: &[ProcessRow]) -> (usize, Option<KillError>) {
+    // 非 Windows 无进程可杀：返回 (0, None)，不误导调用方走 UAC 提权逻辑。
+    (0, None)
+}
+
+/// 弹「以管理员身份重试？」确认框（UAC 提权前置）。返回用户是否确认重试。
+/// UI 线程调用；`title`/`msg` 为 UTF-8 文本（内部转 UTF-16）。
+#[cfg(windows)]
+fn confirm_elevate(title: &str, msg: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+    let ret = unsafe {
+        MessageBoxW(
+            None, // 无父窗口（独立置顶）
+            windows::core::PCWSTR(wide_static(msg).as_ptr()),
+            windows::core::PCWSTR(wide_static(title).as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+        )
+    };
+    ret == windows::Win32::UI::WindowsAndMessaging::IDYES
+}
+
 /// 杀进程失败提示（#2）：权限不足 → 弹「以管理员身份重试」确认框（UAC 提权
 /// 运行 taskkill）；进程已退出/其他 → 信息框。UI 线程调用。
 #[cfg(windows)]
 pub fn prompt_kill_failure(pid: u32, name: &str, err: KillError) {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-        MB_YESNO,
-    };
-    let msg = match err {
+    match err {
         KillError::Permission => {
-            format!(
+            let msg = format!(
                 "权限不足，无法结束进程 {} (PID {})\n\n是否以管理员身份重试？",
                 name, pid
-            )
+            );
+            if confirm_elevate("停止进程", &msg) {
+                elevate_kill_process(pid, false);
+            }
         }
         KillError::NotFound | KillError::Other => {
-            format!(
+            use windows::Win32::UI::WindowsAndMessaging::{
+                MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+            };
+            let msg = format!(
                 "无法结束进程 {} (PID {})\n\n进程可能已退出或已停止运行。",
                 name, pid
-            )
+            );
+            let _ = unsafe {
+                MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(wide_static(&msg).as_ptr()),
+                    windows::core::PCWSTR(wide_static("停止进程").as_ptr()),
+                    MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
+                )
+            };
         }
-    };
-    let flags = if err == KillError::Permission {
-        MB_YESNO | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND
-    } else {
-        MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND
-    };
-    let ret = unsafe {
-        MessageBoxW(
-            None, // 无父窗口的消息框（独立置顶）
-            windows::core::PCWSTR(wide_static(&msg).as_ptr()),
-            windows::core::PCWSTR(wide_static("停止进程").as_ptr()),
-            flags,
-        )
-    };
-    if err == KillError::Permission && ret == windows::Win32::UI::WindowsAndMessaging::IDYES {
-        elevate_kill_process(pid);
+    }
+}
+
+/// 权限不足时弹「以管理员身份重试」确认框（进程树场景）：
+/// 用户确认后走 UAC 提权运行 `taskkill /F /T /PID <pid>`（连同子树一起终止）。
+#[cfg(windows)]
+pub fn prompt_kill_tree_failure(pid: u32, name: &str) {
+    let msg = format!(
+        "权限不足，无法结束进程树 {} (PID {})\n\n是否以管理员身份重试？\n（将连同其子进程一起终止）",
+        name, pid
+    );
+    if confirm_elevate("结束进程树", &msg) {
+        elevate_kill_process(pid, true);
     }
 }
 
 /// UAC 提权运行 `taskkill /F /PID <pid>`（ShellExecuteW "runas"）。
+/// `tree=true` 时追加 `/T`，连同子树一起终止（进程树场景）。
 #[cfg(windows)]
-fn elevate_kill_process(pid: u32) {
+fn elevate_kill_process(pid: u32, tree: bool) {
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    let params = format!("/F /PID {}", pid);
+    let params = format!("/F{} /PID {}", if tree { " /T" } else { "" }, pid);
     let result = unsafe {
         ShellExecuteW(
             None,
@@ -1858,6 +1975,7 @@ impl ProcessListWindow {
         // 连续右键切换：菜单被右键点击外部关闭时，命中测试鼠标新位置，
         // 若落在另一行则立即重弹该行菜单（无需先关闭再右键）。
         let weak_rowmenu = ui.as_weak();
+        let cache_rowmenu = cache_tick.clone();
         ui.on_row_context_menu(move |pid: i32, name: slint::SharedString| {
             use crate::window::{RowMenuCmd, RowMenuOutcome};
             log::info!("row-context-menu: pid={} name={}", pid, name);
@@ -1874,6 +1992,24 @@ impl ProcessListWindow {
                                     // 失败提示：权限不足 → 弹管理员提权重试框
                                     prompt_kill_failure(cur_pid as u32, &cur_name, e);
                                 }
+                            }
+                            break; // 下一次刷新自动更新
+                        }
+                        RowMenuOutcome::Command(RowMenuCmd::KillTree) => {
+                            // 结束进程树：沿 parent_pid 递归枚举后代并逐个终止
+                            let rows = cache_rowmenu.lock().unwrap().clone();
+                            let (killed, err) =
+                                kill_process_tree(cur_pid as u32, &rows);
+                            log::info!(
+                                "结束进程树 {} ({}): 已终止 {} 个进程",
+                                cur_name,
+                                cur_pid,
+                                killed
+                            );
+                            if matches!(err, Some(KillError::Permission)) {
+                                // 部分子树权限不足 → 弹 UAC 提权重试
+                                // （连同子树一起终止）
+                                prompt_kill_tree_failure(cur_pid as u32, &cur_name);
                             }
                             break; // 下一次刷新自动更新
                         }
@@ -2962,5 +3098,76 @@ mod tests {
         // svc.exe(3 端口, 最小 80) 排第一，empty.exe(0 端口) 排第二
         assert_eq!(groups[0].name, "svc.exe");
         assert_eq!(groups[1].name, "empty.exe");
+    }
+
+    // ===== collect_process_tree（结束进程树的后代枚举）=====
+
+    /// 构造一行进程（仅 pid / parent_pid / name 参与树枚举）。
+    fn row_tree(pid: u32, ppid: u32) -> ProcessRow {
+        ProcessRow {
+            pid,
+            parent_pid: ppid,
+            name: format!("p{}.exe", pid),
+            cpu_usage: 0.0,
+            memory_bytes: 0,
+            physical_mem_bytes: 0,
+            memory_pct: 0.0,
+            disk_read_bps: 0,
+            disk_write_bps: 0,
+            net_bps: 0,
+            net_total_bytes: 0,
+            ports: vec![],
+            status: String::new(),
+        }
+    }
+
+    #[test]
+    fn collect_process_tree_basic_chain() {
+        // 1 -> 2 -> 3 -> 4 （线性链）
+        let rows = vec![row_tree(1, 0), row_tree(2, 1), row_tree(3, 2), row_tree(4, 3)];
+        let order = collect_process_tree(1, &rows);
+        // 全部后代（2,3,4）被收集
+        assert_eq!(order.len(), 3);
+        assert!(order.contains(&2));
+        assert!(order.contains(&3));
+        assert!(order.contains(&4));
+        // 叶子(4) 先于其父(3) 先于其祖父(2)：子先于父
+        let pos = |p: u32| order.iter().position(|&x| x == p).unwrap();
+        assert!(pos(4) < pos(3));
+        assert!(pos(3) < pos(2));
+        // root(1) 不在列表（最后单独杀）
+        assert!(!order.contains(&1));
+    }
+
+    #[test]
+    fn collect_process_tree_fanout_and_cycle_safe() {
+        // 1 有两个子 2、3；3 又有子 4；另造一个指向自身的环 9 -> 9
+        let rows = vec![
+            row_tree(1, 0),
+            row_tree(2, 1),
+            row_tree(3, 1),
+            row_tree(4, 3),
+            row_tree(9, 9), // 自环，不在 1 的子树内，不应被收集
+        ];
+        let order = collect_process_tree(1, &rows);
+        // 仅 1 的子树：2,3,4
+        assert_eq!(order.len(), 3);
+        assert!(order.contains(&2));
+        assert!(order.contains(&3));
+        assert!(order.contains(&4));
+        // 叶子(2,4) 先于父(3)
+        let pos = |p: u32| order.iter().position(|&x| x == p).unwrap();
+        assert!(pos(4) < pos(3));
+        assert!(pos(2) < pos(3));
+        // 自环节点不被收集
+        assert!(!order.contains(&9));
+    }
+
+    #[test]
+    fn collect_process_tree_no_children() {
+        // 孤立进程：无任何后代
+        let rows = vec![row_tree(7, 0), row_tree(8, 1)];
+        let order = collect_process_tree(7, &rows);
+        assert!(order.is_empty());
     }
 }

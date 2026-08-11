@@ -219,6 +219,8 @@ pub enum RowMenuCmd {
     OpenLocation = 1,
     /// 停止进程
     Kill = 2,
+    /// 结束进程树（连子进程一起终止）
+    KillTree = 3,
 }
 
 /// 鼠标右键虚拟键码（`GetAsyncKeyState` 检测右键按下 / 释放用）。
@@ -291,6 +293,13 @@ pub fn show_row_menu_once(
             wide("打开文件所在的位置"),
         );
         let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
+        // 结束进程树：连子进程一起终止（任务管理器同款入口）
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            RowMenuCmd::KillTree as usize,
+            wide("结束进程树"),
+        );
 
         // 鼠标当前位置（物理屏幕像素）作为菜单弹出点
         let mut pt = windows::Win32::Foundation::POINT::default();
@@ -316,6 +325,7 @@ pub fn show_row_menu_once(
         match cmd.0 as u32 {
             1 => RowMenuOutcome::Command(RowMenuCmd::OpenLocation),
             2 => RowMenuOutcome::Command(RowMenuCmd::Kill),
+            3 => RowMenuOutcome::Command(RowMenuCmd::KillTree),
             _ if right_clicked_away => RowMenuOutcome::Switch,
             _ => RowMenuOutcome::Cancelled,
         }
@@ -530,11 +540,12 @@ mod tests {
 
     // ===== RowMenuCmd（进程详情行右键菜单命令）=====
 
-    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2）
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3）
     #[test]
     fn row_menu_cmd_ids_stable() {
         assert_eq!(RowMenuCmd::OpenLocation as u32, 1);
         assert_eq!(RowMenuCmd::Kill as u32, 2);
+        assert_eq!(RowMenuCmd::KillTree as u32, 3);
     }
 
     /// 验证：命令码到枚举的映射（show_row_menu 的返回逻辑）
@@ -543,10 +554,12 @@ mod tests {
         let map = |v: u32| match v {
             1 => Some(RowMenuCmd::OpenLocation),
             2 => Some(RowMenuCmd::Kill),
+            3 => Some(RowMenuCmd::KillTree),
             _ => None,
         };
         assert_eq!(map(1), Some(RowMenuCmd::OpenLocation));
         assert_eq!(map(2), Some(RowMenuCmd::Kill));
+        assert_eq!(map(3), Some(RowMenuCmd::KillTree));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
     }
