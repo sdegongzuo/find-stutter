@@ -171,11 +171,13 @@ impl Detector {
         // 往往比「可用物理内存归零」更早预警。与 mem 两个口径互补
         // （任一成立即记内存压力）。无滞回（与 mem 硬阈值一致，瞬时判断）。
         let commit_ratio = if sample.commit_limit > 0 {
-            sample.commit_bytes as f32 / sample.commit_limit as f32 * 100.0
+            // 用 f64 计算：大内存机 commit_limit 达数十 GB，超出 f32 的 24 位精确整数范围，
+            // 在 90% 边界附近会因精度丢失而误判。
+            sample.commit_bytes as f64 / sample.commit_limit as f64 * 100.0
         } else {
             0.0
         };
-        if commit_ratio > self.config.commit_threshold_percent {
+        if commit_ratio > self.config.commit_threshold_percent as f64 {
             causes.push(format!(
                 "Commit charge {:.1}% > {}%",
                 commit_ratio, self.config.commit_threshold_percent
