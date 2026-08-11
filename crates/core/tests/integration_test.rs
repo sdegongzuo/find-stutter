@@ -14,7 +14,8 @@ slow_interval_factor = 10
 cpu_threshold = 85.0
 mem_threshold_percent = 85.0
 mem_threshold_mb = 1024
-swap_threshold = 60.0
+commit_threshold_percent = 85.0
+page_reads_threshold = 50.0
 disk_rate_spike_ratio = 3.0
 spike_ratio = 1.5
 sustained_seconds = 5
@@ -109,7 +110,6 @@ fn detector_normal_sample_no_event() {
     let config = DetectionConfig {
         cpu_threshold: 90.0,
         mem_threshold_mb: 500,
-        swap_threshold: 50.0,
         sustained_seconds: 1,
         ..Default::default()
     };
@@ -135,7 +135,6 @@ fn detector_cpu_threshold_triggers_event() {
     let config = DetectionConfig {
         cpu_threshold: 90.0,
         mem_threshold_mb: 500,
-        swap_threshold: 50.0,
         sustained_seconds: 1,
         ..Default::default()
     };

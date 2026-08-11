@@ -11,8 +11,6 @@ pub struct Detector {
     /// CPU 滞回状态：进入后直到 < threshold - hysteresis 才解除
     /// （滞回带内维持激活，避免阈值附近反复 start/stop 反复记录）
     cpu_active: bool,
-    /// Swap 滞回状态（同上）
-    swap_active: bool,
     /// spike 滞回状态（各指标独立）：触发后需明显回落才解除，
     /// 配合「连续确认」（recent 中 ≥6/10 超阈值）避免瞬时抖动误报
     cpu_spike_active: bool,
@@ -35,7 +33,6 @@ impl Detector {
             stutter_start: None,
             current_causes: Vec::new(),
             cpu_active: false,
-            swap_active: false,
             cpu_spike_active: false,
             disk_spike_active: false,
             net_spike_active: false,
@@ -80,7 +77,7 @@ impl Detector {
                 self.current_causes = causes;
             } else {
                 for c in causes {
-                    // 按 cause 类型去重：同类型（如 Swap usage）更新为最新文案，
+                    // 按 cause 类型去重：同类型（如 Commit charge / CPU usage）更新为最新文案，
                     // 避免滞回带内文案随数值变化导致字符串去重失效、cause 反复追加
                     // （一次卡顿中 current_causes 膨胀，还会虚高 severity）。
                     let key = cause_key(&c);
@@ -158,27 +155,44 @@ impl Detector {
             ));
         }
 
-        // Swap：滞回模型（与 CPU 相同；进入 > swap_threshold，退出 < swap_threshold - hysteresis）
-        if sample.swap_usage_percent > self.config.swap_threshold {
-            self.swap_active = true;
-        } else if sample.swap_usage_percent
-            <= self.config.swap_threshold - self.config.swap_hysteresis
-        {
-            self.swap_active = false;
+        // 内存使用率过高（百分比口径）：与 `mem_threshold_mb`（绝对可用下限）互补，
+        // 覆盖「大内存机器上可用内存绝对值仍高、但使用率已爆表」的场景
+        // （例如 32G 机器用到 95% 时可用仍 >500MB，仅看绝对下限会漏报）。
+        // 两个条件为「或」关系：任一成立即记为内存压力（config.toml 注释为「或」）。
+        if sample.mem_usage_percent > self.config.mem_threshold_percent {
+            causes.push(format!(
+                "Memory usage {:.1}% > {}%",
+                sample.mem_usage_percent, self.config.mem_threshold_percent
+            ));
         }
-        if self.swap_active {
-            if sample.swap_usage_percent > self.config.swap_threshold {
-                causes.push(format!(
-                    "Swap usage {:.1}% > {}%",
-                    sample.swap_usage_percent, self.config.swap_threshold
-                ));
-            } else {
-                // 滞回带内维持激活（同上，文案避免 "45% > 50%" 的矛盾）
-                causes.push(format!(
-                    "Swap usage {:.1}%（滞回保持，阈值 {}%）",
-                    sample.swap_usage_percent, self.config.swap_threshold
-                ));
-            }
+
+        // 提交电荷压力（commit charge）：已提交虚拟内存 / 提交上限
+        // （= 物理内存 + 页面文件）。接近上限时系统弹「内存不足」并强制分页，
+        // 往往比「可用物理内存归零」更早预警。与 mem 两个口径互补
+        // （任一成立即记内存压力）。无滞回（与 mem 硬阈值一致，瞬时判断）。
+        let commit_ratio = if sample.commit_limit > 0 {
+            sample.commit_bytes as f32 / sample.commit_limit as f32 * 100.0
+        } else {
+            0.0
+        };
+        if commit_ratio > self.config.commit_threshold_percent {
+            causes.push(format!(
+                "Commit charge {:.1}% > {}%",
+                commit_ratio, self.config.commit_threshold_percent
+            ));
+        }
+
+        // 分页活动速率（阶段 C）：\Memory\Page Reads/sec 是「真正的 swap 卡顿信号」。
+        // 物理内存耗尽时 OS 被迫把页从 pagefile 换入，每次换页注入一次磁盘 I/O 延迟 → 卡顿。
+        // 这是速率口径（流量），而非 swap 使用率存量——后者在 Windows 上易误报且会虚高
+        // severity，已降级为仅展示。作为独立内存压力来源，与 mem / commit 三个口径互补
+        // （任一成立即记内存压力）。无滞回（瞬时速率判断；单 tick 尖峰仅向进行中的卡顿
+        // 追加 cause，不会单独凭一次尖峰记录卡顿）。
+        if sample.page_reads_per_sec > self.config.page_reads_threshold {
+            causes.push(format!(
+                "Memory paging {:.1}/s > {}/s",
+                sample.page_reads_per_sec, self.config.page_reads_threshold
+            ));
         }
 
         causes
@@ -335,14 +349,16 @@ fn avg(v: &[f32]) -> f32 {
 /// 滞回带内文案数值会变化（"CPU usage 85%（滞回保持…）" vs "CPU usage 95% > 90%"），
 /// 但类型 key 不变；CPU 硬阈值与 CPU spike 是不同的 cause（key 不同）。
 fn cause_key(cause: &str) -> &str {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 9] = [
         "CPU usage",
         "CPU spike",
         "Disk write",
         "Network",
+        "Memory usage",
         "Memory available",
         "Available memory",
-        "Swap usage",
+        "Commit charge",
+        "Memory paging",
     ];
     for p in PREFIXES {
         if cause.starts_with(p) {
@@ -424,16 +440,70 @@ mod tests {
         assert!(d.current_causes[0].contains("Available memory"));
     }
 
+    /// 回归：大内存机器上可用内存绝对值仍高（> mem_threshold_mb）但使用率已爆表
+    /// （> mem_threshold_percent）时，必须能触发内存卡顿原因——旧实现只查绝对可用
+    /// 下限，这种场景会漏报（正是「内存爆到 95% 却检测不出卡顿」的成因）。
     #[test]
-    fn analyze_high_swap_starts_stutter_tracking() {
+    fn analyze_high_mem_usage_percent_starts_stutter_tracking() {
         let mut config = DetectionConfig::default();
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        let high_swap = make_sample(30.0, 2000, 80.0);
-        d.analyze(&high_swap);
-        assert!(!d.current_causes.is_empty());
-        assert!(d.current_causes[0].contains("Swap usage"));
+        // 可用 2000MB（远 > 500，不触发绝对下限），但使用率 95% > 90%
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.mem_usage_percent = 95.0;
+        d.analyze(&s);
+        assert!(
+            !d.current_causes.is_empty(),
+            "内存使用率爆表必须触发卡顿原因"
+        );
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory usage")),
+            "应产出 'Memory usage' 原因，got: {:?}",
+            d.current_causes
+        );
+        // 同时确认绝对可用下限分支未被误触发（可用仍高）
+        assert!(
+            !d.current_causes.iter().any(|c| c.contains("Available memory")),
+            "可用内存充足时不应误报 'Available memory'，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 回归：分页活动速率（Page Reads/sec）超过 `page_reads_threshold` 时，必须触发
+    /// 「Memory paging」原因——这是真正的 swap 卡顿信号（阶段 C）。其它内存口径正常时
+    /// 不应误报，只有分页速率这一条成立。
+    #[test]
+    fn analyze_high_page_reads_starts_stutter_tracking() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 内存/提交/CPU 都正常，但分页速率 200/s 远超默认阈值 50/s
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.mem_usage_percent = 30.0;
+        s.page_reads_per_sec = 200.0;
+        d.analyze(&s);
+        assert!(
+            !d.current_causes.is_empty(),
+            "分页速率爆表必须触发卡顿原因"
+        );
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory paging")),
+            "应产出 'Memory paging' 原因，got: {:?}",
+            d.current_causes
+        );
+        // 未达阈值时不触发
+        let mut normal = make_sample(30.0, 2000, 10.0);
+        normal.mem_usage_percent = 30.0;
+        normal.page_reads_per_sec = 5.0; // 远低于阈值
+        let mut d2 = Detector::new(&config);
+        d2.analyze(&normal);
+        assert!(
+            d2.current_causes.is_empty(),
+            "分页速率未达阈值不应触发，got: {:?}",
+            d2.current_causes
+        );
     }
 
     #[test]
@@ -442,10 +512,10 @@ mod tests {
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // High CPU + low memory + high swap = 3 causes
-        let bad = make_sample(95.0, 100, 80.0);
+        // High CPU + low memory = 2 causes（swap 已降级为仅展示，不再触发）
+        let bad = make_sample(95.0, 100, 10.0);
         d.analyze(&bad);
-        assert_eq!(d.current_causes.len(), 3);
+        assert_eq!(d.current_causes.len(), 2);
     }
 
     // --- analyze: event generation after sustained period ---
@@ -524,8 +594,8 @@ mod tests {
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // High CPU + high swap → 2 causes
-        let bad = make_sample(95.0, 2000, 80.0);
+        // High CPU + low memory → 2 causes（swap 已降级为仅展示）
+        let bad = make_sample(95.0, 100, 10.0);
         for _ in 0..3 {
             d.analyze(&bad);
         }
@@ -542,8 +612,10 @@ mod tests {
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // High CPU + low memory + high swap → 3 causes
-        let bad = make_sample(95.0, 100, 80.0);
+        // High CPU + low memory + 内存使用率爆表 → 3 causes
+        // （swap 已降级为仅展示；这里用 mem_usage_percent 凑出第三条原因）
+        let mut bad = make_sample(95.0, 100, 10.0);
+        bad.mem_usage_percent = 95.0;
         for _ in 0..3 {
             d.analyze(&bad);
         }
@@ -603,30 +675,6 @@ mod tests {
         assert!(!d.current_causes.is_empty());
     }
 
-    #[test]
-    fn analyze_swap_at_threshold_no_trigger() {
-        let mut config = DetectionConfig::default();
-        config.sustained_seconds = 1;
-        let mut d = Detector::new(&config);
-
-        // Swap exactly at threshold → no trigger (uses >)
-        let sample = make_sample(30.0, 2000, 50.0);
-        d.analyze(&sample);
-        assert!(d.current_causes.is_empty());
-    }
-
-    #[test]
-    fn analyze_swap_above_threshold_triggers() {
-        let mut config = DetectionConfig::default();
-        config.sustained_seconds = 1;
-        let mut d = Detector::new(&config);
-
-        // Swap just above threshold
-        let sample = make_sample(30.0, 2000, 50.1);
-        d.analyze(&sample);
-        assert!(!d.current_causes.is_empty());
-    }
-
     // --- history management ---
 
     #[test]
@@ -654,54 +702,13 @@ mod tests {
         d.analyze(&cpu_only);
         assert_eq!(d.current_causes.len(), 1);
 
-        // Now also breach swap
-        let cpu_and_swap = make_sample(95.0, 2000, 80.0);
-        d.analyze(&cpu_and_swap);
+        // Now also breach available memory → 2 causes（swap 已降级为仅展示）
+        let cpu_and_lowmem = make_sample(95.0, 100, 10.0);
+        d.analyze(&cpu_and_lowmem);
         assert_eq!(d.current_causes.len(), 2);
     }
 
-    // --- swap / cpu 滞回（hysteresis）---
-
-    #[test]
-    fn swap_hysteresis_keeps_active_within_band() {
-        let config = DetectionConfig::default(); // swap_threshold=50, hysteresis=10 → 退出线 40
-        let mut d = Detector::new(&config);
-
-        d.analyze(&make_sample(30.0, 2000, 55.0)); // >50 进入
-        assert!(!d.current_causes.is_empty());
-        assert!(d.current_causes[0].contains("Swap usage"));
-
-        // 滞回带内（45：< 50 但 > 40）→ 维持激活，不解除；同类型 cause 更新而非追加
-        d.analyze(&make_sample(30.0, 2000, 45.0));
-        assert!(
-            !d.current_causes.is_empty(),
-            "滞回带内应维持 Swap 激活状态"
-        );
-        assert_eq!(
-            d.current_causes.len(),
-            1,
-            "滞回带内同类型 cause 应更新而非追加，got: {:?}",
-            d.current_causes
-        );
-        assert!(d.current_causes[0].contains("Swap usage"));
-        assert!(
-            d.current_causes[0].contains("滞回保持"),
-            "滞回带内文案应标注滞回保持，got: {}",
-            d.current_causes[0]
-        );
-    }
-
-    #[test]
-    fn swap_hysteresis_releases_below_exit_line() {
-        let config = DetectionConfig::default(); // 退出线 40
-        let mut d = Detector::new(&config);
-
-        d.analyze(&make_sample(30.0, 2000, 55.0)); // 进入
-        assert!(!d.current_causes.is_empty());
-
-        d.analyze(&make_sample(30.0, 2000, 35.0)); // <40 退出
-        assert!(d.current_causes.is_empty());
-    }
+    // --- cpu 滞回（hysteresis）---
 
     #[test]
     fn cpu_hysteresis_keeps_active_within_band() {
@@ -803,8 +810,13 @@ mod tests {
             cause_key("CPU usage 85.0%（滞回保持，阈值 90%）")
         );
         assert_eq!(
-            cause_key("Swap usage 55.0% > 50%"),
-            cause_key("Swap usage 45.0%（滞回保持，阈值 50%）")
+            cause_key("Commit charge 95.0% > 90%"),
+            cause_key("Commit charge 85.0%")
+        );
+        // 分页速率不同数值归为同一类型 key（更新而非追加）
+        assert_eq!(
+            cause_key("Memory paging 200.0/s > 50/s"),
+            cause_key("Memory paging 80.5/s > 50/s")
         );
         // 硬阈值与 spike 是不同 cause
         assert_ne!(cause_key("CPU usage 95.0% > 90%"), cause_key("CPU spike: 1.0% → 3.0%"));

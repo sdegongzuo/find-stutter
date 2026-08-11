@@ -7,8 +7,9 @@ use wmi::{Variant, WMIConnection};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Performance::{
-    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
-    PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_LARGE, PDH_HCOUNTER, PDH_HQUERY,
+    PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,     PdhGetFormattedCounterValue,
+    PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER,
+    PDH_HQUERY,
 };
 
 /// Windows PDH-based disk I/O sampler.
@@ -110,6 +111,177 @@ impl Drop for DiskPdh {
     }
 }
 
+/// Windows PDH-based commit-charge sampler.
+///
+/// 采集 `\Memory\Committed Bytes` 与 `\Memory\Commit Limit`（均为瞬时计数，
+/// 非速率计数器），用于判断「提交电荷压力」——已提交虚拟内存接近提交上限
+/// （物理内存 + 页面文件）时系统会弹「内存不足」并强制分页，是比「可用物理
+/// 内存归零」更早的卡顿预警信号。详见 `DetectionConfig::commit_threshold_percent`。
+struct CommitPdh {
+    query: PDH_HQUERY,
+    committed_counter: PDH_HCOUNTER,
+    limit_counter: PDH_HCOUNTER,
+}
+
+impl CommitPdh {
+    fn new() -> Option<Self> {
+        unsafe {
+            let mut query: PDH_HQUERY = PDH_HQUERY::default();
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
+                warn!("PdhOpenQueryW (commit) failed");
+                return None;
+            }
+
+            let mut committed_counter: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut limit_counter: PDH_HCOUNTER = PDH_HCOUNTER::default();
+
+            let committed_path = w!(r"\Memory\Committed Bytes");
+            let limit_path = w!(r"\Memory\Commit Limit");
+
+            if PdhAddEnglishCounterW(query, committed_path, 0, &mut committed_counter)
+                != ERROR_SUCCESS.0
+            {
+                warn!("PdhAddEnglishCounterW (committed) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            if PdhAddEnglishCounterW(query, limit_path, 0, &mut limit_counter) != ERROR_SUCCESS.0
+            {
+                warn!("PdhAddEnglishCounterW (limit) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+
+            // 预采一次，给瞬时计数器建立基线。
+            PdhCollectQueryData(query);
+
+            Some(Self {
+                query,
+                committed_counter,
+                limit_counter,
+            })
+        }
+    }
+
+    /// 采集当前已提交字节数与提交上限（字节）。返回 `(committed, limit)`。
+    fn sample(&self) -> (u64, u64) {
+        unsafe {
+            if PdhCollectQueryData(self.query) != ERROR_SUCCESS.0 {
+                return (0, 0);
+            }
+
+            let mut committed_val: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut limit_val: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+
+            if PdhGetFormattedCounterValue(
+                self.committed_counter,
+                PDH_FMT_LARGE,
+                None,
+                &mut committed_val,
+            ) != ERROR_SUCCESS.0
+            {
+                return (0, 0);
+            }
+            if PdhGetFormattedCounterValue(self.limit_counter, PDH_FMT_LARGE, None, &mut limit_val)
+                != ERROR_SUCCESS.0
+            {
+                return (0, 0);
+            }
+
+            // CStatus == 0 表示数据有效；largeValue 为 i64，负数钳到 0 再转 u64。
+            let committed = if committed_val.CStatus == 0 {
+                committed_val.Anonymous.largeValue.max(0) as u64
+            } else {
+                0
+            };
+            let limit = if limit_val.CStatus == 0 {
+                limit_val.Anonymous.largeValue.max(0) as u64
+            } else {
+                0
+            };
+
+            (committed, limit)
+        }
+    }
+}
+
+impl Drop for CommitPdh {
+    fn drop(&mut self) {
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
+
+/// Windows PDH-based paging-activity sampler.
+///
+/// 采集 `\Memory\Page Reads/sec`（速率计数器）：每秒因硬页错误（hard page fault）
+/// 而从磁盘（含 pagefile）读入的页数。它度量「换页活动强度」这一**流量**口径，
+/// 而非 swap 已用存量——前者才是真正的 swap 卡顿信号（见
+/// `docs/memory-stutter-detection.md` 阶段 C）。作为瞬时速率计数器，PDH 在两次
+/// `PdhCollectQueryData` 之间自动计算每秒速率，故 `sample()` 返回的是 per-second 值。
+struct PagingPdh {
+    query: PDH_HQUERY,
+    counter: PDH_HCOUNTER,
+}
+
+impl PagingPdh {
+    fn new() -> Option<Self> {
+        unsafe {
+            let mut query: PDH_HQUERY = PDH_HQUERY::default();
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
+                warn!("PdhOpenQueryW (paging) failed");
+                return None;
+            }
+
+            let mut counter: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let path = w!(r"\Memory\Page Reads/sec");
+
+            if PdhAddEnglishCounterW(query, path, 0, &mut counter) != ERROR_SUCCESS.0 {
+                warn!("PdhAddEnglishCounterW (page reads) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+
+            // 预采一次，给速率计数器建立基线（首个真实 sample 才能算出 per-second 速率）。
+            PdhCollectQueryData(query);
+
+            Some(Self { query, counter })
+        }
+    }
+
+    /// 采集当前分页读取速率（页/秒）。返回 f32（低活动下可能为小数，用 DOUBLE 格式化保留精度）。
+    fn sample(&self) -> f32 {
+        unsafe {
+            if PdhCollectQueryData(self.query) != ERROR_SUCCESS.0 {
+                return 0.0;
+            }
+
+            let mut val: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            if PdhGetFormattedCounterValue(self.counter, PDH_FMT_DOUBLE, None, &mut val)
+                != ERROR_SUCCESS.0
+            {
+                return 0.0;
+            }
+
+            // CStatus == 0 表示数据有效；doubleValue 已为每秒速率，负数钳到 0。
+            if val.CStatus == 0 {
+                val.Anonymous.doubleValue.max(0.0) as f32
+            } else {
+                0.0
+            }
+        }
+    }
+}
+
+impl Drop for PagingPdh {
+    fn drop(&mut self) {
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
+
 pub struct Collector {
     sys: System,
     networks: Networks,
@@ -117,6 +289,8 @@ pub struct Collector {
     prev_net_recv: u64,
     tick: u32,
     disk_pdh: Option<DiskPdh>,
+    commit_pdh: Option<CommitPdh>,
+    paging_pdh: Option<PagingPdh>,
 }
 
 impl Collector {
@@ -133,6 +307,8 @@ impl Collector {
         }
 
         let disk_pdh = DiskPdh::new();
+        let commit_pdh = CommitPdh::new();
+        let paging_pdh = PagingPdh::new();
 
         Self {
             sys,
@@ -141,6 +317,8 @@ impl Collector {
             prev_net_recv,
             tick: 0,
             disk_pdh,
+            commit_pdh,
+            paging_pdh,
         }
     }
 
@@ -205,6 +383,18 @@ impl Collector {
             None => (0, 0),
         };
 
+        // 提交电荷（commit charge）：瞬时计数器，每 tick 采样。
+        let (commit_bytes, commit_limit) = match &self.commit_pdh {
+            Some(c) => c.sample(),
+            None => (0, 0),
+        };
+
+        // 分页活动速率（Page Reads/sec）：速率计数器，每 tick 采样。
+        let page_reads_per_sec = match &self.paging_pdh {
+            Some(p) => p.sample(),
+            None => 0.0,
+        };
+
         // Slow channel (every 5 ticks): CPU freq, GPU usage, temperature via WMI.
         // These are expensive/rarely-changing, so leaving them on the slow
         // channel is fine.
@@ -233,6 +423,9 @@ impl Collector {
             mem_total_mb,
             mem_available_mb,
             swap_usage_percent,
+            commit_bytes,
+            commit_limit,
+            page_reads_per_sec,
             disk_read_bps,
             disk_write_bps,
             net_sent_bps,

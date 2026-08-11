@@ -327,8 +327,11 @@ pub fn load_culprits(
 /// - `"Disk write spike: ..."`    → 磁盘突增
 /// - `"Network spike: ..."`       → 网络突增
 /// - `"Memory available spike: ..."` → 内存骤降
-/// - `"Available memory ..."`     → 内存不足（硬阈值）
-/// - `"Swap usage ..."`           → 交换分区
+/// - `"Memory usage ..."`          → 内存过高（硬阈值，使用率百分比口径；与
+///   `detector.rs` 的 `mem_threshold_percent` 分支对应，覆盖大内存机器漏报）
+/// - `"Available memory ..."`     → 内存不足（硬阈值，绝对可用 MB 口径）
+/// - `"Commit charge ..."`        → 提交电荷（commit charge 压力，比可用内存更早预警）
+/// - `"Memory paging ..."`        → 内存分页（Page Reads/sec 换页抖动，真正的 swap 卡顿信号）
 /// - 其它                         → 其他
 ///
 /// ⚠️ 粗糙归类：依赖检测器文案，文案一改可能漂移（PRD §6.4 风险）。
@@ -343,10 +346,14 @@ pub fn classify_cause(cause: &str) -> &'static str {
         "网络突增"
     } else if cause.starts_with("Memory available") {
         "内存骤降"
+    } else if cause.starts_with("Memory usage") {
+        "内存过高"
     } else if cause.starts_with("Available memory") {
         "内存不足"
-    } else if cause.starts_with("Swap usage") {
-        "交换分区"
+    } else if cause.starts_with("Commit charge") {
+        "提交电荷"
+    } else if cause.starts_with("Memory paging") {
+        "内存分页"
     } else {
         "其他"
     }
@@ -1342,8 +1349,10 @@ mod tests {
             classify_cause("Memory available spike: 1000MB → 200MB"),
             "内存骤降"
         );
+        assert_eq!(classify_cause("Memory usage 95.0% > 90%"), "内存过高");
         assert_eq!(classify_cause("Available memory 100MB < 500MB"), "内存不足");
-        assert_eq!(classify_cause("Swap usage 55.0% > 50%"), "交换分区");
+        assert_eq!(classify_cause("Commit charge 95.0% > 90%"), "提交电荷");
+        assert_eq!(classify_cause("Memory paging 200.0/s > 50/s"), "内存分页");
         assert_eq!(classify_cause("weird unknown text"), "其他");
     }
 

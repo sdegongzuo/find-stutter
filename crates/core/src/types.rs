@@ -17,6 +17,15 @@ pub struct Sample {
     pub mem_total_mb: u64,
     pub mem_available_mb: u64,
     pub swap_usage_percent: f32,
+    // 提交电荷（commit charge）：已提交虚拟内存字节数 / 提交上限（= 物理内存 + 页面文件）。
+    // 仅采集展示，不再作为卡顿触发（存量≠压力，见 DetectionConfig 说明）。
+    pub commit_bytes: u64,
+    pub commit_limit: u64,
+
+    // 分页活动速率（Page Reads/sec）：每秒因硬页错误而从磁盘（含 pagefile）读入的页数。
+    // 是「真正的 swap 卡顿信号」——直接度量换页活动强度（流量），而非 swap 已用存量。
+    // 见 DetectionConfig::page_reads_threshold 与 docs/memory-stutter-detection.md。
+    pub page_reads_per_sec: f32,
 
     // 磁盘 I/O (bytes/sec)
     pub disk_read_bps: u64,
@@ -57,6 +66,9 @@ impl Default for Sample {
             mem_total_mb: 0,
             mem_available_mb: 0,
             swap_usage_percent: 0.0,
+            commit_bytes: 0,
+            commit_limit: 0,
+            page_reads_per_sec: 0.0,
             disk_read_bps: 0,
             disk_write_bps: 0,
             net_sent_bps: 0,
@@ -165,11 +177,15 @@ pub struct DetectionConfig {
     pub cpu_hysteresis: f32,
     pub mem_threshold_percent: f32,
     pub mem_threshold_mb: u64,
-    pub swap_threshold: f32,
-    /// Swap 滞回：进入需 > swap_threshold；退出需 < swap_threshold - swap_hysteresis。
-    /// 滞回带内维持当前状态。
-    #[serde(default = "default_swap_hysteresis")]
-    pub swap_hysteresis: f32,
+    /// 提交电荷压力阈值（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
+    /// 接近上限时系统弹「内存不足」并强制分页，往往比「可用物理内存归零」更早预警。
+    /// 与 mem 两个口径互补（任一成立即记内存压力）。
+    pub commit_threshold_percent: f32,
+    /// 分页活动速率阈值（/s）：\Memory\Page Reads/sec 超过该值即记为换页抖动
+    /// （真正的 swap 卡顿信号，度量换页活动强度而非 swap 已用存量）。
+    /// 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。详见
+    /// docs/memory-stutter-detection.md 的阶段 C 说明。
+    pub page_reads_threshold: f32,
     pub disk_rate_spike_ratio: f32,
     pub spike_ratio: f32,
     /// 网络/磁盘 spike 的绝对下限（B/s）：当前速率低于该值不判定 spike，
@@ -186,8 +202,8 @@ impl Default for DetectionConfig {
             cpu_hysteresis: 10.0,
             mem_threshold_percent: 90.0,
             mem_threshold_mb: 500,
-            swap_threshold: 50.0,
-            swap_hysteresis: 10.0,
+            commit_threshold_percent: 90.0,
+            page_reads_threshold: 50.0,
             disk_rate_spike_ratio: 10.0,
             spike_ratio: 3.0,
             spike_min_bps: 2_000_000,
@@ -197,10 +213,6 @@ impl Default for DetectionConfig {
 }
 
 fn default_cpu_hysteresis() -> f32 {
-    10.0
-}
-
-fn default_swap_hysteresis() -> f32 {
     10.0
 }
 
@@ -488,7 +500,8 @@ mod tests {
         assert_eq!(c.cpu_threshold, 90.0);
         assert_eq!(c.mem_threshold_percent, 90.0);
         assert_eq!(c.mem_threshold_mb, 500);
-        assert_eq!(c.swap_threshold, 50.0);
+        assert_eq!(c.commit_threshold_percent, 90.0);
+        assert_eq!(c.page_reads_threshold, 50.0);
         assert_eq!(c.disk_rate_spike_ratio, 10.0);
         assert_eq!(c.spike_ratio, 3.0);
         assert_eq!(c.spike_min_bps, 2_000_000);

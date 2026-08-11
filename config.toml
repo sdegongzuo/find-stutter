@@ -19,11 +19,15 @@ cpu_hysteresis = 10.0
 mem_threshold_percent = 90.0
 # 或：可用内存低于该值（MB）即视为潜在卡顿
 mem_threshold_mb = 500
-# 交换分区使用率超过该百分比（%）即视为潜在卡顿
-swap_threshold = 50.0
-# Swap 滞回（百分点）：进入需 > swap_threshold，退出需 < swap_threshold - swap_hysteresis。
-# 滞回带内维持当前状态，避免反复记录
-swap_hysteresis = 10.0
+# 提交电荷压力（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
+# 接近上限时系统弹「内存不足」并强制分页，往往比「可用物理内存归零」更早预警。
+# （旧版曾用「交换分区使用率」做硬触发，因存量≠压力、易误报且虚高 severity，
+# 已将 swap 降级为仅展示，不再参与卡顿判定。）
+commit_threshold_percent = 90.0
+# 分页活动速率（Page Reads/sec）阈值（/s）：超过即记为换页抖动。这是「真正的 swap
+# 卡顿信号」——度量换页活动强度（流量）而非 swap 已用存量。正常负载通常 < 10/s，
+# 抖动（thrashing）时飙升到数百/数千 /s。详见 docs/memory-stutter-detection.md 阶段 C。
+page_reads_threshold = 50.0
 # 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
 disk_rate_spike_ratio = 10.0
 # 综合指标相对基线的突增倍数

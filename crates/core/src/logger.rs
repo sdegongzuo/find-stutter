@@ -38,7 +38,10 @@ impl Logger {
                 cpu_temp REAL,
                 gpu_temp REAL,
                 process_count INTEGER,
-                thread_count INTEGER
+                thread_count INTEGER,
+                commit_bytes INTEGER,
+                commit_limit INTEGER,
+                page_reads_per_sec REAL
             );
             CREATE TABLE IF NOT EXISTS stutter_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +66,14 @@ impl Logger {
         let _ = conn.execute_batch(
             "ALTER TABLE stutter_events ADD COLUMN culprits TEXT NOT NULL DEFAULT '[]';",
         );
+
+        // 迁移：给历史库里的 samples 补 commit_bytes / commit_limit / page_reads_per_sec 列（旧库无此列）。
+        // 每条 ALTER 独立执行并忽略错误——SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，
+        // 若某列已存在则该条 ALTER 报错；若合并成一条 execute_batch，前一条报错会
+        // 中止后续所有 ALTER，导致新列漏加。故逐条执行、各自吞错。
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN commit_bytes INTEGER;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN commit_limit INTEGER;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN page_reads_per_sec REAL;");
 
         // M6：时间戳索引真正落地（PRD §3.3）。
         // 分析页严格只读 stutter.db，无法在只读连接上 CREATE INDEX，故索引必须在
@@ -101,8 +112,9 @@ impl Logger {
                     mem_usage_percent, mem_used_mb, mem_total_mb, mem_available_mb,
                     swap_usage_percent, disk_read_bps, disk_write_bps,
                     net_sent_bps, net_recv_bps, net_sent_total, net_recv_total,
-                    gpu_usage, cpu_temp, gpu_temp, process_count, thread_count
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                    gpu_usage, cpu_temp, gpu_temp, process_count, thread_count,
+                    commit_bytes, commit_limit, page_reads_per_sec
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             )?;
             for s in &self.buffer {
                 let core_str: String = s
@@ -132,6 +144,9 @@ impl Logger {
                     s.gpu_temp,
                     s.process_count as i64,
                     s.thread_count as i64,
+                    s.commit_bytes as i64,
+                    s.commit_limit as i64,
+                    s.page_reads_per_sec,
                 ])?;
             }
         }
@@ -166,7 +181,7 @@ impl Logger {
                     mem_used_mb, mem_total_mb, mem_available_mb, swap_usage_percent,
                     disk_read_bps, disk_write_bps, net_sent_bps, net_recv_bps,
                     net_sent_total, net_recv_total, gpu_usage, cpu_temp, gpu_temp,
-                    process_count, thread_count
+                    process_count, thread_count, commit_bytes, commit_limit, page_reads_per_sec
              FROM samples WHERE timestamp BETWEEN ?1 AND ?2 ORDER BY timestamp",
         )?;
 
@@ -176,7 +191,7 @@ impl Logger {
             "内存已用(MB)", "内存总量(MB)", "内存可用(MB)", "交换分区使用率(%)",
             "磁盘读速率(B/s)", "磁盘写速率(B/s)", "网络发送速率(B/s)", "网络接收速率(B/s)",
             "网络累计发送(B)", "网络累计接收(B)", "GPU 使用率(%)", "CPU 温度(°C)", "GPU 温度(°C)",
-            "进程数", "线程数",
+            "进程数", "线程数", "提交电荷(MB)", "提交上限(MB)", "分页速率(/s)",
         ])?;
 
         let rows = stmt.query_map(params![from, to], |row| {
@@ -200,6 +215,9 @@ impl Logger {
                 row.get::<_, Option<f32>>(17)?,
                 row.get::<_, Option<i64>>(18)?,
                 row.get::<_, Option<i64>>(19)?,
+                row.get::<_, Option<i64>>(20)?,
+                row.get::<_, Option<i64>>(21)?,
+                row.get::<_, Option<f32>>(22)?,
             ))
         })?;
 
@@ -225,6 +243,9 @@ impl Logger {
                 format!("{:.1}", r.16.unwrap_or(0.0)),
                 format!("{}", r.17.unwrap_or(0)),
                 format!("{}", r.18.unwrap_or(0)),
+                format!("{}", r.19.unwrap_or(0) / 1024 / 1024),
+                format!("{}", r.20.unwrap_or(0) / 1024 / 1024),
+                format!("{:.1}", r.21.unwrap_or(0.0)),
             ])?;
         }
         wtr.flush()?;
