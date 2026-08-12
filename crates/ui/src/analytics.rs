@@ -15,10 +15,11 @@
 //!   否则 UTC+8 用户会整体偏移 8 小时。
 //! - KPI「高峰时段 HH:00」取自今日本地时区分桶后的最高桶。
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
-use find_stutter_core::ProcessBrief;
+use find_stutter_core::{CauseKind, DetectionConfig, ProcessBrief, Sample, StutterEvent};
 use rusqlite::{params, Connection, OpenFlags};
 
 /// 时间范围选择器（PRD F7）。
@@ -768,6 +769,470 @@ pub fn load_resource_samples(
 
 // ===================== M5 / F5+F8：原始事件表 + CSV 导出 =====================
 
+// ===================== 卡顿根因分析（PRD §6.5 / F-RC5~F-RC13）纯函数层 =====================
+//
+// 以下函数均为**纯函数**：输入 Slice/引用 → 输出，无 I/O、无 DB、不修改入参。
+// 供高级模式根因分析面板在内存中对历史事件做聚合/归因/画像，不写库、不改 service。
+
+/// 温度→降频根因判定的「负载下限」（%，与 detector.rs 的 `THERMAL_LOAD_MIN_USAGE` 一致）：
+/// 降频仅在负载下才有归因意义。what-if 单帧无历史频率峰值，故以「存在频率读数 + 负载」表征掉档。
+const WHATIF_THERMAL_LOAD_MIN_USAGE: f32 = 50.0;
+
+/// F-RC11：主因相对次因「明显领先」的判定阈值。
+const LEADING_GAP_MS: i64 = 1000; // 首触时间差 >= 1s 视为明显领先
+const LEADING_RATIO: f64 = 1.5; // 主因强度/次因强度 >= 1.5 视为明显领先
+/// F-RC7：进程作为元凶出现次数 >= 该值才算稳定基线，否则降级为噪声/绝对阈值。
+const MIN_BASELINE_APPEARANCES: u32 = 3;
+/// F-RC7：偏离倍数阈值，当前占用 > 基线 × 该值才标显著偏离。
+const DEVIATION_FACTOR: f32 = 1.5;
+
+/// F-RC5：主因加权归因结果（单进程聚合）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightedCulprit {
+    /// 进程名
+    pub name: String,
+    /// 累加权重 = Σ(duration_norm × 主因信号强度)
+    pub weight: f64,
+    /// 作为元凶出现次数
+    pub count: u32,
+    /// 关联卡顿累计时长（ms）
+    pub total_duration_ms: u64,
+}
+
+/// 取某 cause 的归一化越阈幅度（0..~2），供 F-RC5/F-RC11 复用。
+///
+/// 按 cause 从 snapshot 取对应指标的归一化强度（不乘 severity，否则重复计数 cause 数）。
+fn cause_strength(event: &StutterEvent, kind: CauseKind) -> f64 {
+    let s = &event.snapshot;
+    match kind {
+        CauseKind::CpuHigh | CauseKind::CpuSpike => (s.cpu_usage / 100.0) as f64,
+        CauseKind::MemLow => (s.mem_usage_percent / 100.0) as f64,
+        CauseKind::DiskBusy => (s.disk_busy_percent / 100.0) as f64,
+        CauseKind::DpcInterrupt | CauseKind::InterruptStorm => {
+            (s.dpc_percent.max(s.interrupt_percent) / 100.0) as f64
+        }
+        CauseKind::ThermalThrottle => s.cpu_temp.map_or(0.5, |t| (t / 100.0) as f64),
+        // UiFrozen/NetSpike/DiskSpike/GpuHigh/None 等无可量化瞬时强度 → 取居中 0.5
+        _ => 0.5,
+    }
+}
+
+/// 取事件主因的归一化强度（无主因时取居中 0.5）。
+fn primary_strength(event: &StutterEvent) -> f64 {
+    match event.primary_cause {
+        Some(k) => cause_strength(event, k),
+        None => 0.5,
+    }
+}
+
+/// F-RC5：按 `duration × 主因信号强度` 累加每进程权重，按 name 聚合、按 weight 降序取前 limit。
+///
+/// - `set_max_duration` = 事件中最大 duration（最小 1 防除零）；`duration_norm(e) = e.duration_ms / set_max_duration`。
+/// - `primary_strength(e)` 取主因相对阈值的归一化越阈幅度（见 [`cause_strength`]，0..~2）。
+/// - `weight(e, culprit) = duration_norm(e) × primary_strength(e)`；不乘 severity，避免与 cause 数重复计数。
+pub fn weighted_culprits(events: &[StutterEvent], limit: usize) -> Vec<WeightedCulprit> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let set_max_duration = events
+        .iter()
+        .map(|e| e.duration_ms)
+        .max()
+        .unwrap_or(0)
+        .max(1);
+    let mut agg: HashMap<String, WeightedCulprit> = HashMap::new();
+    for e in events {
+        let duration_norm = e.duration_ms as f64 / set_max_duration as f64;
+        let w = duration_norm * primary_strength(e);
+        for c in &e.culprits {
+            let entry = agg.entry(c.name.clone()).or_insert_with(|| WeightedCulprit {
+                name: c.name.clone(),
+                weight: 0.0,
+                count: 0,
+                total_duration_ms: 0,
+            });
+            entry.weight += w;
+            entry.count += 1;
+            entry.total_duration_ms += e.duration_ms;
+        }
+    }
+    let mut out: Vec<WeightedCulprit> = agg.into_values().collect();
+    // 按权重降序（f64 用 partial_cmp 兜底，避免 NaN 导致 panic）
+    out.sort_by(|a, b| {
+        b.weight
+            .partial_cmp(&a.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out.truncate(limit);
+    out
+}
+
+/// 按首触时刻升序排列事件的 cause_kinds（缺首触记 +∞ 排最末，枚举名兜底保证确定性）。
+/// F-RC6 / F-RC9 / F-RC11 共用，避免重复排序闭包。
+fn sorted_causes_by_first_touch(event: &StutterEvent) -> Vec<(CauseKind, i64)> {
+    let mut kinds: Vec<(CauseKind, i64)> = event
+        .cause_kinds
+        .iter()
+        .map(|k| (*k, event.cause_first_touch.get(k).copied().unwrap_or(i64::MAX)))
+        .collect();
+    kinds.sort_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| format!("{:?}", a.0).cmp(&format!("{:?}", b.0)))
+    });
+    kinds
+}
+
+/// F-RC6：因果方向——用各 cause 首触时刻定位触发者（最小偏移）与放大器。
+///
+/// - `trigger` = `cause_kinds` 中 `cause_first_touch` 偏移最小且存在的那一个。
+/// - `amplifiers` = 其余按偏移升序。某 `cause_kinds` 项若无 `first_touch` 记 `+∞`（视为最晚）。
+/// - 纯函数层仅依赖事件自身字段；bulk 窗口回退由调用方在真实流程中处理（不在本函数签名内）。
+pub fn causal_direction(event: &StutterEvent) -> (Option<CauseKind>, Vec<CauseKind>) {
+    let offsets = sorted_causes_by_first_touch(event);
+    let trigger = offsets.first().map(|(k, _)| *k);
+    let amplifiers: Vec<CauseKind> = offsets.iter().skip(1).map(|(k, _)| *k).collect();
+    (trigger, amplifiers)
+}
+
+/// F-RC7：进程基线（某进程作为元凶出现时的典型占用）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessBaseline {
+    /// 进程名
+    pub name: String,
+    /// 典型 CPU 占用（该进程作为元凶时 cpu_usage 的均值，代表常态而非峰值）
+    pub typical_cpu: f32,
+    /// 典型内存占用 MB（均值）
+    pub typical_mem_mb: f64,
+    /// 出现次数（用于区分稳定基线 vs 偶发噪声）
+    pub appearances: u32,
+}
+
+/// F-RC7：从历史事件 culprits 聚合每进程作为元凶时的典型占用（typical = 均值）。
+///
+/// 用均值而非最大值：基线代表「常态」，当前值才可能超过基线 × factor 被标为显著偏离；
+/// 若取历史最大值作基线，则当前占用几乎永远 <= 基线，偏离判定近乎永不触发（逻辑失效）。
+pub fn process_baseline(events: &[StutterEvent]) -> HashMap<String, ProcessBaseline> {
+    // 累加 sum + count，最后算均值（避免每步重算）
+    let mut agg: HashMap<String, (f32, f64, u32)> = HashMap::new(); // (sum_cpu, sum_mem_mb, count)
+    for e in events {
+        for c in &e.culprits {
+            let entry = agg.entry(c.name.clone()).or_insert((0.0, 0.0, 0));
+            entry.0 += c.cpu_usage;
+            entry.1 += c.mem_used_mb as f64;
+            entry.2 += 1;
+        }
+    }
+    agg.into_iter()
+        .map(|(name, (sum_cpu, sum_mem, count))| {
+            (
+                name.clone(),
+                ProcessBaseline {
+                    name,
+                    typical_cpu: if count > 0 { sum_cpu / count as f32 } else { 0.0 },
+                    typical_mem_mb: if count > 0 { sum_mem / count as f64 } else { 0.0 },
+                    appearances: count,
+                },
+            )
+        })
+        .collect()
+}
+
+/// F-RC7：对给定事件每个 culprit 计算偏离倍率与显著性。
+///
+/// - `multiple = culprit.cpu_usage / baseline.typical_cpu`（baseline 存在且 typical>0）。
+/// - `significant = appearances>=3 且 multiple>1.5`；baseline 缺失或 `appearances<3`
+///   → `significant=false`（降级绝对阈值，标注噪声，避免单次偶发误判）。
+pub fn deviation_flags(
+    event: &StutterEvent,
+    baseline: &HashMap<String, ProcessBaseline>,
+) -> Vec<(String, f32, bool)> {
+    let mut out = Vec::new();
+    for c in &event.culprits {
+        let (multiple, significant) = match baseline.get(&c.name) {
+            Some(b) => {
+                let multiple = if b.typical_cpu > 0.0 {
+                    c.cpu_usage / b.typical_cpu
+                } else {
+                    c.cpu_usage
+                };
+                // 出现不足 MIN_BASELINE_APPEARANCES 次视为噪声，不标显著（即使倍率高）
+                let significant = b.appearances >= MIN_BASELINE_APPEARANCES && multiple > DEVIATION_FACTOR;
+                (multiple, significant)
+            }
+            // baseline 缺失 → 标注噪声，significant=false
+            None => (0.0, false),
+        };
+        out.push((c.name.clone(), multiple, significant));
+    }
+    out
+}
+
+/// F-RC8：进程共现对（cfg 无序，a<b 排序避免重复对）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoOccurrence {
+    /// 进程名对（已按字典序排序，保证无序且去重）
+    pub pair: (String, String),
+    /// 共同出现频次
+    pub count: u32,
+}
+
+/// F-RC8：统计每对进程名在事件中共同出现的频次，按 count 降序、去重返回。
+///
+/// 同事件内同名进程只计一次对；无序对按 `(a,b)`（a<=b）归并，避免 (A,B)/(B,A) 重复。
+pub fn cooccurrence_pairs(events: &[StutterEvent]) -> Vec<CoOccurrence> {
+    let mut tally: HashMap<(String, String), u32> = HashMap::new();
+    for e in events {
+        // 同事件内按名字去重（同名不同 PID 视为同一进程）
+        let mut names: Vec<String> = e.culprits.iter().map(|c| c.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        for i in 0..names.len() {
+            for j in (i + 1)..names.len() {
+                let (a, b) = (names[i].clone(), names[j].clone());
+                let pair = if a <= b { (a, b) } else { (b, a) };
+                *tally.entry(pair).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut out: Vec<CoOccurrence> = tally
+        .into_iter()
+        .map(|(pair, count)| CoOccurrence { pair, count })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out
+}
+
+/// F-RC9：因果链——多 cause 按首触时刻升序排成有向链（根因→传导→表象）。
+///
+/// 即 `cause_kinds` 按 `cause_first_touch` 偏移升序；缺首触记 `+∞`（排最末）。
+pub fn cause_chain(event: &StutterEvent) -> Vec<CauseKind> {
+    sorted_causes_by_first_touch(event)
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect()
+}
+
+/// F-RC11：根因置信度（0..1, 中文标签）。
+///
+/// 不按 cause 数量压低（多因并发是 major/critical 的定义本身，数量多≠置信低）。
+/// - 单 cause → `(0.9, "高")`。
+/// - 多 cause：算 primary 首触与次因首触差 Δt、primary 强度比；
+///   primary 明显领先（Δt>=1000ms 或强度比>=1.5）→ `(0.7, "较高")`；
+///   否则 → `(0.35, "主因不显著，疑多因并发")`。
+pub fn root_cause_confidence(event: &StutterEvent) -> (f32, &'static str) {
+    if event.cause_kinds.len() <= 1 {
+        return (0.9, "高");
+    }
+    // 按首触偏移升序（共用 helper，保证与 F-RC6/F-RC9 排序一致）
+    let sorted = sorted_causes_by_first_touch(event);
+    let primary = event.primary_cause.unwrap_or(sorted.first().map(|(k, _)| *k).unwrap_or(CauseKind::UiFrozen));
+    let primary_touch = event
+        .cause_first_touch
+        .get(&primary)
+        .copied()
+        .or_else(|| sorted.first().map(|(_, t)| *t))
+        .unwrap_or(0);
+    // 次因 = 排序后第一个非 primary 的首触
+    let second_touch = sorted.iter().find(|(k, _)| *k != primary).map(|(_, t)| *t);
+    // Δt：primary 相对次因的领先量（primary 先行者时为正）
+    let dt = match second_touch {
+        Some(t) if t != i64::MAX => t - primary_touch,
+        _ => 0,
+    };
+    // primary 强度比 = primary_strength / 次因强度
+    let ps = primary_strength(event);
+    let ss = sorted
+        .iter()
+        .find(|(k, _)| *k != primary)
+        .map(|(k, _)| cause_strength(event, *k))
+        .unwrap_or(ps);
+    let ratio = if ss > 0.0 { ps / ss } else { ps };
+
+    if dt >= LEADING_GAP_MS || ratio >= LEADING_RATIO {
+        (0.7, "较高")
+    } else {
+        (0.35, "主因不显著，疑多因并发")
+    }
+}
+
+/// F-RC12：what-if 纯客户端重算——用单帧 Sample + 可调阈值判定「若阈值 X 是否会触发该 cause」。
+///
+/// 覆盖瞬时硬阈值类 cause：CPU / Mem(usage+available) / Commit / Paging / DiskBusy / DPC /
+/// Interrupt / CtxSwitch / Thermal。不含 spike 类（需历史基线，what-if 不做）。
+/// 返回文案前缀与 detector `check_hard_thresholds` 对齐（如 "CPU usage"/"Memory usage"/
+/// "Available memory"/"Commit charge"/"Memory paging"/"Disk busy"/"DPC time"/"Interrupt time"/
+/// "Context switches"/"Thermal throttle"），便于上层比对。
+///
+/// 注意语义差异（what-if 仅用单帧，无 detector 的运行时状态）：
+/// - CPU/内存/磁盘/DPC/中断/上下文：用瞬时 `>` 阈值判定，忽略 detector 的滞回状态机。
+/// - Thermal：单帧无历史频率峰值，以「温度超阈 + 有频率读数 + 负载」作为降频代理判据，
+///   与 detector 的「频率 < 峰值×比例」语义不同（what-if 无法获知历史峰值）。
+///
+/// 注：本函数当前位于 UI crate；PRD §5.1 期望它成为 service 与分析层共用的纯函数以消除
+/// 阈值漂移（R6/R8），后续应上提到 `find_stutter_core` 由 detector 与 what-if 共同调用。
+pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
+    let mut causes = Vec::new();
+
+    // CPU：瞬时 > 阈值（忽略滞回）
+    if sample.cpu_usage > cfg.cpu_threshold {
+        causes.push(format!(
+            "CPU usage {:.1}% > {}%",
+            sample.cpu_usage, cfg.cpu_threshold
+        ));
+    }
+    // 可用内存不足（绝对下限）
+    if sample.mem_available_mb < cfg.mem_threshold_mb {
+        causes.push(format!(
+            "Available memory {}MB < {}MB",
+            sample.mem_available_mb, cfg.mem_threshold_mb
+        ));
+    }
+    // 内存使用率过高（百分比口径，与可用下限为「或」关系）
+    if sample.mem_usage_percent > cfg.mem_threshold_percent {
+        causes.push(format!(
+            "Memory usage {:.1}% > {}%",
+            sample.mem_usage_percent, cfg.mem_threshold_percent
+        ));
+    }
+    // 提交电荷压力（commit charge）：已提交 / 提交上限
+    let commit_ratio = if sample.commit_limit > 0 {
+        sample.commit_bytes as f64 / sample.commit_limit as f64 * 100.0
+    } else {
+        0.0
+    };
+    if commit_ratio > cfg.commit_threshold_percent as f64 {
+        causes.push(format!(
+            "Commit charge {:.1}% > {}%",
+            commit_ratio, cfg.commit_threshold_percent
+        ));
+    }
+    // 分页活动速率（真正的 swap 卡顿信号）
+    if sample.page_reads_per_sec > cfg.page_reads_threshold {
+        causes.push(format!(
+            "Memory paging {:.1}/s > {}/s",
+            sample.page_reads_per_sec, cfg.page_reads_threshold
+        ));
+    }
+    // 磁盘真繁忙度（% Disk Time 或 单次 IO 延迟，任一超阈值）
+    if sample.disk_busy_percent > cfg.disk_busy_threshold_percent
+        || sample.disk_avg_io_ms > cfg.disk_io_threshold_ms
+    {
+        causes.push(format!(
+            "Disk busy {:.1}% (IO {:.1}ms)",
+            sample.disk_busy_percent, sample.disk_avg_io_ms
+        ));
+    }
+    // % DPC Time
+    if sample.dpc_percent > cfg.dpc_threshold_percent {
+        causes.push(format!(
+            "DPC time {:.1}% > {}%",
+            sample.dpc_percent, cfg.dpc_threshold_percent
+        ));
+    }
+    // % Interrupt Time
+    if sample.interrupt_percent > cfg.interrupt_threshold_percent {
+        causes.push(format!(
+            "Interrupt time {:.1}% > {}%",
+            sample.interrupt_percent, cfg.interrupt_threshold_percent
+        ));
+    }
+    // Context Switches/sec
+    if sample.context_switches_per_sec > cfg.context_switch_threshold_per_sec {
+        causes.push(format!(
+            "Context switches {:.0}/s > {:.0}/s",
+            sample.context_switches_per_sec, cfg.context_switch_threshold_per_sec
+        ));
+    }
+    // Thermal：温度高 + 负载 + 有频率读数（单帧无历史峰值，以存在频率读数表征掉档）
+    if let Some(t) = sample.cpu_temp {
+        if t > cfg.thermal_threshold_celsius
+            && sample.cpu_freq_mhz.is_some()
+            && sample.cpu_usage > WHATIF_THERMAL_LOAD_MIN_USAGE
+        {
+            causes.push(format!(
+                "Thermal throttle: CPU {:.0}°C, freq {:.0}MHz",
+                t,
+                sample.cpu_freq_mhz.unwrap_or(0.0)
+            ));
+        }
+    }
+    causes
+}
+
+/// F-RC13：同类事件画像（按 signature 聚类）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventProfile {
+    /// 画像签名：排序后 cause_kinds 名 + "|" + 排序后 culprit 名 + "|" + duration 桶（短/中/长）
+    pub signature: String,
+    /// 该类事件出现次数
+    pub count: u32,
+    /// 平均持续时长（ms）
+    pub avg_duration_ms: f64,
+}
+
+/// 计算单事件 signature（供聚类与匹配复用）。
+fn signature_of(e: &StutterEvent) -> String {
+    let mut kinds: Vec<String> = e.cause_kinds.iter().map(|k| format!("{:?}", k)).collect();
+    kinds.sort();
+    let mut culprits: Vec<String> = e.culprits.iter().map(|c| c.name.clone()).collect();
+    culprits.sort();
+    let bucket = if e.duration_ms < 1000 {
+        "短"
+    } else if e.duration_ms <= 5000 {
+        "中"
+    } else {
+        "长"
+    };
+    format!("{}|{}|{}", kinds.join("|"), culprits.join("|"), bucket)
+}
+
+/// F-RC13：按 signature 聚类事件，返回按 count 降序的画像列表。
+pub fn cluster_profiles(events: &[StutterEvent]) -> Vec<EventProfile> {
+    let mut tally: HashMap<String, (u32, u64)> = HashMap::new(); // sig -> (count, total_duration)
+    for e in events {
+        let sig = signature_of(e);
+        let entry = tally.entry(sig).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += e.duration_ms;
+    }
+    let mut out: Vec<EventProfile> = tally
+        .into_iter()
+        .map(|(signature, (count, total))| EventProfile {
+            signature,
+            count,
+            avg_duration_ms: if count > 0 {
+                total as f64 / count as f64
+            } else {
+                0.0
+            },
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out
+}
+
+/// F-RC13：对给定事件匹配已知画像（count>=2 的 profile 才算「已知」），返回人话结论。无匹配返回 None。
+pub fn match_profile(event: &StutterEvent, profiles: &[EventProfile]) -> Option<String> {
+    let sig = signature_of(event);
+    let known = profiles.iter().find(|p| p.count >= 2 && p.signature == sig)?;
+    let avg_s = known.avg_duration_ms / 1000.0;
+    let proc_names: Vec<String> = {
+        let mut v: Vec<String> = event.culprits.iter().map(|c| c.name.clone()).collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let proc = if proc_names.is_empty() {
+        "未知进程".to_string()
+    } else {
+        proc_names.join("、")
+    };
+    Some(format!(
+        "匹配已知画像：进程{}典型卡顿（{} 次，平均 {:.1}s）",
+        proc, known.count, avg_s
+    ))
+}
+
 /// F5/F8：单条卡顿事件明细（供高级模式原始事件表与 CSV 导出）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRow {
@@ -1004,7 +1469,7 @@ pub fn export_events_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use find_stutter_core::{Logger, ProcessBrief, Sample, Severity, StorageConfig};
+    use find_stutter_core::{CauseKind, DetectionConfig, Logger, ProcessBrief, Sample, Severity, StorageConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_db(name: &str) -> String {
@@ -1703,5 +2168,367 @@ mod tests {
             EventSortColumn::Culprits
         );
         std::fs::remove_file(&db).ok();
+    }
+
+    // ===================== F-RC5~F-RC13 纯函数单测 =====================
+
+    /// 纯函数测试用：内存直接构造事件（不落库），复用 StutterEvent/Sample/ProcessBrief。
+    fn mk_event(
+        duration_ms: u64,
+        cause_kinds: Vec<CauseKind>,
+        primary_cause: Option<CauseKind>,
+        first_touch: &[(CauseKind, i64)],
+        snapshot: Sample,
+        culprits: Vec<ProcessBrief>,
+    ) -> find_stutter_core::StutterEvent {
+        let mut ft = HashMap::new();
+        for (k, v) in first_touch {
+            ft.insert(*k, *v);
+        }
+        find_stutter_core::StutterEvent {
+            duration_ms,
+            cause_kinds,
+            primary_cause,
+            cause_first_touch: ft,
+            snapshot,
+            culprits,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rc5_weighted_culprits_orders_by_weight_and_aggregates() {
+        // 3 个事件，primary_cause 不同、duration 不同：
+        // e1(dur=5000, CpuHigh, cpu=100)、e2(dur=2000, MemLow, mem%=100)、e3(dur=1000, DiskBusy, disk%=100)
+        // set_max=5000；appA 出现在 e1+e3 → 权重 1.0+0.2=1.2，count=2，total=6000
+        //                          appB 出现在 e2   → 权重 0.4，count=1，total=2000
+        let pb = |pid: u32, name: &str, cpu: f32, mem: u64| ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: cpu,
+            mem_used_mb: mem,
+        };
+        let mut s1 = Sample::default();
+        s1.cpu_usage = 100.0;
+        let mut s2 = Sample::default();
+        s2.mem_usage_percent = 100.0;
+        let mut s3 = Sample::default();
+        s3.disk_busy_percent = 100.0;
+        let e1 = mk_event(
+            5000,
+            vec![CauseKind::CpuHigh],
+            Some(CauseKind::CpuHigh),
+            &[],
+            s1,
+            vec![pb(1, "appA.exe", 90.0, 100)],
+        );
+        let e2 = mk_event(
+            2000,
+            vec![CauseKind::MemLow],
+            Some(CauseKind::MemLow),
+            &[],
+            s2,
+            vec![pb(2, "appB.exe", 50.0, 100)],
+        );
+        let e3 = mk_event(
+            1000,
+            vec![CauseKind::DiskBusy],
+            Some(CauseKind::DiskBusy),
+            &[],
+            s3,
+            vec![pb(3, "appA.exe", 10.0, 100)],
+        );
+        let events = [e1, e2, e3];
+        let top = weighted_culprits(&events, 10);
+        assert_eq!(top.len(), 2);
+        // 按权重降序：appA(1.2) 在前
+        assert_eq!(top[0].name, "appA.exe");
+        assert!((top[0].weight - 1.2).abs() < 1e-9);
+        assert_eq!(top[0].count, 2);
+        assert_eq!(top[0].total_duration_ms, 6000);
+        assert_eq!(top[1].name, "appB.exe");
+        assert!((top[1].weight - 0.4).abs() < 1e-9);
+        assert_eq!(top[1].count, 1);
+        assert_eq!(top[1].total_duration_ms, 2000);
+    }
+
+    #[test]
+    fn rc6_causal_direction_marks_trigger_and_amplifiers() {
+        // cause_kinds=[MemLow, DiskBusy]，首触 {MemLow:0, DiskBusy:1200}
+        let e = mk_event(
+            2000,
+            vec![CauseKind::MemLow, CauseKind::DiskBusy],
+            Some(CauseKind::MemLow),
+            &[(CauseKind::MemLow, 0), (CauseKind::DiskBusy, 1200)],
+            Sample::default(),
+            vec![],
+        );
+        let (trigger, amplifiers) = causal_direction(&e);
+        assert_eq!(trigger, Some(CauseKind::MemLow));
+        assert_eq!(amplifiers, vec![CauseKind::DiskBusy]);
+    }
+
+    #[test]
+    fn rc7_deviation_flags_significant_only_when_baseline_stable_and_spiking() {
+        let pb = |pid: u32, name: &str, cpu: f32, mem: u64| ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: cpu,
+            mem_used_mb: mem,
+        };
+        // appA.exe 出现 3 次（cpu 均为 50）→ baseline: typical_cpu=50, appearances=3
+        // appB.exe 仅出现 1 次（appearances<3）
+        let mut events: Vec<find_stutter_core::StutterEvent> = (0..3)
+            .map(|i| {
+                let mut s = Sample::default();
+                s.cpu_usage = 50.0;
+                mk_event(
+                    1000,
+                    vec![],
+                    None,
+                    &[],
+                    s,
+                    vec![pb(100 + i, "appA.exe", 50.0, 100)],
+                )
+            })
+            .collect();
+        {
+            let mut s = Sample::default();
+            s.cpu_usage = 30.0;
+            events.push(mk_event(
+                1000,
+                vec![],
+                None,
+                &[],
+                s,
+                vec![pb(200, "appB.exe", 30.0, 80)],
+            ));
+        }
+        let baseline = process_baseline(&events);
+        let a_base = baseline.get("appA.exe").unwrap();
+        assert_eq!(a_base.appearances, 3);
+        assert_eq!(a_base.typical_cpu, 50.0);
+
+        // 测试事件：appA.exe cpu=100（= typical 的 2×，>1.5）→ significant=true
+        //           appB.exe 在 baseline 中仅 1 次（appearances<3）→ significant=false（噪声）
+        let ev_culprits = vec![pb(1, "appA.exe", 100.0, 200), pb(2, "appB.exe", 30.0, 80)];
+        let ev = mk_event(1500, vec![], None, &[], Sample::default(), ev_culprits);
+        let flags = deviation_flags(&ev, &baseline);
+        let a = flags.iter().find(|(n, _, _)| n == "appA.exe").unwrap();
+        assert_eq!(a.2, true);
+        assert!((a.1 - 2.0).abs() < 1e-6, "multiple 应为 100/50=2.0，实际 {}", a.1);
+        let bb = flags.iter().find(|(n, _, _)| n == "appB.exe").unwrap();
+        assert_eq!(bb.2, false, "appearances<3 应标为噪声不显著");
+    }
+
+    #[test]
+    fn rc8_cooccurrence_pairs_count_and_order() {
+        let pb = |pid: u32, name: &str| ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: 10.0,
+            mem_used_mb: 50,
+        };
+        // 事件1: A+B+C；事件2: A+B；事件3: A+B → A+B 共现 3 次，A+C / B+C 各 1 次
+        let ev1 = mk_event(
+            1000,
+            vec![],
+            None,
+            &[],
+            Sample::default(),
+            vec![pb(1, "appA.exe"), pb(2, "appB.exe"), pb(3, "appC.exe")],
+        );
+        let ev2 = mk_event(
+            1000,
+            vec![],
+            None,
+            &[],
+            Sample::default(),
+            vec![pb(4, "appA.exe"), pb(5, "appB.exe")],
+        );
+        let ev3 = mk_event(
+            1000,
+            vec![],
+            None,
+            &[],
+            Sample::default(),
+            vec![pb(6, "appA.exe"), pb(7, "appB.exe")],
+        );
+        let pairs = cooccurrence_pairs(&[ev1, ev2, ev3]);
+        let ab = pairs
+            .iter()
+            .find(|p| {
+                (p.pair.0 == "appA.exe" && p.pair.1 == "appB.exe")
+                    || (p.pair.0 == "appB.exe" && p.pair.1 == "appA.exe")
+            })
+            .unwrap();
+        assert_eq!(ab.count, 3);
+        // 按 count 降序，最大频次排首，且无序对已排序（a<=b）
+        assert_eq!(pairs[0].count, 3);
+        assert!(pairs[0].pair.0 <= pairs[0].pair.1);
+    }
+
+    #[test]
+    fn rc9_cause_chain_orders_by_first_touch() {
+        let e = mk_event(
+            2000,
+            vec![CauseKind::MemLow, CauseKind::DiskBusy],
+            Some(CauseKind::MemLow),
+            &[(CauseKind::MemLow, 0), (CauseKind::DiskBusy, 1200)],
+            Sample::default(),
+            vec![],
+        );
+        assert_eq!(cause_chain(&e), vec![CauseKind::MemLow, CauseKind::DiskBusy]);
+    }
+
+    #[test]
+    fn rc11_confidence_single_cause_is_high() {
+        let e = mk_event(
+            2000,
+            vec![CauseKind::CpuHigh],
+            Some(CauseKind::CpuHigh),
+            &[],
+            Sample::default(),
+            vec![],
+        );
+        let (conf, label) = root_cause_confidence(&e);
+        assert_eq!(conf, 0.9);
+        assert_eq!(label, "高");
+    }
+
+    #[test]
+    fn rc11_confidence_multi_leading_primary_is_highish() {
+        // primary(CpuHigh) 首触 0，次因(DiskBusy) 首触 1500 → Δt=1500>=1000 → 0.7 较高
+        let mut s = Sample::default();
+        s.cpu_usage = 100.0;
+        s.disk_busy_percent = 50.0;
+        let e = mk_event(
+            2000,
+            vec![CauseKind::CpuHigh, CauseKind::DiskBusy],
+            Some(CauseKind::CpuHigh),
+            &[(CauseKind::CpuHigh, 0), (CauseKind::DiskBusy, 1500)],
+            s,
+            vec![],
+        );
+        let (conf, label) = root_cause_confidence(&e);
+        assert_eq!(conf, 0.7);
+        assert_eq!(label, "较高");
+    }
+
+    #[test]
+    fn rc11_confidence_multi_overlapping_is_low() {
+        // primary 与次因首触重叠（均为 0），强度比 0.5/0.5=1.0 < 1.5 → 0.35，标签含"多因并发"
+        let mut s = Sample::default();
+        s.cpu_usage = 50.0;
+        s.disk_busy_percent = 50.0;
+        let e = mk_event(
+            2000,
+            vec![CauseKind::CpuHigh, CauseKind::DiskBusy],
+            Some(CauseKind::CpuHigh),
+            &[(CauseKind::CpuHigh, 0), (CauseKind::DiskBusy, 0)],
+            s,
+            vec![],
+        );
+        let (conf, label) = root_cause_confidence(&e);
+        assert_eq!(conf, 0.35);
+        assert!(label.contains("多因并发"));
+    }
+
+    #[test]
+    fn rc12_detect_core_high_cpu_and_thermal_and_clean() {
+        let cfg = DetectionConfig::default();
+        // 高 CPU（其余指标正常：可用内存充足、使用率/提交均安全）→ 仅含 "CPU usage"
+        let mut s = Sample::default();
+        s.cpu_usage = 95.0;
+        s.mem_available_mb = 8000;
+        s.mem_usage_percent = 30.0;
+        s.commit_limit = 1_000_000;
+        s.commit_bytes = 100_000;
+        let out = detect_core(&s, &cfg);
+        assert!(
+            out.iter().any(|c| c.contains("CPU usage")),
+            "高 CPU 应包含 CPU usage: {:?}",
+            out
+        );
+
+        // 全正常 sample（所有指标在阈值内）→ 空
+        let mut normal = Sample::default();
+        normal.cpu_usage = 30.0;
+        normal.mem_available_mb = 8000;
+        normal.mem_usage_percent = 30.0;
+        normal.commit_limit = 1_000_000;
+        normal.commit_bytes = 100_000;
+        normal.page_reads_per_sec = 0.0;
+        assert!(
+            detect_core(&normal, &cfg).is_empty(),
+            "全正常应为空: {:?}",
+            detect_core(&normal, &cfg)
+        );
+
+        // Thermal：温度高 + 频率读数 + 负载高 → 含 "Thermal throttle"
+        let mut hot = Sample::default();
+        hot.cpu_temp = Some(95.0);
+        hot.cpu_freq_mhz = Some(2000.0);
+        hot.cpu_usage = 80.0;
+        hot.mem_available_mb = 8000;
+        hot.mem_usage_percent = 30.0;
+        let out2 = detect_core(&hot, &cfg);
+        assert!(
+            out2.iter().any(|c| c.contains("Thermal throttle")),
+            "温度降频应包含 Thermal throttle: {:?}",
+            out2
+        );
+    }
+
+    #[test]
+    fn rc13_cluster_profiles_and_match() {
+        let pb = |pid: u32, name: &str| ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: 10.0,
+            mem_used_mb: 50,
+        };
+        // 2 个同 signature 事件：CpuHigh + appA.exe + 中桶(2000/3000ms)
+        let mk = |dur: u64| {
+            let mut s = Sample::default();
+            s.cpu_usage = 95.0;
+            mk_event(
+                dur,
+                vec![CauseKind::CpuHigh],
+                Some(CauseKind::CpuHigh),
+                &[],
+                s,
+                vec![pb(1, "appA.exe")],
+            )
+        };
+        let e1 = mk(2000);
+        let e2 = mk(3000);
+        // 1 个不同：MemLow + appB.exe + 长桶(8000ms)
+        let mut s3 = Sample::default();
+        s3.mem_usage_percent = 95.0;
+        let e3 = mk_event(
+            8000,
+            vec![CauseKind::MemLow],
+            Some(CauseKind::MemLow),
+            &[],
+            s3,
+            vec![pb(2, "appB.exe")],
+        );
+        let profiles = cluster_profiles(&[e1.clone(), e2.clone(), e3.clone()]);
+        // 2 个不同 signature；CpuHigh+appA+中 出现 2 次
+        assert_eq!(profiles.len(), 2);
+        let sig = signature_of(&e1);
+        let prof = profiles.iter().find(|p| p.signature == sig).unwrap();
+        assert!(prof.count >= 2);
+        assert_eq!(prof.count, 2);
+        assert!((prof.avg_duration_ms - 2500.0).abs() < 1e-9);
+
+        // 对 e1（已知画像）→ Some 且含"匹配已知画像"
+        let m = match_profile(&e1, &profiles);
+        assert!(m.is_some());
+        assert!(m.unwrap().contains("匹配已知画像"));
+
+        // 对 e3（仅 1 次，非已知）→ None
+        assert!(match_profile(&e3, &profiles).is_none());
     }
 }
