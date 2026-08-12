@@ -75,8 +75,18 @@
       `types.rs` 加 `ui_freeze_timeout_ms`（默认 200，供 F-RC12 what-if）+ `PREFIX_TO_KIND` 补
       `UiFrozen` 映射。3 单测覆盖触发/不触发/不进热路径，`rtk cargo test` 282 全过、`release` 零警告；
       code-review 两轴通过（复审修复误报 bug）。service 重装生效同 F-RC1（UAC 被封，部署留手动）。
-- [ ] **F-RC4 温度→降频根因** — 数据源改为 `cpu_temp` + `cpu_freq_mhz` 掉档判据
+- [x] **F-RC4 温度→降频根因** — 数据源改为 `cpu_temp` + `cpu_freq_mhz` 掉档判据
       （`gpu_temp` 从未填充，不纳入），新增 `ThermalThrottle` cause（温度高 + 疑似降频）
+      > 实现：`types.rs` 加 `thermal_threshold_celsius`(默认 85℃)/`thermal_freq_drop_ratio`
+      > (默认 0.85) 配置+serde(default)+`PREFIX_TO_KIND` 补 `("Thermal throttle",
+      > ThermalThrottle)` 映射；`detector.rs` 加 `freq_peak`（近期 CPU 频率峰值基线，max 不衰减）
+      > + `thermal_active` 状态，`check_hard_thresholds` 用 `hot && dropped && load`
+      > （温度>阈值 且 当前频率<峰值×比例 且 cpu_usage>50% 负载下限，常量
+      > `THERMAL_LOAD_MIN_USAGE`）三条件直接重算触发 `ThermalThrottle` cause（gpu_temp
+      > 不参与）；4 单测覆盖触发/温度低不触发/频率未掉档不触发/无频率读数不触发。
+      > code-review 两轴通过（Standards 指出滞回块 `else if` 为激活条件补集等价 `else` +
+      > 50 魔数，已简化为三条件重算+命名常量）。`rtk cargo test` 287 全过、release 零警告。
+      > service 重装生效同 F-RC1（UAC 被封，部署留手动）。
 - [ ] **F-RC5 主因判定 + 加权** — 权重 `duration × 主因信号强度`（**不乘 severity**，severity=并发 cause 数会重复计数），
       替代平权 COUNT；`primary_cause` 直接作主因高亮
 - [ ] **F-RC6 因果方向** — 依赖 detector 落库**各 cause 首触时刻 / 事件 onset**（spike 是滑动基线+滞回，非静态阈值）；

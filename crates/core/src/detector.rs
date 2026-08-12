@@ -4,6 +4,11 @@ use chrono::Utc;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// F-RC4：降频判定所需的「负载下限」（CPU 使用率 %）。
+/// 降频仅在负载下才有归因意义——空闲时频率本就低（节能降频），不能算卡顿根因。
+/// 取 50% 是经验值：低于此不视为「负载下频率不升反降」。
+const THERMAL_LOAD_MIN_USAGE: f32 = 50.0;
+
 pub struct Detector {
     config: DetectionConfig,
     history: Vec<Sample>,
@@ -24,6 +29,9 @@ pub struct Detector {
     dpc_active: bool,
     interrupt_active: bool,
     ctx_switch_active: bool,
+    /// F-RC4 温度→降频根因滞回状态：温度高且 cpu_freq 掉档（疑似降频）则激活，
+    /// 温度回落或频率恢复则解除。仅在有温度/频率读数的 tick 更新（慢通道每 5 tick）。
+    thermal_active: bool,
     /// F-RC3 前台窗口冻结滞回状态：探测到前台窗口挂起则激活，响应则解除
     /// （低频探测，无中间带）。仅作为「伴随诊断」——绝不单独成 cause。
     ui_freeze_active: bool,
@@ -40,6 +48,10 @@ pub struct Detector {
     /// 下一帧 collect 是否需要构建 top_processes 快照。
     /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
     need_process_snapshot: bool,
+    /// F-RC4 近期观测到的 CPU 频率峰值（MHz），作为「频率掉档」判定基线。
+    /// 仅当 sample.cpu_freq_mhz 为 Some 时取 max 更新，不衰减——
+    /// 反映该机在负载下观测到的最高频率，即降频判定的参照点。
+    freq_peak: Option<f32>,
 }
 
 impl Detector {
@@ -57,12 +69,14 @@ impl Detector {
             dpc_active: false,
             interrupt_active: false,
             ctx_switch_active: false,
+            thermal_active: false,
             ui_freeze_active: false,
             last_ui_probe: None,
             ui_probe: Box::new(probe_foreground_window_frozen),
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
+            freq_peak: None,
         }
     }
 
@@ -75,6 +89,10 @@ impl Detector {
         self.history.push(sample.clone());
         if self.history.len() > 120 {
             self.history.remove(0);
+        }
+        // F-RC4：更新近期 CPU 频率峰值（降频判定基线），仅在有读数时取 max。
+        if let Some(f) = sample.cpu_freq_mhz {
+            self.freq_peak = Some(self.freq_peak.map_or(f, |p| p.max(f)));
         }
 
         let mut causes = Vec::new();
@@ -341,6 +359,40 @@ impl Detector {
             causes.push(format!(
                 "Context switches {:.0}/s > {:.0}/s",
                 sample.context_switches_per_sec, self.config.context_switch_threshold_per_sec
+            ));
+        }
+
+        // ===== F-RC4 温度→降频根因 =====
+        // 数据源：cpu_temp + cpu_freq_mhz（均来自 collector 慢通道，每 5 tick 采集一次；
+        // gpu_temp 恒为 None 不纳入）。判据：温度 > 阈值 **且** 当前频率明显低于近期峰值
+        // （疑似降频）**且** 负载存在——三者同时成立才记 ThermalThrottle。
+        // 单一高温但频率正常 ≠ 降频（可能是短时满载未触发降频）；频率掉但温度不高也忽略。
+        let has_thermal = sample.cpu_temp.is_some() && sample.cpu_freq_mhz.is_some();
+        if has_thermal {
+            let t = sample.cpu_temp.unwrap();
+            let f = sample.cpu_freq_mhz.unwrap();
+            // 降频仅在负载下才有归因意义：负载不足时不计入（见 THERMAL_LOAD_MIN_USAGE）。
+            let load = sample.cpu_usage > THERMAL_LOAD_MIN_USAGE;
+            let hot = t > self.config.thermal_threshold_celsius;
+            let dropped = self
+                .freq_peak
+                .map_or(false, |peak| peak > 0.0 && f < peak * self.config.thermal_freq_drop_ratio);
+            // 有读数 tick 直接按三条件重算（无滞回中间带）：三者同成立才激活，否则解除。
+            // 非读数 tick（has_thermal=false）跳过本块，沿用上次 thermal_active 状态。
+            self.thermal_active = hot && dropped && load;
+        }
+        if self.thermal_active && sample.cpu_temp.is_some() {
+            let t = sample.cpu_temp.unwrap();
+            let f = sample.cpu_freq_mhz.unwrap_or(0.0);
+            let peak = self.freq_peak.unwrap_or(f);
+            let drop = if peak > 0.0 {
+                ((1.0 - f / peak) * 100.0) as i32
+            } else {
+                0
+            };
+            causes.push(format!(
+                "Thermal throttle: CPU {:.0}°C, freq {:.0}MHz < {:.0}MHz (drop {}%)",
+                t, f, peak, drop
             ));
         }
 
@@ -779,6 +831,100 @@ mod tests {
             event.cause_kinds.contains(&CauseKind::ContextSwitchStorm),
             "cause_kinds 应含 ContextSwitchStorm，got: {:?}",
             event.cause_kinds
+        );
+    }
+
+    /// F-RC4 辅助：构造带温度/频率的样本（慢通道每 5 tick 才有读数，测试直接给定）。
+    fn make_sample_thermal(
+        cpu: f32,
+        mem_avail_mb: u64,
+        cpu_temp: Option<f32>,
+        cpu_freq_mhz: Option<f32>,
+    ) -> Sample {
+        let mut s = make_sample(cpu, mem_avail_mb, 10.0);
+        s.cpu_temp = cpu_temp;
+        s.cpu_freq_mhz = cpu_freq_mhz;
+        s
+    }
+
+    /// F-RC4：温度高 + 频率掉档（低于近期峰值×比例）+ 负载存在 → 触发 ThermalThrottle。
+    #[test]
+    fn analyze_thermal_throttle_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 先喂一个高频率样本建立 freq_peak 基线（=3000MHz）
+        d.analyze(&make_sample_thermal(80.0, 2000, Some(70.0), Some(3000.0)));
+        // 再喂：温度 95°C（>85）+ 频率掉到 2000（<3000×0.85=2550）+ 负载 80% → 触发
+        let hot = make_sample_thermal(80.0, 2000, Some(95.0), Some(2000.0));
+        d.analyze(&hot);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Thermal throttle")),
+            "温度高+频率掉档应触发 ThermalThrottle，got: {:?}",
+            d.current_causes
+        );
+
+        for _ in 0..2 {
+            d.analyze(&hot);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample_thermal(20.0, 2000, Some(95.0), Some(2000.0))).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::ThermalThrottle),
+            "cause_kinds 应含 ThermalThrottle，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC4：温度低于阈值 → 不触发（即便频率掉档）。
+    #[test]
+    fn analyze_thermal_no_trigger_when_temp_low() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample_thermal(80.0, 2000, Some(70.0), Some(3000.0))); // peak=3000
+        let cool = make_sample_thermal(80.0, 2000, Some(60.0), Some(2000.0)); // 温度低
+        d.analyze(&cool);
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Thermal throttle")),
+            "温度低不应触发 ThermalThrottle，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// F-RC4：温度高但频率未掉档（=峰值）→ 不触发（单一高温不算降频）。
+    #[test]
+    fn analyze_thermal_no_trigger_when_freq_not_dropped() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample_thermal(80.0, 2000, Some(70.0), Some(3000.0))); // peak=3000
+        let hot_boosted = make_sample_thermal(80.0, 2000, Some(95.0), Some(3000.0)); // 温度高且频率满
+        d.analyze(&hot_boosted);
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Thermal throttle")),
+            "温度高但频率未掉档不应触发，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// F-RC4：无频率读数（cpu_freq_mhz=None，慢通道非采样 tick）→ 不触发，避免误报。
+    #[test]
+    fn analyze_thermal_no_trigger_when_no_freq() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 温度高但频率始终为 None → freq_peak 无法建立，不可能判定掉档
+        let no_freq = make_sample_thermal(80.0, 2000, Some(95.0), None);
+        d.analyze(&no_freq);
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Thermal throttle")),
+            "无频率读数不应触发 ThermalThrottle，got: {:?}",
+            d.current_causes
         );
     }
 

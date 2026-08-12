@@ -193,8 +193,10 @@ impl std::fmt::Display for Severity {
 /// 便于旧库回读与新库直接 `GROUP BY`。`cause_kinds` 映射随检测器改造分批补齐：
 /// - F-RC1：CpuHigh / CpuSpike / MemLow / DiskSpike / NetSpike
 /// - F-RC2（本项）：DiskBusy / DpcInterrupt / InterruptStorm / ContextSwitchStorm
-/// - 尚未落地映射：`GpuHigh`（检测器未产出 GPU cause）、`ThermalThrottle`（F-RC4）、
-///   `UiFrozen`（F-RC3）——这些槽位已预留，对应检测器改造后 `from_cause` 即生效。
+/// - F-RC3：UiFrozen
+/// - F-RC4：ThermalThrottle（温度高 + cpu_freq 掉档，gpu_temp 不纳入）
+/// - 尚未落地映射：`GpuHigh`（检测器未产出 GPU cause）——该槽位已预留，
+///   对应检测器改造后 `from_cause` 即生效。
 /// 检测器一旦产出对应 cause，即可直接落入 `cause_kinds`。
 ///
 /// 注：`CpuSpike` 对齐 `cause_key()` 现有 `"CPU spike"` key——PRD §3.3 枚举清单未列，
@@ -231,6 +233,7 @@ const PREFIX_TO_KIND: &[(&str, CauseKind)] = &[
     ("DPC time", CauseKind::DpcInterrupt),
     ("Interrupt time", CauseKind::InterruptStorm),
     ("Context switches", CauseKind::ContextSwitchStorm),
+    ("Thermal throttle", CauseKind::ThermalThrottle),
     ("UI frozen", CauseKind::UiFrozen),
     ("Network", CauseKind::NetSpike),
     ("Memory usage", CauseKind::MemLow),
@@ -246,8 +249,8 @@ impl CauseKind {
     /// 旧事件 `cause_kinds` 为空时，reader 用本函数把自由文本 `causes`
     /// **可靠回填**为枚举（精确映射，非脆弱关键词猜测，见 PRD §3.1）。
     /// 返回 `None` 表示该 cause 文本尚无对应枚举（如尚未落地的
-    /// `GpuHigh` / `ThermalThrottle` 等，待 F-RC4 补齐映射；`UiFrozen`
-    /// 已在 F-RC3 映射，`DiskBusy` 等已在 F-RC2 映射）。
+    /// `GpuHigh`——该槽位已预留待后续检测器改造补齐；`UiFrozen` 已在 F-RC3
+    /// 映射，`ThermalThrottle` 已在 F-RC4 映射，`DiskBusy` 等已在 F-RC2 映射）。
     pub fn from_cause(cause: &str) -> Option<CauseKind> {
         for (prefix, kind) in PREFIX_TO_KIND {
             if cause.starts_with(prefix) {
@@ -352,6 +355,16 @@ pub struct DetectionConfig {
     /// （2s 限频）探测的常态开销极小，不会进入采集热路径。供 F-RC12 what-if 调参。
     #[serde(default = "default_ui_freeze_timeout_ms")]
     pub ui_freeze_timeout_ms: u32,
+    // ===== F-RC4 温度→降频根因阈值 =====
+    /// 温度降频阈值（℃）：`cpu_temp` 超过即视为「温度高」，进入降频判定。
+    /// `gpu_temp` 从未填充（collector 恒为 None），不纳入。
+    #[serde(default = "default_thermal_threshold_celsius")]
+    pub thermal_threshold_celsius: f32,
+    /// 频率掉档比例（0~1）：当前 `cpu_freq_mhz` 低于近期观测峰值 × 该比例
+    /// 即视为「疑似降频」（负载下频率不升反降）。与高温**同时**成立才记
+    /// `ThermalThrottle` cause（单一高温但频率正常不算降频）。
+    #[serde(default = "default_thermal_freq_drop_ratio")]
+    pub thermal_freq_drop_ratio: f32,
 }
 
 impl Default for DetectionConfig {
@@ -374,6 +387,8 @@ impl Default for DetectionConfig {
             context_switch_threshold_per_sec: 50_000.0,
             sys_signal_hysteresis_ratio: 0.5,
             ui_freeze_timeout_ms: 200,
+            thermal_threshold_celsius: 85.0,
+            thermal_freq_drop_ratio: 0.85,
         }
     }
 }
@@ -407,6 +422,14 @@ fn default_sys_signal_hysteresis_ratio() -> f32 {
 }
 fn default_ui_freeze_timeout_ms() -> u32 {
     200
+}
+
+// F-RC4 温度→降频根因阈值默认值
+fn default_thermal_threshold_celsius() -> f32 {
+    85.0
+}
+fn default_thermal_freq_drop_ratio() -> f32 {
+    0.85
 }
 
 /// 采样配置
@@ -708,6 +731,9 @@ mod tests {
         assert_eq!(c.context_switch_threshold_per_sec, 50_000.0);
         assert_eq!(c.sys_signal_hysteresis_ratio, 0.5);
         assert_eq!(c.ui_freeze_timeout_ms, 200);
+        // F-RC4 温度→降频根因阈值默认值
+        assert_eq!(c.thermal_threshold_celsius, 85.0);
+        assert_eq!(c.thermal_freq_drop_ratio, 0.85);
     }
 
     #[test]
@@ -878,11 +904,10 @@ mod tests {
 
     #[test]
     fn cause_kind_from_cause_none_for_unmapped() {
-        // F-RC3 的 UiFrozen 已在 PREFIX_TO_KIND 映射（见下方 maps_ui_frozen 用例）；
-        // 这里验证尚未落地的 GpuHigh / ThermalThrottle 仍返回 None，不臆造枚举，
-        // 避免 R2「分类不连续」。
+        // F-RC3 的 UiFrozen、F-RC4 的 ThermalThrottle 已在 PREFIX_TO_KIND 映射
+        // （见下方 maps_ui_frozen / maps_thermal_throttle 用例）；
+        // 这里仅验证尚未落地的 GpuHigh 仍返回 None，不臆造枚举，避免 R2「分类不连续」。
         assert_eq!(CauseKind::from_cause("GPU usage 99%"), None);
-        assert_eq!(CauseKind::from_cause("Thermal throttle 95C"), None);
         // 完全无关文本也返回 None
         assert_eq!(CauseKind::from_cause("something else"), None);
     }
@@ -893,6 +918,15 @@ mod tests {
         assert_eq!(
             CauseKind::from_cause("UI frozen (前台窗口无响应 200ms)"),
             Some(CauseKind::UiFrozen)
+        );
+    }
+
+    #[test]
+    fn cause_kind_from_cause_maps_thermal_throttle() {
+        // F-RC4：温度降频 cause 文本应映射到 ThermalThrottle 枚举。
+        assert_eq!(
+            CauseKind::from_cause("Thermal throttle: CPU 95°C, freq 2000MHz < 3000MHz (drop 33%)"),
+            Some(CauseKind::ThermalThrottle)
         );
     }
 
