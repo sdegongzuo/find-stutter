@@ -1,7 +1,7 @@
-use crate::types::{DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
+use crate::types::{cause_key, CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
 use chrono::Utc;
 use std::collections::HashMap;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct Detector {
     config: DetectionConfig,
@@ -20,6 +20,9 @@ pub struct Detector {
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
+    /// 各 cause（按 `CauseKind`）首次出现的时刻（SystemTime），用于落库首触时刻
+    /// 与 F-RC6 因果方向（触发者 vs 放大器）。随 `current_causes` 一起在卡顿结束时清空。
+    current_cause_first_touch: HashMap<CauseKind, SystemTime>,
     /// 下一帧 collect 是否需要构建 top_processes 快照。
     /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
     need_process_snapshot: bool,
@@ -38,6 +41,7 @@ impl Detector {
             net_spike_active: false,
             mem_spike_active: false,
             current_culprits: HashMap::new(),
+            current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
         }
     }
@@ -63,6 +67,7 @@ impl Detector {
             // 峰值归因靠后续帧的累积取 max 兜底（current_culprits 按 pid 取最大），
             // 因此这是可接受的；从第二帧起进程快照才开始累积。
             self.need_process_snapshot = true;
+            let now = SystemTime::now();
             // 累积当前样本 top 进程（卡顿元凶候选）：同 pid 取最大 CPU / 内存用量
             for p in &sample.top_processes {
                 let entry = self
@@ -73,8 +78,14 @@ impl Detector {
                 entry.mem_used_mb = entry.mem_used_mb.max(p.mem_used_mb);
             }
             if self.stutter_start.is_none() {
-                self.stutter_start = Some(SystemTime::now());
+                self.stutter_start = Some(now);
                 self.current_causes = causes;
+                // 记录每个 cause 的首触时刻（按 CauseKind 去重）
+                for c in &self.current_causes {
+                    if let Some(k) = CauseKind::from_cause(c) {
+                        self.current_cause_first_touch.entry(k).or_insert(now);
+                    }
+                }
             } else {
                 for c in causes {
                     // 按 cause 类型去重：同类型（如 Commit charge / CPU usage）更新为最新文案，
@@ -86,7 +97,12 @@ impl Detector {
                     {
                         self.current_causes[pos] = c;
                     } else {
+                        // 新出现的 cause：先取其 CauseKind（在 move 之前借用），再 push
+                        let k = CauseKind::from_cause(&c);
                         self.current_causes.push(c);
+                        if let Some(k) = k {
+                            self.current_cause_first_touch.entry(k).or_insert(now);
+                        }
                     }
                 }
             }
@@ -97,15 +113,49 @@ impl Detector {
 
             if duration_ms >= self.config.sustained_seconds as u64 * 1000 {
                 let culprits = self.extract_culprits();
+                // 首触时刻：相对 onset（卡顿起点）的偏移毫秒
+                let cause_first_touch: HashMap<CauseKind, i64> = self
+                    .current_cause_first_touch
+                    .iter()
+                    .map(|(k, t)| {
+                        let off = t
+                            .duration_since(start)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        (*k, off)
+                    })
+                    .collect();
+                // 结构化根因（对齐 CauseKind；按 current_causes 顺序去重）
+                let mut cause_kinds: Vec<CauseKind> = self
+                    .current_causes
+                    .iter()
+                    .filter_map(|c| CauseKind::from_cause(c))
+                    .collect();
+                cause_kinds.dedup();
+                // 按首触时刻升序（最早触发者在前）：F-RC1 主因取首触最早者，
+                // 同时让 cause_kinds 顺序即「触发者→放大器」走向，供 F-RC9 因果链使用；
+                // F-RC5 将在此基础上按信号强度×持续细化加权。
+                cause_kinds.sort_by_key(|k| cause_first_touch.get(k).copied().unwrap_or(0));
+                let primary_cause = cause_kinds.first().copied();
+                let onset_ts = start
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
                 let event = StutterEvent {
+                    id: 0,
                     timestamp: Utc::now(),
                     duration_ms,
                     severity: Self::determine_severity(&self.current_causes, duration_ms),
                     causes: self.current_causes.clone(),
+                    cause_kinds,
+                    primary_cause,
+                    cause_first_touch,
+                    onset_ts: Some(onset_ts),
                     snapshot: sample.clone(),
                     culprits,
                 };
                 self.current_causes.clear();
+                self.current_cause_first_touch.clear();
                 // 卡顿已结束：下一帧 collect 不再需要进程快照。
                 // 时序权衡见上方 causes 分支：analyze 设置的标志影响下一帧。
                 self.need_process_snapshot = false;
@@ -113,6 +163,7 @@ impl Detector {
             }
             self.current_causes.clear();
             self.current_culprits.clear();
+            self.current_cause_first_touch.clear();
             // 卡顿不足 sustained 秒即结束：同样不再需要下一帧进程快照。
             self.need_process_snapshot = false;
             None
@@ -347,29 +398,6 @@ fn avg(v: &[f32]) -> f32 {
     }
 }
 
-/// cause 的稳定类型 key：按已知前缀匹配，用于同类型去重/更新。
-/// 滞回带内文案数值会变化（"CPU usage 85%（滞回保持…）" vs "CPU usage 95% > 90%"），
-/// 但类型 key 不变；CPU 硬阈值与 CPU spike 是不同的 cause（key 不同）。
-fn cause_key(cause: &str) -> &str {
-    const PREFIXES: [&str; 9] = [
-        "CPU usage",
-        "CPU spike",
-        "Disk write",
-        "Network",
-        "Memory usage",
-        "Memory available",
-        "Available memory",
-        "Commit charge",
-        "Memory paging",
-    ];
-    for p in PREFIXES {
-        if cause.starts_with(p) {
-            return p;
-        }
-    }
-    cause
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +596,42 @@ mod tests {
         // Causes should be cleared since stutter was too short
         assert!(d.current_causes.is_empty());
         assert!(d.stutter_start.is_none());
+    }
+
+    /// F-RC1：事件应携带结构化根因（cause_kinds / primary_cause / onset_ts /
+    /// cause_first_touch），对齐 `CauseKind` 枚举。
+    #[test]
+    fn analyze_event_carries_structured_causes() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let high = make_sample(95.0, 2000, 10.0);
+        for _ in 0..3 {
+            d.analyze(&high);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+
+        // 结构化根因应含 CpuHigh，且 primary_cause 为 CpuHigh（首个检测到的 cause）
+        assert!(
+            event.cause_kinds.contains(&CauseKind::CpuHigh),
+            "cause_kinds 应含 CpuHigh: {:?}",
+            event.cause_kinds
+        );
+        assert_eq!(event.primary_cause, Some(CauseKind::CpuHigh));
+        // onset_ts 应已落库（Unix 毫秒，落在合理范围）
+        let onset = event.onset_ts.expect("onset_ts 应已落库");
+        assert!(
+            onset > 1_700_000_000_000,
+            "onset_ts 应为合理 Unix 毫秒: {}",
+            onset
+        );
+        // 首触时刻应记录 CpuHigh（偏移 0，因为是首个 cause）
+        assert_eq!(
+            event.cause_first_touch.get(&CauseKind::CpuHigh).copied(),
+            Some(0)
+        );
     }
 
     // --- analyze: severity via cause count ---

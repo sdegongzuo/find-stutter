@@ -259,6 +259,7 @@ fn logger_event_count_tracking() {
         causes: vec!["CPU High".to_string()],
         snapshot: Sample::default(),
         culprits: vec![],
+        ..Default::default()
     };
 
     logger.write_event(&event).unwrap();

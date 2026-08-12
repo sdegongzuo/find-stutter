@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use find_stutter_core::logger::LatestSampleSummary;
-use find_stutter_core::{Config, ProcessBrief, StutterEvent};
+use find_stutter_core::{CauseKind, Config, ProcessBrief, StutterEvent};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
@@ -190,28 +190,39 @@ impl DbReader {
         // overlay 只展示「上次卡顿时间」：轻量路径（want_event_detail == false）只取
         // timestamp 列，避免每 tick 反序列化 snapshot/culprits 两个大 JSON 字段。
         let event: Option<StutterEvent> = if want_event_detail {
-            let has_culprits: bool = conn
+            let columns: Vec<String> = conn
                 .prepare("PRAGMA table_info(stutter_events)")
                 .and_then(|mut stmt| {
                     let names: Vec<String> = stmt
                         .query_map([], |row| row.get::<_, String>(1))?
                         .collect::<Result<Vec<_>, _>>()?;
-                    Ok(names.iter().any(|n| n == "culprits"))
+                    Ok(names)
                 })
-                .unwrap_or(false);
-            let event_sql = if has_culprits {
-                "SELECT timestamp, duration_ms, severity, causes, snapshot, culprits \
-                 FROM stutter_events ORDER BY id DESC LIMIT 1"
-            } else {
-                "SELECT timestamp, duration_ms, severity, causes, snapshot \
-                 FROM stutter_events ORDER BY id DESC LIMIT 1"
-            };
-            conn.query_row(event_sql, [], |row| {
-                let ts_str: String = row.get(0)?;
-                let duration_ms: i64 = row.get(1)?;
-                let severity_str: String = row.get(2)?;
-                let causes_str: String = row.get(3)?;
-                let snapshot_str: String = row.get(4)?;
+                .unwrap_or_default();
+            let has_culprits = columns.iter().any(|n| n == "culprits");
+            // F-RC1 新列：检测是否存在（与 culprits 同理）。四列随同一迁移批次写入，
+            // 存在性以 lead 列 cause_kinds 代表即可，缺失则回退默认值。
+            let has_cause_kinds = columns.iter().any(|n| n == "cause_kinds");
+
+            let mut select =
+                "id, timestamp, duration_ms, severity, causes, snapshot".to_string();
+            if has_culprits {
+                select.push_str(", culprits");
+            }
+            if has_cause_kinds {
+                select.push_str(", cause_kinds, primary_cause, cause_first_touch, onset_ts");
+            }
+            let event_sql = format!(
+                "SELECT {} FROM stutter_events ORDER BY id DESC LIMIT 1",
+                select
+            );
+            conn.query_row(&event_sql, [], |row| {
+                let id: i64 = row.get(0)?;
+                let ts_str: String = row.get(1)?;
+                let duration_ms: i64 = row.get(2)?;
+                let severity_str: String = row.get(3)?;
+                let causes_str: String = row.get(4)?;
+                let snapshot_str: String = row.get(5)?;
                 let timestamp = chrono::DateTime::parse_from_rfc3339(&ts_str)
                     .map(|d| d.with_timezone(&chrono::Utc))
                     .unwrap_or_else(|_| chrono::Utc::now());
@@ -224,20 +235,54 @@ impl DbReader {
                     serde_json::from_str(&causes_str).unwrap_or_default();
                 let snapshot: find_stutter_core::Sample =
                     serde_json::from_str(&snapshot_str).unwrap_or_default();
+                let mut idx = 6usize;
                 let culprits: Vec<ProcessBrief> = if has_culprits {
-                    let culprits_str: String = row.get(5)?;
+                    let culprits_str: String = row.get(idx)?;
+                    idx += 1;
                     serde_json::from_str(&culprits_str).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
-                Ok(StutterEvent {
+                let (cause_kinds, primary_cause, cause_first_touch, onset_ts) = if has_cause_kinds {
+                    let cause_kinds_str: String = row.get(idx)?;
+                    idx += 1;
+                    let primary_cause_str: String = row.get(idx)?;
+                    idx += 1;
+                    let cause_first_touch_str: String = row.get(idx)?;
+                    idx += 1;
+                    let onset_ts: Option<i64> = row.get(idx)?;
+                    (
+                        serde_json::from_str(&cause_kinds_str).unwrap_or_default(),
+                        serde_json::from_str(&primary_cause_str).unwrap_or_default(),
+                        serde_json::from_str(&cause_first_touch_str).unwrap_or_default(),
+                        onset_ts,
+                    )
+                } else {
+                    (Vec::new(), None, std::collections::HashMap::new(), None)
+                };
+                let mut event = StutterEvent {
+                    id,
                     timestamp,
                     duration_ms: duration_ms as u64,
                     severity,
                     causes,
+                    cause_kinds,
+                    primary_cause,
+                    cause_first_touch,
+                    onset_ts,
                     snapshot,
                     culprits,
-                })
+                };
+                // 旧库 cause_kinds 为空时用 cause_key 可靠回填（精确映射，非脆弱关键词）：
+                // 仅当结构化字段为空、但自由文本 causes 非空时触发（见 PRD §3.1）。
+                if event.cause_kinds.is_empty() && !event.causes.is_empty() {
+                    event.cause_kinds = event
+                        .causes
+                        .iter()
+                        .filter_map(|c| CauseKind::from_cause(c))
+                        .collect();
+                }
+                Ok(event)
             })
             .ok()
         } else {
@@ -253,11 +298,7 @@ impl DbReader {
                         .unwrap_or_else(|_| chrono::Utc::now());
                     Ok(StutterEvent {
                         timestamp,
-                        duration_ms: 0,
-                        severity: find_stutter_core::Severity::Minor,
-                        causes: Vec::new(),
-                        snapshot: find_stutter_core::Sample::default(),
-                        culprits: Vec::new(),
+                        ..Default::default()
                     })
                 },
             )
@@ -430,6 +471,7 @@ mod tests {
                     causes: vec!["test".into()],
                     snapshot: s,
                     culprits: vec![],
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -507,6 +549,7 @@ mod tests {
                 cpu_usage: 90.0,
                 mem_used_mb: 512,
             }],
+            ..Default::default()
         };
         logger.write_event(&ev).unwrap();
 
@@ -515,6 +558,122 @@ mod tests {
         assert_eq!(event.culprits.len(), 1);
         assert_eq!(event.culprits[0].pid, 777);
         assert_eq!(event.culprits[0].name, "hog.exe");
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// F-RC1：结构化根因字段（cause_kinds / primary_cause / onset_ts /
+    /// cause_first_touch / id）应能随事件落库并回读。
+    #[test]
+    fn poll_reads_cause_kinds_and_primary_cause() {
+        let db = unique_db("cause_kinds");
+        let cfg = StorageConfig {
+            db_path: db.clone(),
+            retention_days: 30,
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+
+        let mut s = Sample::default();
+        s.cpu_usage = 100.0;
+        let ev = find_stutter_core::StutterEvent {
+            timestamp: chrono::Utc::now(),
+            duration_ms: 5000,
+            severity: Severity::Major,
+            causes: vec![
+                "CPU usage 95.0% > 90.0%".into(),
+                "Available memory 100MB < 500MB".into(),
+            ],
+            snapshot: s,
+            cause_kinds: vec![CauseKind::CpuHigh, CauseKind::MemLow],
+            primary_cause: Some(CauseKind::CpuHigh),
+            onset_ts: Some(1_700_000_000_000),
+            cause_first_touch: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(CauseKind::CpuHigh, 0i64);
+                m.insert(CauseKind::MemLow, 1200i64);
+                m
+            },
+            ..Default::default()
+        };
+        logger.write_event(&ev).unwrap();
+
+        let reader = DbReader::new(&db);
+        let event = reader.poll().event.expect("应读到最近事件");
+        assert_eq!(event.id, 1, "应读出事件主键 id");
+        assert_eq!(
+            event.cause_kinds,
+            vec![CauseKind::CpuHigh, CauseKind::MemLow]
+        );
+        assert_eq!(event.primary_cause, Some(CauseKind::CpuHigh));
+        assert_eq!(event.onset_ts, Some(1_700_000_000_000));
+        assert_eq!(
+            event.cause_first_touch.get(&CauseKind::MemLow).copied(),
+            Some(1200)
+        );
+
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// 回归：旧库（stutter_events 无 cause_kinds 列）事件，cause_kinds 为空时
+    /// 用 `cause_key` 可靠回填（精确映射，非脆弱关键词），primary_cause 回退 None。
+    #[test]
+    fn poll_refills_cause_kinds_from_legacy_causes() {
+        let db = unique_db("legacy_cause_kinds");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE stutter_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                duration_ms INTEGER NOT NULL,
+                severity TEXT NOT NULL,
+                causes TEXT NOT NULL,
+                snapshot TEXT NOT NULL
+            );
+            CREATE TABLE service_heartbeat (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                timestamp TEXT NOT NULL,
+                pid INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                chrono::Utc::now().to_rfc3339(),
+                3000i64,
+                "major",
+                r#"["CPU usage 95.0% > 90.0%","Available memory 100MB < 500MB"]"#,
+                r#"{"cpu_usage":95.0}"#,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO service_heartbeat (id, timestamp, pid) VALUES (1, ?1, ?2)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339(), 0i64],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = DbReader::new(&db);
+        let event = reader.poll().event.expect("旧库事件应能读回");
+        assert_eq!(event.duration_ms, 3000);
+        // cause_kinds 无列 → 用 cause_key 可靠回填
+        assert!(
+            event.cause_kinds.contains(&CauseKind::CpuHigh),
+            "应回填 CpuHigh: {:?}",
+            event.cause_kinds
+        );
+        assert!(
+            event.cause_kinds.contains(&CauseKind::MemLow),
+            "应回填 MemLow: {:?}",
+            event.cause_kinds
+        );
+        assert_eq!(
+            event.primary_cause, None,
+            "旧库无 primary_cause 列应回退 None"
+        );
 
         std::fs::remove_file(&db).ok();
     }
@@ -593,6 +752,7 @@ mod tests {
                 cpu_usage: 90.0,
                 mem_used_mb: 512,
             }],
+            ..Default::default()
         };
         logger.write_event(&ev).unwrap();
 

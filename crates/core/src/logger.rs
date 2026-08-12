@@ -67,6 +67,21 @@ impl Logger {
             "ALTER TABLE stutter_events ADD COLUMN culprits TEXT NOT NULL DEFAULT '[]';",
         );
 
+        // 迁移（F-RC1）：结构化根因落库列。每条 ALTER 独立执行并忽略错误
+        // （SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，逐条吞错避免前一条报错
+        // 中止后续迁移）。列存在性由 reader 在读取时探测，缺失即回退默认值。
+        // - cause_kinds：结构化根因枚举数组（JSON）
+        // - primary_cause：主因枚举（JSON，可空）
+        // - cause_first_touch：各 cause 首触时刻偏移（JSON 对象，key 为枚举字符串）
+        // - onset_ts：事件 onset 时刻（Unix 毫秒，可空）
+        let _ = conn.execute_batch(
+            "ALTER TABLE stutter_events ADD COLUMN cause_kinds TEXT NOT NULL DEFAULT '[]';",
+        );
+        let _ = conn.execute_batch("ALTER TABLE stutter_events ADD COLUMN primary_cause TEXT;");
+        let _ = conn
+            .execute_batch("ALTER TABLE stutter_events ADD COLUMN cause_first_touch TEXT NOT NULL DEFAULT '{}';");
+        let _ = conn.execute_batch("ALTER TABLE stutter_events ADD COLUMN onset_ts INTEGER;");
+
         // 迁移：给历史库里的 samples 补 commit_bytes / commit_limit / page_reads_per_sec 列（旧库无此列）。
         // 每条 ALTER 独立执行并忽略错误——SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，
         // 若某列已存在则该条 ALTER 报错；若合并成一条 execute_batch，前一条报错会
@@ -160,9 +175,13 @@ impl Logger {
         let causes = serde_json::to_string(&event.causes)?;
         let snapshot = serde_json::to_string(&event.snapshot)?;
         let culprits = serde_json::to_string(&event.culprits)?;
+        let cause_kinds = serde_json::to_string(&event.cause_kinds)?;
+        let primary_cause = serde_json::to_string(&event.primary_cause)?;
+        let cause_first_touch = serde_json::to_string(&event.cause_first_touch)?;
+        let onset_ts = event.onset_ts.unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot, culprits)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot, culprits, cause_kinds, primary_cause, cause_first_touch, onset_ts)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 event.timestamp.to_rfc3339(),
                 event.duration_ms as i64,
@@ -170,6 +189,10 @@ impl Logger {
                 causes,
                 snapshot,
                 culprits,
+                cause_kinds,
+                primary_cause,
+                cause_first_touch,
+                onset_ts,
             ],
         )?;
         Ok(())
@@ -441,6 +464,7 @@ mod tests {
             causes: vec!["CPU usage 95.0% > 90.0%".to_string()],
             snapshot: make_sample(),
             culprits: vec![],
+            ..Default::default()
         }
     }
 

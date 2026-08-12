@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// 一次系统指标采样
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,8 +139,9 @@ impl ProcessBrief {
 }
 
 /// 卡顿严重程度
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Severity {
+    #[default]
     Minor,
     Major,
     Critical,
@@ -155,13 +157,105 @@ impl std::fmt::Display for Severity {
     }
 }
 
+/// 结构化根因枚举（F-RC1）。
+///
+/// 枚举值**直接对齐 `cause_key()` 的稳定类型 key**（不臆造），以字符串形式落库，
+/// 便于旧库回读与新库直接 `GROUP BY`。新增 cause（`DiskBusy` / `GpuHigh` /
+/// `ThermalThrottle` / `DpcInterrupt` / `InterruptStorm` / `ContextSwitchStorm` /
+/// `UiFrozen`）的 `from_cause` 映射随 F-RC2~F-RC4 检测器改造补齐；本枚举先把
+/// 槽位预留好，检测器一旦产出对应 cause 即可直接落入 `cause_kinds`。
+///
+/// 注：`CpuSpike` 对齐 `cause_key()` 现有 `"CPU spike"` key——PRD §3.3 枚举清单未列，
+/// 但 `cause_key()` 实际产出该 key，若丢弃会导致「纯 CPU spike」事件 `cause_kinds`
+/// 缺项，故显式补齐（保持与 `cause_key()` 严格一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CauseKind {
+    CpuHigh,
+    /// CPU 突增 spike（与 `CpuHigh` 区分：硬阈值 vs 滑动基线比率，见 `cause_key`）
+    CpuSpike,
+    MemLow,
+    DiskBusy,
+    DiskSpike,
+    GpuHigh,
+    ThermalThrottle,
+    DpcInterrupt,
+    InterruptStorm,
+    ContextSwitchStorm,
+    NetSpike,
+    UiFrozen,
+}
+
+/// 稳定类型 key → 结构化 `CauseKind` 的**单一映射表**。
+///
+/// `cause_key`（去重/更新用）与 `CauseKind::from_cause`（回填用）共用这一份前缀真相，
+/// 消除 R2「分类不连续」风险：新增前缀只改这里一处，漏改即在 `from_cause` 落空。
+/// 顺序无关紧要（各前缀互不嵌套），与历史 `detector.rs` 的 `PREFIXES` 顺序保持一致。
+const PREFIX_TO_KIND: &[(&str, CauseKind)] = &[
+    ("CPU usage", CauseKind::CpuHigh),
+    ("CPU spike", CauseKind::CpuSpike),
+    ("Disk write", CauseKind::DiskSpike),
+    ("Network", CauseKind::NetSpike),
+    ("Memory usage", CauseKind::MemLow),
+    ("Memory available", CauseKind::MemLow),
+    ("Available memory", CauseKind::MemLow),
+    ("Commit charge", CauseKind::MemLow),
+    ("Memory paging", CauseKind::MemLow),
+];
+
+impl CauseKind {
+    /// 从一条 cause 文本映射到结构化 `CauseKind`（基于稳定前缀 key）。
+    ///
+    /// 旧事件 `cause_kinds` 为空时，reader 用本函数把自由文本 `causes`
+    /// **可靠回填**为枚举（精确映射，非脆弱关键词猜测，见 PRD §3.1）。
+    /// 返回 `None` 表示该 cause 文本尚无对应枚举（如尚未落地的
+    /// `DiskBusy` / `UiFrozen` 等，待 F-RC2~F-RC4 补齐映射）。
+    pub fn from_cause(cause: &str) -> Option<CauseKind> {
+        for (prefix, kind) in PREFIX_TO_KIND {
+            if cause.starts_with(prefix) {
+                return Some(*kind);
+            }
+        }
+        None
+    }
+}
+
+/// cause 的稳定类型 key：按已知前缀匹配，用于同类型去重/更新与 `CauseKind` 映射。
+///
+/// 滞回带内文案数值会变化（"CPU usage 85%（滞回保持…）" vs "CPU usage 95% > 90%"），
+/// 但类型 key 不变；CPU 硬阈值与 CPU spike 是不同的 cause（key 不同）。原定义位于
+/// `detector.rs`，F-RC1 起统一迁移到 `types.rs`，与 `CauseKind::from_cause` 共用
+/// `PREFIX_TO_KIND` 同一份真相（消除 R2「分类不连续」风险）。
+pub fn cause_key(cause: &str) -> &str {
+    for (prefix, _) in PREFIX_TO_KIND {
+        if cause.starts_with(prefix) {
+            return prefix;
+        }
+    }
+    cause
+}
+
 /// 卡顿事件
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StutterEvent {
+    /// 事件主键（stutter_events 表 autoincrement id；in-memory 构造时默认 0，
+    /// 由 reader 从库读出真实值，供 F-RC10 钻取卡精准关联）
+    pub id: i64,
     pub timestamp: DateTime<Utc>,
     pub duration_ms: u64,
     pub severity: Severity,
+    /// 自由文本根因（保留作兜底/兼容旧库）
     pub causes: Vec<String>,
+    /// 结构化根因枚举（对齐 `CauseKind`；旧库无此列时为空，由 reader 用 `cause_key` 回填）
+    pub cause_kinds: Vec<CauseKind>,
+    /// 主因枚举（多因同发时按首触时刻最早者取第一；F-RC5 进一步按信号强度×持续细化权重）
+    pub primary_cause: Option<CauseKind>,
+    /// 各 cause 首触时刻（相对 onset 的偏移毫秒：0=与卡顿同时起点，正数=晚于起点），
+    /// 供 F-RC6 因果方向（触发者 vs 放大器）使用
+    pub cause_first_touch: HashMap<CauseKind, i64>,
+    /// 事件 onset 时刻（Unix 毫秒；≈ 卡顿真实起点 = timestamp - duration_ms），
+    /// 供 F-RC6 锚定分析窗口
+    pub onset_ts: Option<i64>,
     pub snapshot: Sample,
     /// 造成本次卡顿的进程（CPU / 内存维度 top 进程，去重最多 ~6 个）
     pub culprits: Vec<ProcessBrief>,
@@ -611,5 +705,132 @@ mod tests {
         let cloned = s.clone();
         assert_eq!(cloned.cpu_usage, 75.5);
         assert_eq!(cloned.cpu_per_core, vec![50.0, 60.0]);
+    }
+
+    // --- CauseKind / cause_key（F-RC1）---
+
+    #[test]
+    fn cause_kind_from_cause_maps_known_keys() {
+        // 对齐 cause_key() 现有稳定 key
+        assert_eq!(
+            CauseKind::from_cause("CPU usage 95.0% > 90%"),
+            Some(CauseKind::CpuHigh)
+        );
+        assert_eq!(
+            CauseKind::from_cause("CPU usage 85.0%（滞回保持，阈值 90%）"),
+            Some(CauseKind::CpuHigh)
+        );
+        assert_eq!(
+            CauseKind::from_cause("CPU spike: 1.0% → 3.0%"),
+            Some(CauseKind::CpuSpike)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Disk write spike: 1B/s → 3B/s"),
+            Some(CauseKind::DiskSpike)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Network spike: 1B/s → 3B/s"),
+            Some(CauseKind::NetSpike)
+        );
+        // 内存多口径归并为同一 MemLow
+        assert_eq!(
+            CauseKind::from_cause("Available memory 100MB < 500MB"),
+            Some(CauseKind::MemLow)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Memory usage 95.0% > 90%"),
+            Some(CauseKind::MemLow)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Memory paging 200.0/s > 50/s"),
+            Some(CauseKind::MemLow)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Commit charge 95.0% > 90%"),
+            Some(CauseKind::MemLow)
+        );
+    }
+
+    #[test]
+    fn cause_kind_from_cause_none_for_unmapped() {
+        // 尚未落地映射的 cause（如 F-RC2~F-RC4 的 DiskBusy/UiFrozen）暂返回 None，
+        // 不臆造枚举，避免 R2「分类不连续」。
+        assert_eq!(CauseKind::from_cause("Disk busy 98%"), None);
+        assert_eq!(CauseKind::from_cause("UI frozen 200ms"), None);
+        // 完全无关文本也返回 None
+        assert_eq!(CauseKind::from_cause("something else"), None);
+    }
+
+    #[test]
+    fn cause_key_relocated_groups_hysteresis_variants() {
+        // cause_key 已迁移到 types.rs，语义必须与原 detector 实现一致
+        assert_eq!(
+            cause_key("CPU usage 95.0% > 90%"),
+            cause_key("CPU usage 85.0%（滞回保持，阈值 90%）")
+        );
+        assert_eq!(
+            cause_key("Commit charge 95.0% > 90%"),
+            cause_key("Commit charge 85.0%")
+        );
+        assert_eq!(
+            cause_key("Memory paging 200.0/s > 50/s"),
+            cause_key("Memory paging 80.5/s > 50/s")
+        );
+        // 硬阈值与 spike 是不同 cause
+        assert_ne!(
+            cause_key("CPU usage 95.0% > 90%"),
+            cause_key("CPU spike: 1.0% → 3.0%")
+        );
+        assert_ne!(
+            cause_key("Disk write spike: 1B/s → 3B/s"),
+            cause_key("Network spike: 1B/s → 3B/s")
+        );
+        assert_ne!(
+            cause_key("Memory available spike: 1MB → 3MB"),
+            cause_key("Available memory 100MB < 500MB")
+        );
+    }
+
+    #[test]
+    fn cause_kind_serde_roundtrip() {
+        let kinds = vec![CauseKind::CpuHigh, CauseKind::MemLow, CauseKind::NetSpike];
+        let json = serde_json::to_string(&kinds).unwrap();
+        assert_eq!(json, r#"["CpuHigh","MemLow","NetSpike"]"#);
+        let back: Vec<CauseKind> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, kinds);
+
+        // 单值与 Option 形态（落库存 primary_cause）
+        let p: Option<CauseKind> = serde_json::from_str(r#""DiskSpike""#).unwrap();
+        assert_eq!(p, Some(CauseKind::DiskSpike));
+        let n: Option<CauseKind> = serde_json::from_str("null").unwrap();
+        assert_eq!(n, None);
+    }
+
+    #[test]
+    fn cause_first_touch_serde_roundtrip() {
+        // HashMap<CauseKind, i64> 以枚举字符串为 key 落库（供 F-RC6 按 cause 查首触时刻）
+        let mut map: HashMap<CauseKind, i64> = HashMap::new();
+        map.insert(CauseKind::CpuHigh, 0);
+        map.insert(CauseKind::MemLow, 1200);
+        let json = serde_json::to_string(&map).unwrap();
+        let back: HashMap<CauseKind, i64> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, map);
+        assert_eq!(back.get(&CauseKind::MemLow).copied(), Some(1200));
+    }
+
+    #[test]
+    fn severity_default_is_minor() {
+        assert_eq!(Severity::default(), Severity::Minor);
+    }
+
+    #[test]
+    fn stutter_event_default_has_empty_structured_fields() {
+        let e = StutterEvent::default();
+        assert_eq!(e.id, 0);
+        assert!(e.cause_kinds.is_empty());
+        assert_eq!(e.primary_cause, None);
+        assert!(e.cause_first_touch.is_empty());
+        assert_eq!(e.onset_ts, None);
+        assert!(e.culprits.is_empty());
     }
 }

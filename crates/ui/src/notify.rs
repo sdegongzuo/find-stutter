@@ -189,6 +189,7 @@ mod tests {
             causes: vec!["CPU usage 95.0% > 90.0%".into()],
             snapshot: Sample::default(),
             culprits: vec![],
+            ..Default::default()
         }
     }
 

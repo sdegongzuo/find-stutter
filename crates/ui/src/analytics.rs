@@ -1049,6 +1049,7 @@ mod tests {
                     cpu_usage: 80.0,
                     mem_used_mb: 200,
                 }],
+                ..Default::default()
             };
             logger.write_event(&ev).unwrap();
         }
@@ -1083,6 +1084,7 @@ mod tests {
                     cpu_usage: 80.0,
                     mem_used_mb: 200,
                 }],
+                ..Default::default()
             };
             logger.write_event(&ev).unwrap();
         }
@@ -1230,6 +1232,7 @@ mod tests {
                 causes: caz.clone(),
                 snapshot: s,
                 culprits: cs.clone(),
+                ..Default::default()
             };
             logger.write_event(&ev).unwrap();
         }
@@ -1490,6 +1493,7 @@ mod tests {
             causes: vec!["x".into()],
             snapshot: snap,
             culprits: vec![],
+            ..Default::default()
         };
         {
             let cfg = StorageConfig {
@@ -1642,8 +1646,9 @@ mod tests {
                     severity: *sev,
                     causes: causes[i].clone(),
                     snapshot: s,
-                    culprits: culprits[i].clone(),
-                };
+                culprits: culprits[i].clone(),
+                ..Default::default()
+            };
                 logger.write_event(&ev).unwrap();
             }
             logger.flush().unwrap();
