@@ -66,8 +66,15 @@
       > 的 `samples` 表 CREATE+5×ALTER+INSERT 补齐 5 列（`context_switches_per_sec` 为 INTEGER，
       > f32→i64 落库），新增回读单测。另补 4 个 cause 触发器单测（含「高吞吐但磁盘不忙不误报」回归）。
       > `rtk cargo test` 278 全过、`release` 零警告。service 重装生效同 F-RC1（本会话 UAC 被封，部署留手动）。
-- [ ] **F-RC3 前台窗口冻结检测** — `SendMessageTimeout(WM_NULL, 200ms)` 探前台窗口，`UiFrozen` cause；
-      **仅已在其它 cause 帧探一次 / 独立线程 200ms 超时 + 每 2s 限频**，绝不进采集热路径（500ms 会腰斩 1Hz）
+- [x] **F-RC3 前台窗口冻结检测** — `SendMessageTimeout(WM_NULL, 200ms)` 探前台窗口，`UiFrozen` cause；
+      **仅已在其它 cause 帧探一次 / 独立线程 200ms 超时 + 每 2s 限频**，绝不进采集热路径（500ms 会腰斩 1Hz）。
+      **实现要点**：`collector.rs` 新增 `probe_foreground_window_frozen`（SMTO_ABORTIFHUNG|SMTO_BLOCK，
+      靠 `GetLastError()==ERROR_TIMEOUT` 区分「WM_NULL 正常返回 0」与「真挂起超时」，修正仅凭 LRESULT==0
+      判冻结的误报经典坑；无前台窗口按未冻结）；`detector.rs` 仅在「已触发其它 cause」卡顿帧探测
+      （不进热路径）+ 2s 限频 + 依赖注入 `ui_probe` 便于单测，`UiFrozen` 绝不单独成 cause；
+      `types.rs` 加 `ui_freeze_timeout_ms`（默认 200，供 F-RC12 what-if）+ `PREFIX_TO_KIND` 补
+      `UiFrozen` 映射。3 单测覆盖触发/不触发/不进热路径，`rtk cargo test` 282 全过、`release` 零警告；
+      code-review 两轴通过（复审修复误报 bug）。service 重装生效同 F-RC1（UAC 被封，部署留手动）。
 - [ ] **F-RC4 温度→降频根因** — 数据源改为 `cpu_temp` + `cpu_freq_mhz` 掉档判据
       （`gpu_temp` 从未填充，不纳入），新增 `ThermalThrottle` cause（温度高 + 疑似降频）
 - [ ] **F-RC5 主因判定 + 加权** — 权重 `duration × 主因信号强度`（**不乘 severity**，severity=并发 cause 数会重复计数），

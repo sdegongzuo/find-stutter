@@ -5,7 +5,12 @@ use std::collections::HashMap;
 use sysinfo::{Networks, System};
 use wmi::{Variant, WMIConnection};
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::ERROR_SUCCESS;
+use windows::Win32::Foundation::{
+    ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, LPARAM, SetLastError, WPARAM,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
+};
 use windows::Win32::System::Performance::{
     PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,     PdhGetFormattedCounterValue,
     PdhOpenQueryW, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_FMT_LARGE, PDH_HCOUNTER,
@@ -442,6 +447,44 @@ impl Drop for SysPdh {
         unsafe {
             PdhCloseQuery(self.query);
         }
+    }
+}
+
+/// F-RC3：探测前台窗口是否真无响应（挂起）。
+///
+/// 通过 `SendMessageTimeout(WM_NULL, timeout_ms)` 向前台窗口投递一条空消息，
+/// 若窗口消息循环挂起（`SMTO_ABORTIFHUNG` 命中）则在超时前返回 0（冻结）。
+/// 无前台窗口（桌面 / 锁屏 / 无焦点）返回 `false`——无法判断时按「未冻结」处理，
+/// 避免误报。此函数本身有 ~timeout_ms 的阻塞成本，**调用方必须限频、
+/// 不得进入采集热路径**（PRD §F-RC3 / R5）。
+pub(crate) fn probe_foreground_window_frozen(timeout_ms: u32) -> bool {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.0.is_null() {
+            return false;
+        }
+        // 清空残留错误，避免上一次 API 的 ERROR_TIMEOUT 残留干扰「窗口是否挂起」判定
+        SetLastError(ERROR_SUCCESS);
+        let mut presult: usize = 0;
+        let ret = SendMessageTimeoutW(
+            hwnd,
+            WM_NULL,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            timeout_ms,
+            Some(&mut presult),
+        );
+        if ret.0 == 0 {
+            // 返回 0 可能是 WM_NULL 成功（DefWindowProc 返回 0）**或**超时/失败。
+            // 仅靠 GetLastError == ERROR_TIMEOUT 区分：只有前台窗口真挂起才会置该错误；
+            // 否则（窗口正常响应 WM_NULL 返回 0）GetLastError 非 ERROR_TIMEOUT → 视为未冻结。
+            // 这是 SendMessageTimeout 的经典坑：不能仅凭 LRESULT==0 判冻结（违背 PRD §F-RC3
+            // 「区分资源高但还能动与真卡死」的初衷，否则会大量误报）。
+            return GetLastError() == ERROR_TIMEOUT;
+        }
+        // ret != 0：窗口正常响应消息（明确成功），未冻结
+        false
     }
 }
 

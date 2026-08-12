@@ -231,6 +231,7 @@ const PREFIX_TO_KIND: &[(&str, CauseKind)] = &[
     ("DPC time", CauseKind::DpcInterrupt),
     ("Interrupt time", CauseKind::InterruptStorm),
     ("Context switches", CauseKind::ContextSwitchStorm),
+    ("UI frozen", CauseKind::UiFrozen),
     ("Network", CauseKind::NetSpike),
     ("Memory usage", CauseKind::MemLow),
     ("Memory available", CauseKind::MemLow),
@@ -245,7 +246,8 @@ impl CauseKind {
     /// 旧事件 `cause_kinds` 为空时，reader 用本函数把自由文本 `causes`
     /// **可靠回填**为枚举（精确映射，非脆弱关键词猜测，见 PRD §3.1）。
     /// 返回 `None` 表示该 cause 文本尚无对应枚举（如尚未落地的
-    /// `DiskBusy` / `UiFrozen` 等，待 F-RC2~F-RC4 补齐映射）。
+    /// `GpuHigh` / `ThermalThrottle` 等，待 F-RC4 补齐映射；`UiFrozen`
+    /// 已在 F-RC3 映射，`DiskBusy` 等已在 F-RC2 映射）。
     pub fn from_cause(cause: &str) -> Option<CauseKind> {
         for (prefix, kind) in PREFIX_TO_KIND {
             if cause.starts_with(prefix) {
@@ -345,6 +347,11 @@ pub struct DetectionConfig {
     /// 触发后需明显回落（降到阈值的一半，默认 0.5）才解除激活。
     #[serde(default = "default_sys_signal_hysteresis_ratio")]
     pub sys_signal_hysteresis_ratio: f32,
+    /// F-RC3 前台窗口冻结探测超时（ms）：`SendMessageTimeout(WM_NULL, N)` 的 N。
+    /// 仅在前台窗口真正挂起时才可能等满 N；正常响应近乎立即返回，故低频
+    /// （2s 限频）探测的常态开销极小，不会进入采集热路径。供 F-RC12 what-if 调参。
+    #[serde(default = "default_ui_freeze_timeout_ms")]
+    pub ui_freeze_timeout_ms: u32,
 }
 
 impl Default for DetectionConfig {
@@ -366,6 +373,7 @@ impl Default for DetectionConfig {
             interrupt_threshold_percent: 10.0,
             context_switch_threshold_per_sec: 50_000.0,
             sys_signal_hysteresis_ratio: 0.5,
+            ui_freeze_timeout_ms: 200,
         }
     }
 }
@@ -396,6 +404,9 @@ fn default_context_switch_threshold_per_sec() -> f32 {
 }
 fn default_sys_signal_hysteresis_ratio() -> f32 {
     0.5
+}
+fn default_ui_freeze_timeout_ms() -> u32 {
+    200
 }
 
 /// 采样配置
@@ -696,6 +707,7 @@ mod tests {
         assert_eq!(c.interrupt_threshold_percent, 10.0);
         assert_eq!(c.context_switch_threshold_per_sec, 50_000.0);
         assert_eq!(c.sys_signal_hysteresis_ratio, 0.5);
+        assert_eq!(c.ui_freeze_timeout_ms, 200);
     }
 
     #[test]
@@ -866,15 +878,22 @@ mod tests {
 
     #[test]
     fn cause_kind_from_cause_none_for_unmapped() {
-        // 尚未落地映射的 cause（如 F-RC3 的 UiFrozen）仍返回 None，不臆造枚举，
-        // 避免 R2「分类不连续」；F-RC2 的 DiskBusy/DpcInterrupt/InterruptStorm/
-        // ContextSwitchStorm 已映射，不再返回 None（见上方 maps_known_keys）。
-        assert_eq!(CauseKind::from_cause("UI frozen 200ms"), None);
-        // GpuHigh / ThermalThrottle 槽位已预留但检测器尚未产出对应 cause，亦返回 None
+        // F-RC3 的 UiFrozen 已在 PREFIX_TO_KIND 映射（见下方 maps_ui_frozen 用例）；
+        // 这里验证尚未落地的 GpuHigh / ThermalThrottle 仍返回 None，不臆造枚举，
+        // 避免 R2「分类不连续」。
         assert_eq!(CauseKind::from_cause("GPU usage 99%"), None);
         assert_eq!(CauseKind::from_cause("Thermal throttle 95C"), None);
         // 完全无关文本也返回 None
         assert_eq!(CauseKind::from_cause("something else"), None);
+    }
+
+    #[test]
+    fn cause_kind_from_cause_maps_ui_frozen() {
+        // F-RC3：前台窗口冻结 cause 文本应映射到 UiFrozen 枚举。
+        assert_eq!(
+            CauseKind::from_cause("UI frozen (前台窗口无响应 200ms)"),
+            Some(CauseKind::UiFrozen)
+        );
     }
 
     #[test]

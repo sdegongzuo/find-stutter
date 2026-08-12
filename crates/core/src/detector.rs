@@ -1,7 +1,8 @@
+use crate::collector::probe_foreground_window_frozen;
 use crate::types::{cause_key, CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
 use chrono::Utc;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct Detector {
     config: DetectionConfig,
@@ -23,6 +24,13 @@ pub struct Detector {
     dpc_active: bool,
     interrupt_active: bool,
     ctx_switch_active: bool,
+    /// F-RC3 前台窗口冻结滞回状态：探测到前台窗口挂起则激活，响应则解除
+    /// （低频探测，无中间带）。仅作为「伴随诊断」——绝不单独成 cause。
+    ui_freeze_active: bool,
+    /// F-RC3 上次 UI 冻结探测时刻（限频：每 2s 至多探一次，避免 200ms 阻塞累积）。
+    last_ui_probe: Option<Instant>,
+    /// F-RC3 前台窗口冻结探测函数（依赖注入，便于单测；默认走真实 Win32 探测）。
+    ui_probe: Box<dyn Fn(u32) -> bool + Send>,
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
@@ -49,6 +57,9 @@ impl Detector {
             dpc_active: false,
             interrupt_active: false,
             ctx_switch_active: false,
+            ui_freeze_active: false,
+            last_ui_probe: None,
+            ui_probe: Box::new(probe_foreground_window_frozen),
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
@@ -71,6 +82,15 @@ impl Detector {
         causes.extend(self.check_spike());
 
         if !causes.is_empty() {
+            // F-RC3：仅在前台窗口「已触发其它 cause」的卡顿帧探一次冻结，
+            // 不进入采集热路径（200ms 探测只在真正卡顿帧发生，且 2s 限频）。
+            self.maybe_probe_ui_freeze();
+            if self.ui_freeze_active {
+                causes.push(format!(
+                    "UI frozen (前台窗口无响应 {}ms)",
+                    self.config.ui_freeze_timeout_ms
+                ));
+            }
             // 时序权衡：analyze 在 collect 之后被调用，这里设置的标志影响的是
             // **下一帧**的 collect——卡顿触发的那一帧 top_processes 会为空，
             // 峰值归因靠后续帧的累积取 max 兜底（current_culprits 按 pid 取最大），
@@ -325,6 +345,23 @@ impl Detector {
         }
 
         causes
+    }
+
+    /// F-RC3：前台窗口冻结探测（限频 + 滞回）。
+    ///
+    /// 仅在 `ui_probe` 实际执行时才更新 `last_ui_probe`（2s 限频）；
+    /// 限频窗口内沿用上次 `ui_freeze_active`，避免每 tick 都做 200ms 阻塞探测。
+    /// 探测结果直接驱动 `ui_freeze_active`（低频探测，无需滞回中间带）。
+    fn maybe_probe_ui_freeze(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.last_ui_probe {
+            if now.duration_since(last) < Duration::from_secs(2) {
+                return; // 限频：沿用上次结果
+            }
+        }
+        let frozen = (self.ui_probe)(self.config.ui_freeze_timeout_ms);
+        self.last_ui_probe = Some(now);
+        self.ui_freeze_active = frozen;
     }
 
     fn check_spike(&mut self) -> Vec<String> {
@@ -1283,5 +1320,66 @@ mod tests {
             !d.needs_process_snapshot(),
             "卡顿结束后不再需要进程快照"
         );
+    }
+
+    /// F-RC3：已触发其它 cause 的卡顿帧 + 前台窗口探测返回冻结 → 产出 `UiFrozen`
+    /// cause 并落库 `CauseKind::UiFrozen`（绝不单独成 cause，必须伴随其它 cause）。
+    #[test]
+    fn analyze_ui_frozen_triggers_when_probe_says_frozen() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+        // 注入：前台窗口无响应
+        d.ui_probe = Box::new(|_| true);
+
+        // 同时触发 CPU 卡顿（UiFrozen 必须伴随其它 cause，不单独出现）
+        let high = make_sample(95.0, 2000, 10.0);
+        d.analyze(&high);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("UI frozen")),
+            "冻结探测返回 true 时应产出 UI frozen cause，got: {:?}",
+            d.current_causes
+        );
+
+        for _ in 0..2 {
+            d.analyze(&high);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::UiFrozen),
+            "cause_kinds 应含 UiFrozen，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC3：前台窗口探测返回响应（不冻结）→ 不产出 `UiFrozen` cause。
+    #[test]
+    fn analyze_ui_frozen_absent_when_probe_says_responsive() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+        d.ui_probe = Box::new(|_| false); // 前台窗口正常响应
+
+        let high = make_sample(95.0, 2000, 10.0);
+        d.analyze(&high);
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("UI frozen")),
+            "前台窗口正常时不应产出 UI frozen，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// F-RC3 回归：无其它 cause 的常规帧**绝不**触发 UI 探测（不进热路径）。
+    /// 注入探测函数：一旦被调用即 panic，验证常规帧不会调用它。
+    #[test]
+    fn analyze_ui_probe_not_called_on_normal_frame() {
+        let config = DetectionConfig::default();
+        let mut d = Detector::new(&config);
+        d.ui_probe = Box::new(|_| panic!("probe must not run on non-stutter frame"));
+        // 常规样本（无 cause）不应调用 probe
+        let normal = make_sample(30.0, 2000, 10.0);
+        d.analyze(&normal);
+        assert!(d.current_causes.is_empty());
     }
 }
