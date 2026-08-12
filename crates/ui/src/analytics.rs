@@ -19,7 +19,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
-use find_stutter_core::{CauseKind, DetectionConfig, ProcessBrief, Sample, StutterEvent};
+use find_stutter_core::{
+    CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent,
+};
 use rusqlite::{params, Connection, OpenFlags};
 
 /// 时间范围选择器（PRD F7）。
@@ -665,16 +667,20 @@ impl Default for ResourceView {
 ///   桶数 clamp 到 200~2000，再据范围总长算出 `bucket_secs`。
 /// - 同时取同范围 `stutter_events.timestamp`（事件数少）折算为桶序号，作为竖线标记。
 /// - 全程只读；空范围/无 samples → 返回 `points` 为空的 `ResourceData`（图表端占位）。
-pub fn load_resource_samples(
+/// F3（高级）：把 [start, end] 区间内 1Hz 采样降采样为 `ResourceData`（桶聚合 + 卡顿竖线）。
+///
+/// 抽成私有 helper，供 `load_resource_samples`（按 `TimeRange`）与
+/// `load_resource_samples_window`（按事件中心 ±N 秒窄窗口，F-RC10 前导曲线）共用，消除重复。
+fn downsample_samples(
     conn: &Connection,
-    range: &TimeRange,
+    start: &str,
+    end: &str,
     width_px: u32,
 ) -> anyhow::Result<ResourceData> {
-    let (start, end) = range.bounds();
-    let base_dt = DateTime::parse_from_rfc3339(&start)
+    let base_dt = DateTime::parse_from_rfc3339(start)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
-    let end_dt = DateTime::parse_from_rfc3339(&end)
+    let end_dt = DateTime::parse_from_rfc3339(end)
         .map(|d| d.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now());
     let base_secs = base_dt.timestamp();
@@ -765,6 +771,39 @@ pub fn load_resource_samples(
         bucket_secs,
         span_secs,
     })
+}
+
+pub fn load_resource_samples(
+    conn: &Connection,
+    range: &TimeRange,
+    width_px: u32,
+) -> anyhow::Result<ResourceData> {
+    let (start, end) = range.bounds();
+    downsample_samples(conn, &start, &end, width_px)
+}
+
+/// F-RC10：取某次卡顿事件前后 ±`half_secs` 秒的窄窗口资源采样，供钻取卡「前导曲线」渲染。
+///
+/// 与 `load_resource_samples` 共用 `downsample_samples` 降采样逻辑；窗口以事件时刻
+/// （epoch 秒）为中心，对窄窗口用更细的桶（仍为 1Hz 友好量级）。
+pub fn load_resource_samples_window(
+    conn: &Connection,
+    center_ts_secs: i64,
+    half_secs: i64,
+    width_px: u32,
+) -> anyhow::Result<ResourceData> {
+    use chrono::TimeZone;
+    let start = Utc
+        .timestamp_opt(center_ts_secs.saturating_sub(half_secs), 0)
+        .single()
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    let end = Utc
+        .timestamp_opt(center_ts_secs.saturating_add(half_secs), 0)
+        .single()
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    downsample_samples(conn, &start, &end, width_px)
 }
 
 // ===================== M5 / F5+F8：原始事件表 + CSV 导出 =====================
@@ -1236,6 +1275,8 @@ pub fn match_profile(event: &StutterEvent, profiles: &[EventProfile]) -> Option<
 /// F5/F8：单条卡顿事件明细（供高级模式原始事件表与 CSV 导出）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EventRow {
+    /// 事件主键（stutter_events.id）；用于钻取卡精准关联被点事件（F-RC10）。
+    pub id: i64,
     /// 本地时区格式化时间 `YYYY-MM-DD HH:MM:SS`（PRD §3.3 时区口径）。
     pub time_local: String,
     /// 卡顿发生时刻（UTC epoch 秒）；用于按时刻对齐资源采样与加载 snapshot。
@@ -1294,6 +1335,131 @@ fn parse_culprits(json: &str) -> (Vec<String>, String) {
 /// 排序由 [`EventSort`] 控制（PRD §5「可排序/筛选」）：默认按时间升序，与旧行为一致。
 pub fn load_events(conn: &Connection, range: &TimeRange) -> anyhow::Result<Vec<EventRow>> {
     load_events_sorted(conn, range, &EventSort::default())
+}
+
+/// F-RC10/11/13：回读时间范围内**完整** `StutterEvent`（含结构化 cause_kinds /
+/// primary_cause / cause_first_touch / snapshot / culprits / onset_ts），供根因钻取卡与
+/// 同类画像对比在内存中计算。全程只读；service 已落库这些列（F-RC1 迁移），本函数不写库。
+///
+/// 各结构化列容错：旧库缺列时回退默认空值（不崩）。`primary_cause` 列存储为 JSON
+/// （`null` 或枚举字符串），解析失败时按 `None` 处理。
+pub fn load_full_events(
+    conn: &Connection,
+    range: &TimeRange,
+) -> anyhow::Result<Vec<StutterEvent>> {
+    let (start, end) = range.bounds();
+    let has_causes = has_column(conn, "stutter_events", "causes");
+    let has_culprits = has_column(conn, "stutter_events", "culprits");
+    let has_kinds = has_column(conn, "stutter_events", "cause_kinds");
+    let has_primary = has_column(conn, "stutter_events", "primary_cause");
+    let has_touch = has_column(conn, "stutter_events", "cause_first_touch");
+    let has_snapshot = has_column(conn, "stutter_events", "snapshot");
+    let has_onset = has_column(conn, "stutter_events", "onset_ts");
+
+    let causes_sql = if has_causes { "COALESCE(causes, '[]')" } else { "'[]'" };
+    let culprits_sql = if has_culprits {
+        "COALESCE(culprits, '[]')"
+    } else {
+        "'[]'"
+    };
+    let kinds_sql = if has_kinds {
+        "COALESCE(cause_kinds, '[]')"
+    } else {
+        "'[]'"
+    };
+    let primary_sql = if has_primary { "primary_cause" } else { "NULL" };
+    let touch_sql = if has_touch {
+        "COALESCE(cause_first_touch, '{}')"
+    } else {
+        "'{}'"
+    };
+    let snapshot_sql = if has_snapshot {
+        "COALESCE(snapshot, '{}')"
+    } else {
+        "'{}'"
+    };
+    let onset_sql = if has_onset { "onset_ts" } else { "0" };
+
+    let sql = format!(
+        "SELECT id, timestamp, duration_ms, severity, {causes_sql}, {culprits_sql}, \
+         {kinds_sql}, {primary_sql}, {touch_sql}, {snapshot_sql}, {onset_sql} \
+         FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2 ORDER BY timestamp"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![start, end], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u64,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, String>(9)?,
+            row.get::<_, i64>(10)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        let (id, ts, dur, sev, causes_json, culprits_json, kinds_json, primary_json, touch_json, snapshot_json, onset) =
+            r?;
+        let timestamp = DateTime::parse_from_rfc3339(&ts)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        let causes: Vec<String> = serde_json::from_str(&causes_json).unwrap_or_default();
+        let cause_kinds: Vec<CauseKind> = serde_json::from_str(&kinds_json).unwrap_or_default();
+        let primary_cause: Option<CauseKind> = match primary_json {
+            Some(s) if s != "null" => serde_json::from_str(&s).unwrap_or(None),
+            _ => None,
+        };
+        let cause_first_touch: HashMap<CauseKind, i64> =
+            serde_json::from_str(&touch_json).unwrap_or_default();
+        let snapshot: Sample = serde_json::from_str(&snapshot_json).unwrap_or_default();
+        let culprits: Vec<ProcessBrief> = serde_json::from_str(&culprits_json).unwrap_or_default();
+        out.push(StutterEvent {
+            id,
+            timestamp,
+            duration_ms: dur,
+            severity: parse_severity(&sev),
+            causes,
+            cause_kinds,
+            primary_cause,
+            cause_first_touch,
+            onset_ts: if onset <= 0 { None } else { Some(onset) },
+            snapshot,
+            culprits,
+        });
+    }
+    Ok(out)
+}
+
+/// 把日志存储的 severity 字符串（"minor"/"major"/"critical"）解析回枚举。
+fn parse_severity(s: &str) -> Severity {
+    match s {
+        "critical" => Severity::Critical,
+        "major" => Severity::Major,
+        _ => Severity::Minor,
+    }
+}
+
+/// F-RC10/11/13：把 `CauseKind` 枚举映射为中文展示标签（与 detector 文案前缀一致）。
+pub fn cause_kind_label(kind: CauseKind) -> &'static str {
+    match kind {
+        CauseKind::CpuHigh => "CPU 占用高",
+        CauseKind::CpuSpike => "CPU 突增",
+        CauseKind::MemLow => "内存不足",
+        CauseKind::DiskBusy => "磁盘繁忙",
+        CauseKind::DiskSpike => "磁盘突增",
+        CauseKind::GpuHigh => "GPU 占用高",
+        CauseKind::ThermalThrottle => "温度降频",
+        CauseKind::DpcInterrupt => "DPC 风暴",
+        CauseKind::InterruptStorm => "中断风暴",
+        CauseKind::ContextSwitchStorm => "上下文切换风暴",
+        CauseKind::NetSpike => "网络突增",
+        CauseKind::UiFrozen => "界面冻结",
+    }
 }
 
 /// 事件表排序字段（PRD §5 列头排序）。
@@ -1366,24 +1532,25 @@ pub fn load_events_sorted(
         "'[]'"
     };
     let sql = format!(
-        "SELECT timestamp, duration_ms, severity, {causes_sql}, {culprits_sql} \
+        "SELECT id, timestamp, duration_ms, severity, {causes_sql}, {culprits_sql} \
          FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2 ORDER BY timestamp"
     );
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params![start, end], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)? as u64,
-            row.get::<_, String>(2)?,
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)? as u64,
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
         ))
     })?;
 
     let mut out = Vec::new();
     for r in rows {
-        let (ts, dur, sev, causes_json, culprits_json) = r?;
+        let (id, ts, dur, sev, causes_json, culprits_json) = r?;
         // timestamp 落库 UTC RFC3339 → 解析为本地时区展示（与 KPI/趋势一致口径）
         let time_local = DateTime::parse_from_rfc3339(&ts)
             .map(|d| d.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S").to_string())
@@ -1395,6 +1562,7 @@ pub fn load_events_sorted(
         let causes_text = join_causes(&causes_json);
         let (culprit_names, culprits_text) = parse_culprits(&culprits_json);
         out.push(EventRow {
+            id,
             time_local,
             ts_secs,
             duration_ms: dur,
@@ -2530,5 +2698,81 @@ mod tests {
 
         // 对 e3（仅 1 次，非已知）→ None
         assert!(match_profile(&e3, &profiles).is_none());
+    }
+
+    #[test]
+    fn load_full_events_roundtrip_structured_fields() {
+        // 验证 load_full_events 能把 service 落库的结构化字段（cause_kinds /
+        // primary_cause / cause_first_touch / snapshot / culprits / onset_ts）完整重建，
+        // 供 F-RC10/11/13 钻取卡与画像对比使用。
+        let pb = |pid: u32, name: &str, cpu: f32, mem: u64| ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: cpu,
+            mem_used_mb: mem,
+        };
+        let db = unique_db("full_events");
+        let mut ev = find_stutter_core::StutterEvent {
+            timestamp: local_midnight_utc() + ChronoDuration::minutes(5),
+            duration_ms: 1500,
+            severity: Severity::Major,
+            causes: vec!["CPU usage 95.0% > 90.0%".to_string()],
+            cause_kinds: vec![CauseKind::CpuHigh, CauseKind::MemLow],
+            primary_cause: Some(CauseKind::CpuHigh),
+            cause_first_touch: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(CauseKind::CpuHigh, 0i64);
+                m.insert(CauseKind::MemLow, 800i64);
+                m
+            },
+            onset_ts: Some(
+                (local_midnight_utc() + ChronoDuration::minutes(5)).timestamp() - 1500,
+            ),
+            snapshot: {
+                let mut s = Sample::default();
+                s.cpu_usage = 96.0;
+                s.mem_usage_percent = 92.0;
+                s
+            },
+            culprits: vec![pb(1, "app.exe", 96.0, 512)],
+            ..Default::default()
+        };
+        {
+            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30 };
+            let mut logger = Logger::new(&cfg).unwrap();
+            logger.touch_heartbeat().unwrap();
+            logger.write_event(&ev).unwrap();
+            logger.flush().unwrap();
+            // 补一条采样，确保前导曲线窄窗口查询有数据；
+            // 让其 timestamp 落在事件 ±60s 窗口内，否则 load_resource_samples_window 返回空。
+            let mut s = Sample::default();
+            s.timestamp = ev.timestamp;
+            s.cpu_usage = 90.0;
+            logger.write_sample(&s).unwrap();
+            logger.flush().unwrap();
+        }
+        let conn = open_readonly(std::path::Path::new(&db)).unwrap();
+        let all = load_full_events(&conn, &TimeRange::Today).unwrap();
+        assert_eq!(all.len(), 1);
+        let got = &all[0];
+        assert_eq!(got.cause_kinds, vec![CauseKind::CpuHigh, CauseKind::MemLow]);
+        assert_eq!(got.primary_cause, Some(CauseKind::CpuHigh));
+        assert_eq!(got.cause_first_touch.get(&CauseKind::MemLow), Some(&800i64));
+        assert_eq!(got.snapshot.cpu_usage, 96.0);
+        assert_eq!(got.culprits.len(), 1);
+        assert_eq!(got.culprits[0].name, "app.exe");
+        assert!(got.onset_ts.is_some());
+
+        // F-RC10：cause_kind_label 中文映射
+        assert_eq!(cause_kind_label(CauseKind::CpuHigh), "CPU 占用高");
+        assert_eq!(cause_kind_label(CauseKind::ThermalThrottle), "温度降频");
+        assert_eq!(cause_kind_label(CauseKind::UiFrozen), "界面冻结");
+
+        // F-RC10：前导曲线窄窗口采样（事件 ±60s 应有降采样点）
+        let ts = got.timestamp.timestamp();
+        let data = load_resource_samples_window(&conn, ts, 60, 780).unwrap();
+        assert!(!data.points.is_empty(), "窄窗口应返回采样点");
+
+        std::fs::remove_file(&db).ok();
     }
 }

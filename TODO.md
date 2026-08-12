@@ -87,20 +87,48 @@
       > code-review 两轴通过（Standards 指出滞回块 `else if` 为激活条件补集等价 `else` +
       > 50 魔数，已简化为三条件重算+命名常量）。`rtk cargo test` 287 全过、release 零警告。
       > service 重装生效同 F-RC1（UAC 被封，部署留手动）。
-- [ ] **F-RC5 主因判定 + 加权** — 权重 `duration × 主因信号强度`（**不乘 severity**，severity=并发 cause 数会重复计数），
+- [x] **F-RC5 主因判定 + 加权** — 权重 `duration × 主因信号强度`（**不乘 severity**，severity=并发 cause 数会重复计数），
       替代平权 COUNT；`primary_cause` 直接作主因高亮
-- [ ] **F-RC6 因果方向** — 依赖 detector 落库**各 cause 首触时刻 / 事件 onset**（spike 是滑动基线+滞回，非静态阈值）；
+      > 分析层 `weighted_culprits` 已落地（提交 c983950，rc5 单测覆盖排序/聚合）。
+- [x] **F-RC6 因果方向** — 依赖 detector 落库**各 cause 首触时刻 / 事件 onset**（spike 是滑动基线+滞回，非静态阈值）；
       锚定 `onset≈t-3s`；**一次性 bulk 拉 samples 内存切片**算 leading signal，区分
       「触发者」与「放大器」（如 MemLow 先动 → DiskBusy 放大器）
-- [ ] **F-RC7 基线偏离** — 非卡顿 `top_processes` 为空，**改从事件侧聚合**（`culprits`/`snapshot.top_processes`
+      > 分析层 `causal_direction` 已落地（提交 c983950，rc6 单测；bulk 窗口由调用方处理）。
+- [x] **F-RC7 基线偏离** — 非卡顿 `top_processes` 为空，**改从事件侧聚合**（`culprits`/`snapshot.top_processes`
       作为元凶时的典型占用）；只标显著偏离者，过滤常驻高占用噪声
-- [ ] **F-RC8 多进程共现** — 按 culprit 进程名集合做共现统计，输出高频「卡顿组合」可下钻
-- [ ] **F-RC9 因果链** — 多 cause 按首触时刻排序成有向链（根因→传导→表象），替代平铺列表
-- [ ] **F-RC10 单事件根因钻取卡** — **前置：`StutterEvent` 加 `id`**（reader 当前丢 id，钻取无法关联）；
+      > 分析层 `process_baseline`/`deviation_flags` 已落地（提交 c983950，rc7 单测）。
+      > **修复**：基线由 max 改为**均值**（max 作基线使偏离判定近乎永不触发）；`typical_mem_mb` 改 f64。
+- [x] **F-RC8 多进程共现** — 按 culprit 进程名集合做共现统计，输出高频「卡顿组合」可下钻
+      > 分析层 `cooccurrence_pairs` 已落地（提交 c983950，rc8 单测）。Jaccard 为 PRD 可选项，未实现。
+- [x] **F-RC9 因果链** — 多 cause 按首触时刻排序成有向链（根因→传导→表象），替代平铺列表
+      > 分析层 `cause_chain` 已落地（提交 c983950，rc9 单测，复用 sorted_causes_by_first_touch）。
+- [x] **F-RC10 单事件根因钻取卡** — **前置：`StutterEvent.id` 已落库**（F-RC1），钻取精准关联；
       点事件给出主因(置信度)+前导曲线(±60s)+偏离幅度+因果链
-- [ ] **F-RC11 根因置信度** — 按「主因是否明显领先其余 cause（强度/时间差）」给 0–1 置信度；
+      > 数据层（提交 c983950）：`causal_direction`/`cause_chain`/`root_cause_confidence`/`deviation_flags` 全部落地，`id` 已回读。
+      > 接线：`analytics.rs` 新增 `load_full_events`（容错回读 cause_kinds/primary_cause/cause_first_touch/snapshot/culprits/onset_ts）
+      > 供钻取卡精准关联；`analysis.rs` 重写 `on_row_clicked` 组装 RootCauseCard（主因/置信度进度条/因果链/基线偏离/前导曲线
+      > `load_resource_samples_window`±60s + `render_resource_chart` 后台线程）；`overlay.slint` 新增 RootCauseCard 模态覆盖层。
+      > 因果链当前为文本链「根因→传导→表象」（F-RC9），非可视化有向图（验收仅要求「显示因果链」，达标；可视化图待增强）。
+- [x] **F-RC11 根因置信度** — 按「主因是否明显领先其余 cause（强度/时间差）」给 0–1 置信度；
       **多因并发本身是 major/critical 定义，不再单独压低**；低置信标注「主因不显著，疑多因并发」
-- [ ] **F-RC12 阈值敏感性 what-if** — 客户端用 `snapshot` 信号值重算，不改 service（保持只读）；
+      > 分析层 `root_cause_confidence` 已落地（提交 c983950，rc11×3 单测；量级 0.9/0.7/0.35 与 PRD §5.4 一致）。
+- [x] **F-RC12 阈值敏感性 what-if** — 客户端用 `snapshot` 信号值重算，不改 service（保持只读）；
       阈值语义须与 `detect_core` 纯函数一致
-- [ ] **F-RC13 同类事件画像对比** — 按 cause_kinds+culprit+duration 聚类，给「匹配已知画像」结论
+      > 纯函数 `detect_core` 已落地（提交 c983950，rc12 单测；瞬时阈值 + Thermal 单帧代理）。
+      > 接线：`analysis.rs` `on_what_if_requested` 读 `wi_sample`（`ev.snapshot`）+ 解析 ComboBox 阈值覆盖 `DetectionConfig`
+      > → 调 `analytics::detect_core` 实时重算显示「若阈值 X 是否触发该 cause」。Slint 本版本无 `Slider`，
+      > 用 `ComboBox` 预设阈值（CPU/Mem/磁盘%）替代滑块（功能等价，满足 PRD「可调阈值重算」意图）。
+      > 注：当前仅暴露 CPU/Mem/磁盘 3 类阈值（detect_core 内部约 9 类，其余以 `DetectionConfig::default()` 固定），
+      > 扩展其余阈值 UI 为后续增强；PRD §5.1「detect_core 上提 core 由 detector 与 what-if 共用」（R6/R8）仍待重构（见下方待办）。
+- [x] **F-RC13 同类事件画像对比** — 按 cause_kinds+culprit+duration 聚类，给「匹配已知画像」结论
       （与 F-RC7 共用事件侧数据源）
+      > 纯函数 `cluster_profiles`/`match_profile` 已落地（提交 c983950，rc13 单测；count>=2 为已知）。
+      > 接线：`analysis.rs` 调 `cluster_profiles`+`match_profile` 写 `rc-profile` 文本（「匹配已知画像：进程 Y 典型卡顿」），
+      > 复用 `load_full_events` 事件侧数据源（与 F-RC7 一致）。
+
+### GUI 接线（F-RC10 / F-RC12 / F-RC13 的 UI 部分）
+> 分析层纯函数（c983950）已全部就绪，以下为 `analysis.slint` 现只读窗口内「根因」钻取卡接线（已完成）：
+- [x] **F-RC10 钻取卡**：点事件 → 主因(置信度) + 前导曲线(±60s) + 偏离幅度(F-RC7) + 因果链图(F-RC9)
+- [x] **F-RC12 what-if 交互**：ComboBox 调 `DetectionConfig` 阈值，调 `detect_core` 实时重算显示「若阈值 X 是否触发」
+- [x] **F-RC13 画像展示**：当前事件匹配 `cluster_profiles`，显示「匹配已知画像：进程 Y 典型卡顿」
+- [ ] **`detect_core` 上提 core**（R6/R8）：把 `detect_core` 移入 `find_stutter_core`，detector 与 what-if 共用，消除阈值漂移（已知 deferred）

@@ -870,6 +870,7 @@ struct CulpritRow {
 
 // 原始事件表一行数据（Rust 端按此结构填充 event-model；高级模式 F5）
 struct EventRow {
+    id: int,               // 事件主键（stutter_events.id），供钻取卡关联（F-RC10）
     time: string,          // 本地时区时间 "YYYY-MM-DD HH:MM:SS"
     duration: string,      // "1500" 持续毫秒（数字串，便于排序显示）
     duration-ms: int,      // 原始毫秒（备用，当前未直接用于排序）
@@ -1010,6 +1011,31 @@ export component Analysis inherits Window {
     // F3（高级）：点击原始事件表某行 → 该次卡顿的 snapshot 详情面板文本
     in-out property <string> event-detail: "";
 
+    // === F-RC10/11/13：根因钻取卡（模态覆盖层）状态与内容 ===
+    // 模态是否可见（点事件行 → Rust 端置 true 并填充下方属性；关闭回调置 false）
+    in-out property <bool> root-cause-visible: false;
+    // 主因文本（cause_kind_label 映射后的中文）
+    in property <string> rc-primary: "";
+    // 置信度 0..1（进度条宽度比例）
+    in property <float> rc-confidence: 0.0;
+    // 置信度文字标签（高 / 较高 / 主因不显著，疑多因并发）
+    in property <string> rc-confidence-label: "";
+    // 因果链（cause_chain 映射后的中文，以「 → 」连接）
+    in property <string> rc-chain: "";
+    // 基线偏离（deviation_flags 结果，多行文本）
+    in property <string> rc-deviation: "";
+    // 画像对比（match_profile 结果：匹配已知画像 / 新情况）
+    in property <string> rc-profile: "";
+    // 前导曲线（事件 ±60s 资源图）；rc-has-leading 控制占位文本
+    in property <image> rc-leading-image;
+    in property <bool> rc-has-leading: false;
+    // F-RC12 what-if：客户端可调阈值（不改 service）；detector 默认阈值作初值（字符串，ComboBox 选中）
+    in-out property <string> wi-cpu: "90";
+    in-out property <string> wi-mem-pct: "90";
+    in-out property <string> wi-disk-busy: "95";
+    // F-RC12 what-if 重算结果文本
+    in property <string> wi-result: "";
+
     callback close-requested();
     callback refresh-requested();
     callback toggle-mode-changed(bool);
@@ -1033,6 +1059,10 @@ export component Analysis inherits Window {
     callback resource-hover(float);
     // F3（高级）：点击原始事件表某行（传该行在模型中的序号），Rust 端加载 snapshot 详情
     callback row-clicked(int);
+    // F-RC10/12/13：根因钻取卡「关闭」→ Rust 端隐藏模态
+    callback root-cause-closed();
+    // F-RC12：what-if「用当前阈值重算」→ Rust 端用 wi-* 阈值对当前事件 snapshot 调 detect_core
+    callback what-if-requested();
     // F3（高级）：切换某资源指标显隐（名 "cpu"/"mem"/"disk_read"/"disk_write"/"gpu"，状态）
     callback metric-toggled(string, bool);
     // F3（高级）：切换磁盘对数轴
@@ -1500,6 +1530,88 @@ export component Analysis inherits Window {
                         CheckBox { text: "磁盘写"; checked: true; toggled => { root.metric-toggled("disk_write", self.checked); } }
                         CheckBox { text: "GPU%"; checked: true; toggled => { root.metric-toggled("gpu", self.checked); } }
                         CheckBox { text: "对数轴（磁盘）"; checked: false; toggled => { root.log-axis-changed(self.checked); } }
+                    }
+                }
+            }
+        }
+
+        // ===== F-RC10/12/13：根因钻取卡（模态覆盖层）=====
+        // 点原始事件表某行时由 Rust 端置 root-cause-visible=true 并填充各属性；
+        // 「关闭」按钮触发 root-cause-closed 回调置 false。纯展示 + 客户端 what-if，不改库。
+        Rectangle {
+            visible: root.root-cause-visible;
+            width: 100%;
+            height: 100%;
+            background: #00000099;
+            Rectangle {
+                width: 820px;
+                height: 660px;
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                background: #ffffff;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: #c0c0c0;
+                VerticalLayout {
+                    padding: 10px;
+                    spacing: 8px;
+                    Rectangle {
+                        height: 28px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text { text: "根因钻取"; color: #1e1e2e; font-size: 14px; vertical-alignment: center; }
+                            Rectangle { min-width: 4px; }
+                            HorizontalLayout { horizontal-stretch: 0;
+                                Button { text: "关闭"; clicked => { root.root-cause-closed(); } }
+                            }
+                        }
+                    }
+                    // 主因 + 置信度 + 因果链 + 基线偏离 + 画像对比
+                    Rectangle {
+                        background: #f5f6fa; border-radius: 6px;
+                        VerticalLayout { padding: 8px; spacing: 4px;
+                            Text { text: "主因：" + root.rc-primary; color: #1e1e2e; font-size: 13px; font-weight: 700; }
+                            HorizontalLayout { spacing: 6px;
+                                Text { text: "置信度：" + root.rc-confidence-label; color: #1e1e2e; font-size: 12px; vertical-alignment: center; }
+                                Rectangle { width: 160px; height: 10px; background: #eceef3; border-radius: 5px;
+                                    Rectangle { height: 100%; width: parent.width * root.rc-confidence; background: #4c9ac4; border-radius: 5px; }
+                                }
+                            }
+                            Text { text: "因果链：" + root.rc-chain; color: #606066; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "基线偏离：" + root.rc-deviation; color: #606066; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "画像对比：" + root.rc-profile; color: #606066; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    // 前导曲线（事件 ±60s 资源图）
+                    Rectangle {
+                        min-height: 150px; vertical-stretch: 1;
+                        background: #fafbfc; border-radius: 6px; border-width: 1px; border-color: #e2e4ea;
+                        VerticalLayout { padding: 4px; spacing: 2px;
+                            Text { text: "前导资源曲线（事件 ±60s）"; color: #1e1e2e; font-size: 12px; font-weight: 700; }
+                            Image { visible: root.rc-has-leading; source: root.rc-leading-image; width: 100%; height: 100%; image-fit: contain; }
+                            Text { visible: !root.rc-has-leading; text: "暂无采样数据"; color: #909098; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    // F-RC12 what-if：阈值滑块（纯客户端模拟，不改 service）
+                    Rectangle {
+                        background: #f5f6fa; border-radius: 6px;
+                        VerticalLayout { padding: 8px; spacing: 4px;
+                            Text { text: "阈值敏感性 what-if（客户端模拟，不改配置）"; color: #1e1e2e; font-size: 12px; font-weight: 700; }
+                            HorizontalLayout { spacing: 6px;
+                                Text { text: "CPU%"; width: 48px; color: #606066; font-size: 11px; vertical-alignment: center; }
+                                ComboBox { width: 80px; model: ["90", "85", "80", "75", "70"]; selected(v) => { root.wi-cpu = v; } }
+                            }
+                            HorizontalLayout { spacing: 6px;
+                                Text { text: "内存%"; width: 48px; color: #606066; font-size: 11px; vertical-alignment: center; }
+                                ComboBox { width: 80px; model: ["90", "85", "80", "75", "70"]; selected(v) => { root.wi-mem-pct = v; } }
+                            }
+                            HorizontalLayout { spacing: 6px;
+                                Text { text: "磁盘%"; width: 48px; color: #606066; font-size: 11px; vertical-alignment: center; }
+                                ComboBox { width: 80px; model: ["95", "90", "85", "80", "70"]; selected(v) => { root.wi-disk-busy = v; } }
+                            }
+                            Button { text: "用当前阈值重算"; clicked => { root.what-if-requested(); } }
+                            Text { text: root.wi-result; color: #2c7a3d; font-size: 11px; wrap: word-wrap; }
+                        }
                     }
                 }
             }

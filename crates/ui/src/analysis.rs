@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slint::{Brush, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
+use find_stutter_core::{DetectionConfig, Sample};
 
 use crate::analytics::{
     self, parse_event_sort_column, EventRow, EventSnapshot, EventSort, ResourceView, TimeRange,
@@ -102,6 +103,8 @@ impl AnalysisWindow {
         let hover_snaps: Arc<Mutex<Vec<Option<EventSnapshot>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let table_events: Arc<Mutex<Vec<EventRow>>> = Arc::new(Mutex::new(Vec::new()));
+        // F-RC10/12：当前钻取卡事件的资源快照（供 what-if 重算）
+        let wi_sample: Arc<Mutex<Option<Sample>>> = Arc::new(Mutex::new(None));
         let resource_view: Arc<Mutex<ResourceView>> = Arc::new(Mutex::new(ResourceView::default()));
 
         // 皮肤注入：让 Analysis 主框架跟随 skin.toml（与 Overlay/ProcessList 一致）
@@ -378,10 +381,13 @@ impl AnalysisWindow {
             }
         });
 
-        // F3（高级）：点击原始事件表某行 → 加载该次卡顿的 snapshot 资源详情
+        // F3（高级）：点击原始事件表某行 → 加载该次卡顿的 snapshot 资源详情 + 根因钻取卡
         let weak_row = ui.as_weak();
         let te_for_row = table_events.clone();
         let db_for_row = db_path.clone();
+        let current_for_row = current_range.clone();
+        let custom_for_row = custom_range.clone();
+        let wi_for_row = wi_sample.clone();
         ui.on_row_clicked(move |idx: i32| {
             let events = te_for_row.lock().unwrap().clone();
             if idx < 0 || idx as usize >= events.len() {
@@ -393,6 +399,13 @@ impl AnalysisWindow {
                 "时间 {}\n严重 {} | 持续 {}ms\n原因 {}\n元凶 {}",
                 e.time_local, e.severity_cn, e.duration_ms, e.causes_text, e.culprits_text
             );
+            // F-RC10/11/13：打开根因钻取卡（纯客户端计算，不改库）
+            let mut rc_primary = String::from("未判定");
+            let mut rc_confidence = 0.0f32;
+            let mut rc_confidence_label = String::from("—");
+            let mut rc_chain = String::new();
+            let mut rc_deviation = String::from("（无元凶数据）");
+            let mut rc_profile = String::from("（无画像数据）");
             if let Ok(conn) = analytics::open_readonly(&db_for_row) {
                 if let Some(snap) = analytics::load_event_snapshot(&conn, e.ts_secs) {
                     detail.push_str(&format!(
@@ -406,9 +419,167 @@ impl AnalysisWindow {
                         detail.push_str(&format!(" / GPU {:.1}%", g));
                     }
                 }
+                // 回读完整事件（含结构化 cause_kinds / 基线 / 画像所需全部字段）
+                let range = resolve_range(
+                    current_for_row.lock().unwrap().clone(),
+                    &custom_for_row.lock().unwrap(),
+                );
+                let all = analytics::load_full_events(&conn, &range)
+                    .unwrap_or_default();
+                if let Some(ev) = all.iter().find(|ev| ev.id == e.id) {
+                    // 主因（F-RC5/11）
+                    if let Some(pk) = ev.primary_cause {
+                        rc_primary = analytics::cause_kind_label(pk).to_string();
+                    }
+                    // 置信度（F-RC11）
+                    let (conf, label) = analytics::root_cause_confidence(ev);
+                    rc_confidence = conf;
+                    rc_confidence_label = label.to_string();
+                    // 因果链（F-RC9）
+                    let chain: Vec<String> = analytics::cause_chain(ev)
+                        .iter()
+                        .map(|k| analytics::cause_kind_label(*k).to_string())
+                        .collect();
+                    rc_chain = if chain.is_empty() {
+                        "（无 cause）".to_string()
+                    } else {
+                        chain.join(" → ")
+                    };
+                    // 基线偏离（F-RC7）
+                    let baseline = analytics::process_baseline(&all);
+                    let flags = analytics::deviation_flags(ev, &baseline);
+                    rc_deviation = if flags.is_empty() {
+                        "（无元凶数据）".to_string()
+                    } else {
+                        flags
+                            .iter()
+                            .map(|(name, multiple, significant)| {
+                                let tag = if *significant { " ⚠显著偏离" } else { "" };
+                                format!("{}: 当前/典型 ≈ ×{:.1}{}", name, multiple, tag)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    // 画像对比（F-RC13）
+                    let profiles = analytics::cluster_profiles(&all);
+                    rc_profile = match analytics::match_profile(ev, &profiles) {
+                        Some(p) => p,
+                        None => "新情况：未匹配已知画像".to_string(),
+                    };
+                    // 存储 snapshot 供 what-if 重算（F-RC12）
+                    *wi_for_row.lock().unwrap() = Some(ev.snapshot.clone());
+                }
             }
             if let Some(ui) = weak_row.upgrade() {
                 ui.set_event_detail(SharedString::from(detail));
+                // 钻取卡内容
+                ui.set_rc_primary(SharedString::from(rc_primary));
+                ui.set_rc_confidence(rc_confidence);
+                ui.set_rc_confidence_label(SharedString::from(rc_confidence_label));
+                ui.set_rc_chain(SharedString::from(rc_chain));
+                ui.set_rc_deviation(SharedString::from(rc_deviation));
+                ui.set_rc_profile(SharedString::from(rc_profile));
+                // what-if 初值 = detector 默认阈值（不改 service）
+                let dflt = DetectionConfig::default();
+                ui.set_wi_cpu(SharedString::from(dflt.cpu_threshold.to_string()));
+                ui.set_wi_mem_pct(SharedString::from(dflt.mem_threshold_percent.to_string()));
+                ui.set_wi_disk_busy(SharedString::from(dflt.disk_busy_threshold_percent.to_string()));
+                ui.set_wi_result(SharedString::from(""));
+                // 前导曲线（事件 ±60s）后台渲染
+                let weak_lead = ui.as_weak();
+                let db_lead = db_for_row.clone();
+                let ts = e.ts_secs;
+                std::thread::Builder::new()
+                    .name("rc-leading-chart".into())
+                    .spawn(move || {
+                        if let Ok(c) = analytics::open_readonly(&db_lead) {
+                            if let Ok(data) =
+                                analytics::load_resource_samples_window(&c, ts, 60, 780)
+                            {
+                                super::render_resource_chart(
+                                    &data,
+                                    780,
+                                    150,
+                                    &ResourceView::default(),
+                                    move |image| {
+                                        slint::invoke_from_event_loop(move || {
+                                            if let Some(ui) = weak_lead.upgrade() {
+                                                if let Some(buf) = image {
+                                                    ui.set_rc_leading_image(slint::Image::from_rgba8(
+                                                        buf,
+                                                    ));
+                                                    ui.set_rc_has_leading(true);
+                                                } else {
+                                                    ui.set_rc_has_leading(false);
+                                                }
+                                            }
+                                        })
+                                        .ok();
+                                    },
+                                );
+                                return;
+                            }
+                        }
+                        slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = weak_lead.upgrade() {
+                                ui.set_rc_has_leading(false);
+                            }
+                        })
+                        .ok();
+                    })
+                    .ok();
+                // 显示钻取卡
+                ui.set_root_cause_visible(true);
+            }
+        });
+
+        // F-RC10/12/13：钻取卡「关闭」→ 隐藏模态
+        let weak_close_rc = ui.as_weak();
+        ui.on_root_cause_closed(move || {
+            if let Some(ui) = weak_close_rc.upgrade() {
+                ui.set_root_cause_visible(false);
+            }
+        });
+
+        // F-RC12：what-if「用当前阈值重算」→ 用滑块阈值对当前事件 snapshot 调 detect_core
+        // （纯客户端模拟，不改 service / config）
+        let wi_sample_for_wi = wi_sample.clone();
+        let weak_wi = ui.as_weak();
+        ui.on_what_if_requested(move || {
+            let sample = wi_sample_for_wi.lock().unwrap().clone();
+            if let Some(ui) = weak_wi.upgrade() {
+                let result = match sample {
+                    None => "请先点选一条事件再重算".to_string(),
+                    Some(s) => {
+                        // 用 what-if 阈值覆盖 detector 默认配置（仅客户端模拟）
+                        let mut cfg = DetectionConfig::default();
+                        cfg.cpu_threshold = ui
+                            .get_wi_cpu()
+                            .as_str()
+                            .trim()
+                            .parse()
+                            .unwrap_or(90.0);
+                        cfg.mem_threshold_percent = ui
+                            .get_wi_mem_pct()
+                            .as_str()
+                            .trim()
+                            .parse()
+                            .unwrap_or(90.0);
+                        cfg.disk_busy_threshold_percent = ui
+                            .get_wi_disk_busy()
+                            .as_str()
+                            .trim()
+                            .parse()
+                            .unwrap_or(95.0);
+                        let causes = analytics::detect_core(&s, &cfg);
+                        if causes.is_empty() {
+                            "未触发任何 cause（当前阈值下不卡顿）".to_string()
+                        } else {
+                            format!("若按此阈值，将触发：{}", causes.join("；"))
+                        }
+                    }
+                };
+                ui.set_wi_result(SharedString::from(result));
             }
         });
 
@@ -971,6 +1142,7 @@ fn refill_event_table(
                     let rows: Vec<crate::EventRow> = events
                         .iter()
                         .map(|e| crate::EventRow {
+                            id: e.id as i32,
                             time: SharedString::from(e.time_local.clone()),
                             duration: SharedString::from(format!("{}", e.duration_ms)),
                             duration_ms: e.duration_ms as i32,
