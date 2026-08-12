@@ -32,6 +32,31 @@ pub struct Sample {
     pub disk_read_bps: u64,
     pub disk_write_bps: u64,
 
+    // 系统级信号（F-RC2）：磁盘真繁忙度 + DPC/中断/上下文切换。
+    // 这些字段在 3.2 之后加入，旧库 snapshot JSON 若无此字段，
+    // 用 serde(default) 回退默认（0.0），避免反序列化失败（reader 读旧事件时用到）。
+    // 见 `卡顿根因分析-PRD.md` §3.2。
+    /// 磁盘繁忙度：`\PhysicalDisk(_Total)\% Disk Time`（%）。
+    /// 比 B/s 吞吐更准确地反映磁盘是否真正饱和（队列里排队的 IO）。
+    #[serde(default)]
+    pub disk_busy_percent: f32,
+    /// 单次 IO 延迟：`\PhysicalDisk(_Total)\Avg Disk sec/Transfer` 换算成毫秒。
+    /// 数值高说明磁盘每次 IO 都要等很久（机械盘寻道 / SSD 写放大等）。
+    #[serde(default)]
+    pub disk_avg_io_ms: f32,
+    /// 系统底层卡顿信号：`\Processor(_Total)\% DPC Time`（%）。
+    /// DPC（延迟过程调用）长时间占用 CPU 会挤占普通线程，造成「CPU 不忙但系统卡」。
+    #[serde(default)]
+    pub dpc_percent: f32,
+    /// 系统底层卡顿信号：`\Processor(_Total)\% Interrupt Time`（%）。
+    /// 中断处理长时间占用 CPU 同样挤占普通线程。
+    #[serde(default)]
+    pub interrupt_percent: f32,
+    /// 上下文切换速率：`\System\Context Switches/sec`（/s）。
+    /// 异常飙高（上下文切换风暴）会拖垮调度，是系统级卡顿真信号。
+    #[serde(default)]
+    pub context_switches_per_sec: f32,
+
     // 网络 I/O (bytes/sec)
     pub net_sent_bps: u64,
     pub net_recv_bps: u64,
@@ -72,6 +97,11 @@ impl Default for Sample {
             page_reads_per_sec: 0.0,
             disk_read_bps: 0,
             disk_write_bps: 0,
+            disk_busy_percent: 0.0,
+            disk_avg_io_ms: 0.0,
+            dpc_percent: 0.0,
+            interrupt_percent: 0.0,
+            context_switches_per_sec: 0.0,
             net_sent_bps: 0,
             net_recv_bps: 0,
             net_sent_total: 0,
@@ -160,10 +190,12 @@ impl std::fmt::Display for Severity {
 /// 结构化根因枚举（F-RC1）。
 ///
 /// 枚举值**直接对齐 `cause_key()` 的稳定类型 key**（不臆造），以字符串形式落库，
-/// 便于旧库回读与新库直接 `GROUP BY`。新增 cause（`DiskBusy` / `GpuHigh` /
-/// `ThermalThrottle` / `DpcInterrupt` / `InterruptStorm` / `ContextSwitchStorm` /
-/// `UiFrozen`）的 `from_cause` 映射随 F-RC2~F-RC4 检测器改造补齐；本枚举先把
-/// 槽位预留好，检测器一旦产出对应 cause 即可直接落入 `cause_kinds`。
+/// 便于旧库回读与新库直接 `GROUP BY`。`cause_kinds` 映射随检测器改造分批补齐：
+/// - F-RC1：CpuHigh / CpuSpike / MemLow / DiskSpike / NetSpike
+/// - F-RC2（本项）：DiskBusy / DpcInterrupt / InterruptStorm / ContextSwitchStorm
+/// - 尚未落地映射：`GpuHigh`（检测器未产出 GPU cause）、`ThermalThrottle`（F-RC4）、
+///   `UiFrozen`（F-RC3）——这些槽位已预留，对应检测器改造后 `from_cause` 即生效。
+/// 检测器一旦产出对应 cause，即可直接落入 `cause_kinds`。
 ///
 /// 注：`CpuSpike` 对齐 `cause_key()` 现有 `"CPU spike"` key——PRD §3.3 枚举清单未列，
 /// 但 `cause_key()` 实际产出该 key，若丢弃会导致「纯 CPU spike」事件 `cause_kinds`
@@ -195,6 +227,10 @@ const PREFIX_TO_KIND: &[(&str, CauseKind)] = &[
     ("CPU usage", CauseKind::CpuHigh),
     ("CPU spike", CauseKind::CpuSpike),
     ("Disk write", CauseKind::DiskSpike),
+    ("Disk busy", CauseKind::DiskBusy),
+    ("DPC time", CauseKind::DpcInterrupt),
+    ("Interrupt time", CauseKind::InterruptStorm),
+    ("Context switches", CauseKind::ContextSwitchStorm),
     ("Network", CauseKind::NetSpike),
     ("Memory usage", CauseKind::MemLow),
     ("Memory available", CauseKind::MemLow),
@@ -287,6 +323,28 @@ pub struct DetectionConfig {
     #[serde(default = "default_spike_min_bps")]
     pub spike_min_bps: u64,
     pub sustained_seconds: u32,
+    // ===== F-RC2 系统级信号阈值（带滞回）=====
+    /// 磁盘繁忙度阈值（% Disk Time）：超过即记为 `DiskBusy` cause。
+    /// 替代原来的磁盘 B/s spike——繁忙度才是磁盘真正饱和的真信号。
+    #[serde(default = "default_disk_busy_threshold_percent")]
+    pub disk_busy_threshold_percent: f32,
+    /// 单次 IO 延迟阈值（ms，来自 Avg Disk sec/Transfer）：超过即记为 `DiskBusy`。
+    /// 与 `disk_busy_threshold_percent` 为「或」关系：任一成立即磁盘繁忙。
+    #[serde(default = "default_disk_io_threshold_ms")]
+    pub disk_io_threshold_ms: f32,
+    /// `% DPC Time` 阈值（%）：超过即记为 `DpcInterrupt` cause（DPC 风暴）。
+    #[serde(default = "default_dpc_threshold_percent")]
+    pub dpc_threshold_percent: f32,
+    /// `% Interrupt Time` 阈值（%）：超过即记为 `InterruptStorm` cause（中断风暴）。
+    #[serde(default = "default_interrupt_threshold_percent")]
+    pub interrupt_threshold_percent: f32,
+    /// `Context Switches/sec` 阈值（/s）：超过即记为 `ContextSwitchStorm` cause（切换风暴）。
+    #[serde(default = "default_context_switch_threshold_per_sec")]
+    pub context_switch_threshold_per_sec: f32,
+    /// 系统级信号滞回比例（退出线 = 阈值 × 该比例）。避免在阈值附近反复横跳：
+    /// 触发后需明显回落（降到阈值的一半，默认 0.5）才解除激活。
+    #[serde(default = "default_sys_signal_hysteresis_ratio")]
+    pub sys_signal_hysteresis_ratio: f32,
 }
 
 impl Default for DetectionConfig {
@@ -302,6 +360,12 @@ impl Default for DetectionConfig {
             spike_ratio: 3.0,
             spike_min_bps: 2_000_000,
             sustained_seconds: 3,
+            disk_busy_threshold_percent: 95.0,
+            disk_io_threshold_ms: 50.0,
+            dpc_threshold_percent: 10.0,
+            interrupt_threshold_percent: 10.0,
+            context_switch_threshold_per_sec: 50_000.0,
+            sys_signal_hysteresis_ratio: 0.5,
         }
     }
 }
@@ -312,6 +376,26 @@ fn default_cpu_hysteresis() -> f32 {
 
 fn default_spike_min_bps() -> u64 {
     2_000_000
+}
+
+// F-RC2 系统级信号阈值默认值
+fn default_disk_busy_threshold_percent() -> f32 {
+    95.0
+}
+fn default_disk_io_threshold_ms() -> f32 {
+    50.0
+}
+fn default_dpc_threshold_percent() -> f32 {
+    10.0
+}
+fn default_interrupt_threshold_percent() -> f32 {
+    10.0
+}
+fn default_context_switch_threshold_per_sec() -> f32 {
+    50_000.0
+}
+fn default_sys_signal_hysteresis_ratio() -> f32 {
+    0.5
 }
 
 /// 采样配置
@@ -561,6 +645,11 @@ mod tests {
         assert_eq!(s.swap_usage_percent, 0.0);
         assert_eq!(s.disk_read_bps, 0);
         assert_eq!(s.disk_write_bps, 0);
+        assert_eq!(s.disk_busy_percent, 0.0);
+        assert_eq!(s.disk_avg_io_ms, 0.0);
+        assert_eq!(s.dpc_percent, 0.0);
+        assert_eq!(s.interrupt_percent, 0.0);
+        assert_eq!(s.context_switches_per_sec, 0.0);
         assert_eq!(s.net_sent_bps, 0);
         assert_eq!(s.net_recv_bps, 0);
         assert_eq!(s.net_sent_total, 0);
@@ -600,6 +689,13 @@ mod tests {
         assert_eq!(c.spike_ratio, 3.0);
         assert_eq!(c.spike_min_bps, 2_000_000);
         assert_eq!(c.sustained_seconds, 3);
+        // F-RC2 系统级信号阈值默认值
+        assert_eq!(c.disk_busy_threshold_percent, 95.0);
+        assert_eq!(c.disk_io_threshold_ms, 50.0);
+        assert_eq!(c.dpc_threshold_percent, 10.0);
+        assert_eq!(c.interrupt_threshold_percent, 10.0);
+        assert_eq!(c.context_switch_threshold_per_sec, 50_000.0);
+        assert_eq!(c.sys_signal_hysteresis_ratio, 0.5);
     }
 
     #[test]
@@ -728,6 +824,23 @@ mod tests {
             CauseKind::from_cause("Disk write spike: 1B/s → 3B/s"),
             Some(CauseKind::DiskSpike)
         );
+        // F-RC2：系统级信号映射
+        assert_eq!(
+            CauseKind::from_cause("Disk busy 98.0% (IO 12.5ms)"),
+            Some(CauseKind::DiskBusy)
+        );
+        assert_eq!(
+            CauseKind::from_cause("DPC time 12.0% > 10%"),
+            Some(CauseKind::DpcInterrupt)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Interrupt time 14.0% > 10%"),
+            Some(CauseKind::InterruptStorm)
+        );
+        assert_eq!(
+            CauseKind::from_cause("Context switches 60000/s > 50000/s"),
+            Some(CauseKind::ContextSwitchStorm)
+        );
         assert_eq!(
             CauseKind::from_cause("Network spike: 1B/s → 3B/s"),
             Some(CauseKind::NetSpike)
@@ -753,10 +866,13 @@ mod tests {
 
     #[test]
     fn cause_kind_from_cause_none_for_unmapped() {
-        // 尚未落地映射的 cause（如 F-RC2~F-RC4 的 DiskBusy/UiFrozen）暂返回 None，
-        // 不臆造枚举，避免 R2「分类不连续」。
-        assert_eq!(CauseKind::from_cause("Disk busy 98%"), None);
+        // 尚未落地映射的 cause（如 F-RC3 的 UiFrozen）仍返回 None，不臆造枚举，
+        // 避免 R2「分类不连续」；F-RC2 的 DiskBusy/DpcInterrupt/InterruptStorm/
+        // ContextSwitchStorm 已映射，不再返回 None（见上方 maps_known_keys）。
         assert_eq!(CauseKind::from_cause("UI frozen 200ms"), None);
+        // GpuHigh / ThermalThrottle 槽位已预留但检测器尚未产出对应 cause，亦返回 None
+        assert_eq!(CauseKind::from_cause("GPU usage 99%"), None);
+        assert_eq!(CauseKind::from_cause("Thermal throttle 95C"), None);
         // 完全无关文本也返回 None
         assert_eq!(CauseKind::from_cause("something else"), None);
     }

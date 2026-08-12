@@ -41,7 +41,12 @@ impl Logger {
                 thread_count INTEGER,
                 commit_bytes INTEGER,
                 commit_limit INTEGER,
-                page_reads_per_sec REAL
+                page_reads_per_sec REAL,
+                disk_busy_percent REAL,
+                disk_avg_io_ms REAL,
+                dpc_percent REAL,
+                interrupt_percent REAL,
+                context_switches_per_sec INTEGER
             );
             CREATE TABLE IF NOT EXISTS stutter_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,6 +95,16 @@ impl Logger {
         let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN commit_limit INTEGER;");
         let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN page_reads_per_sec REAL;");
 
+        // 迁移（F-RC2）：系统级信号落库列。逐条执行并忽略「列已存在」错误，
+        // 与上方 samples 迁移、F-RC1 stutter_events 迁移同一套路。旧库缺这些列时
+        // 补上，供 F-RC6 直接从 samples 表查询 disk_busy_percent / dpc_percent 等
+        // （PRD §3.2：`ALTER TABLE samples ADD COLUMN ...`）。
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN disk_busy_percent REAL;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN disk_avg_io_ms REAL;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN dpc_percent REAL;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN interrupt_percent REAL;");
+        let _ = conn.execute_batch("ALTER TABLE samples ADD COLUMN context_switches_per_sec INTEGER;");
+
         // M6：时间戳索引真正落地（PRD §3.3）。
         // 分析页严格只读 stutter.db，无法在只读连接上 CREATE INDEX，故索引必须在
         // service 端（本建表逻辑）创建——service 有写权限，重启/重装即生效。
@@ -128,8 +143,10 @@ impl Logger {
                     swap_usage_percent, disk_read_bps, disk_write_bps,
                     net_sent_bps, net_recv_bps, net_sent_total, net_recv_total,
                     gpu_usage, cpu_temp, gpu_temp, process_count, thread_count,
-                    commit_bytes, commit_limit, page_reads_per_sec
-                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                    commit_bytes, commit_limit, page_reads_per_sec,
+                    disk_busy_percent, disk_avg_io_ms, dpc_percent, interrupt_percent,
+                    context_switches_per_sec
+                ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28)",
             )?;
             for s in &self.buffer {
                 let core_str: String = s
@@ -162,6 +179,11 @@ impl Logger {
                     s.commit_bytes as i64,
                     s.commit_limit as i64,
                     s.page_reads_per_sec,
+                    s.disk_busy_percent,
+                    s.disk_avg_io_ms,
+                    s.dpc_percent,
+                    s.interrupt_percent,
+                    s.context_switches_per_sec as i64,
                 ])?;
             }
         }
@@ -466,6 +488,61 @@ mod tests {
             culprits: vec![],
             ..Default::default()
         }
+    }
+
+    /// F-RC2：系统级信号（disk_busy_percent / disk_avg_io_ms / dpc_percent /
+    /// interrupt_percent / context_switches_per_sec）应随 sample 落库 `samples`
+    /// 表并回读（PRD §3.2 要求 `ALTER TABLE samples ADD COLUMN ...`）。
+    #[test]
+    fn logger_persists_sys_signals() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir
+            .join("test_sys_signals.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = StorageConfig {
+            db_path: db_path.clone(),
+            retention_days: 30,
+        };
+        let mut logger = Logger::new(&config).unwrap();
+
+        let mut s = Sample::default();
+        s.disk_busy_percent = 98.0;
+        s.disk_avg_io_ms = 12.5;
+        s.dpc_percent = 15.0;
+        s.interrupt_percent = 18.0;
+        s.context_switches_per_sec = 80_000.0;
+        logger.write_sample(&s).unwrap();
+        logger.flush().unwrap();
+
+        // 回读刚写入的最新 sample
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let row: (f64, f64, f64, f64, i64) = conn
+            .query_row(
+                "SELECT disk_busy_percent, disk_avg_io_ms, dpc_percent, \
+                        interrupt_percent, context_switches_per_sec \
+                 FROM samples ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, f64>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, f64>(2)?,
+                        r.get::<_, f64>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 98.0);
+        assert_eq!(row.1, 12.5);
+        assert_eq!(row.2, 15.0);
+        assert_eq!(row.3, 18.0);
+        assert_eq!(row.4, 80_000);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // --- Logger::new ---

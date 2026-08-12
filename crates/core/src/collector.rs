@@ -282,6 +282,169 @@ impl Drop for PagingPdh {
     }
 }
 
+/// 系统级信号采样结果（F-RC2）。
+///
+/// 各字段含义见 `Sample` 对应字段与 `卡顿根因分析-PRD.md` §3.2。
+pub struct SysSample {
+    pub disk_busy_percent: f32,
+    pub disk_avg_io_ms: f32,
+    pub dpc_percent: f32,
+    pub interrupt_percent: f32,
+    pub context_switches_per_sec: f32,
+}
+
+impl Default for SysSample {
+    fn default() -> Self {
+        Self {
+            disk_busy_percent: 0.0,
+            disk_avg_io_ms: 0.0,
+            dpc_percent: 0.0,
+            interrupt_percent: 0.0,
+            context_switches_per_sec: 0.0,
+        }
+    }
+}
+
+/// Windows PDH-based system-level signal sampler（F-RC2）。
+///
+/// 单个 PDH query 同时挂载 5 个计数器，每 tick 采样一次：
+/// - `\PhysicalDisk(_Total)\% Disk Time`：磁盘繁忙度（%）
+/// - `\PhysicalDisk(_Total)\Avg Disk sec/Transfer`：单次 IO 延迟（秒，转 ms）
+/// - `\Processor(_Total)\% DPC Time`：DPC 占用（%）
+/// - `\Processor(_Total)\% Interrupt Time`：中断处理占用（%）
+/// - `\System\Context Switches/sec`：上下文切换速率（/s）
+///
+/// 这些都是瞬时/速率型计数器，开销极低（与 `DiskPdh` 同为 PDH 句柄，不走 WMI）。
+/// 数值全部用 `PDH_FMT_DOUBLE` 格式化以保留精度；CStatus != 0 或负数一律钳为 0。
+struct SysPdh {
+    query: PDH_HQUERY,
+    disk_time: PDH_HCOUNTER,
+    disk_avg_io: PDH_HCOUNTER,
+    dpc_time: PDH_HCOUNTER,
+    interrupt_time: PDH_HCOUNTER,
+    ctx_switch: PDH_HCOUNTER,
+}
+
+impl SysPdh {
+    fn new() -> Option<Self> {
+        unsafe {
+            let mut query: PDH_HQUERY = PDH_HQUERY::default();
+            if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
+                warn!("PdhOpenQueryW (sys) failed");
+                return None;
+            }
+
+            let mut disk_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut disk_avg_io: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut dpc_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut interrupt_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            let mut ctx_switch: PDH_HCOUNTER = PDH_HCOUNTER::default();
+
+            let disk_time_path = w!(r"\PhysicalDisk(_Total)\% Disk Time");
+            if PdhAddEnglishCounterW(query, disk_time_path, 0, &mut disk_time) != ERROR_SUCCESS.0 {
+                warn!("PdhAddEnglishCounterW (sys disk time) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            let disk_avg_io_path = w!(r"\PhysicalDisk(_Total)\Avg Disk sec/Transfer");
+            if PdhAddEnglishCounterW(query, disk_avg_io_path, 0, &mut disk_avg_io)
+                != ERROR_SUCCESS.0
+            {
+                warn!("PdhAddEnglishCounterW (sys disk avg io) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            let dpc_time_path = w!(r"\Processor(_Total)\% DPC Time");
+            if PdhAddEnglishCounterW(query, dpc_time_path, 0, &mut dpc_time) != ERROR_SUCCESS.0 {
+                warn!("PdhAddEnglishCounterW (sys dpc time) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            let interrupt_time_path = w!(r"\Processor(_Total)\% Interrupt Time");
+            if PdhAddEnglishCounterW(query, interrupt_time_path, 0, &mut interrupt_time)
+                != ERROR_SUCCESS.0
+            {
+                warn!("PdhAddEnglishCounterW (sys interrupt time) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+            let ctx_switch_path = w!(r"\System\Context Switches/sec");
+            if PdhAddEnglishCounterW(query, ctx_switch_path, 0, &mut ctx_switch) != ERROR_SUCCESS.0
+            {
+                warn!("PdhAddEnglishCounterW (sys ctx switch) failed");
+                PdhCloseQuery(query);
+                return None;
+            }
+
+            // 预采一次，给速率计数器（Context Switches/sec）建立基线。
+            PdhCollectQueryData(query);
+
+            Some(Self {
+                query,
+                disk_time,
+                disk_avg_io,
+                dpc_time,
+                interrupt_time,
+                ctx_switch,
+            })
+        }
+    }
+
+    /// 采集当前系统级信号快照。
+    fn sample(&self) -> SysSample {
+        unsafe {
+            if PdhCollectQueryData(self.query) != ERROR_SUCCESS.0 {
+                return SysSample::default();
+            }
+
+            let mut dt: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut dio: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut dpc: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut intr: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+            let mut ctx: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+
+            if PdhGetFormattedCounterValue(self.disk_time, PDH_FMT_DOUBLE, None, &mut dt)
+                != ERROR_SUCCESS.0
+                || PdhGetFormattedCounterValue(self.disk_avg_io, PDH_FMT_DOUBLE, None, &mut dio)
+                    != ERROR_SUCCESS.0
+                || PdhGetFormattedCounterValue(self.dpc_time, PDH_FMT_DOUBLE, None, &mut dpc)
+                    != ERROR_SUCCESS.0
+                || PdhGetFormattedCounterValue(self.interrupt_time, PDH_FMT_DOUBLE, None, &mut intr)
+                    != ERROR_SUCCESS.0
+                || PdhGetFormattedCounterValue(self.ctx_switch, PDH_FMT_DOUBLE, None, &mut ctx)
+                    != ERROR_SUCCESS.0
+            {
+                return SysSample::default();
+            }
+
+            let d = |v: &PDH_FMT_COUNTERVALUE| -> f32 {
+                if v.CStatus == 0 {
+                    v.Anonymous.doubleValue.max(0.0) as f32
+                } else {
+                    0.0
+                }
+            };
+
+            SysSample {
+                disk_busy_percent: d(&dt),
+                // Avg Disk sec/Transfer 是秒，×1000 转毫秒
+                disk_avg_io_ms: (d(&dio) * 1000.0),
+                dpc_percent: d(&dpc),
+                interrupt_percent: d(&intr),
+                context_switches_per_sec: d(&ctx),
+            }
+        }
+    }
+}
+
+impl Drop for SysPdh {
+    fn drop(&mut self) {
+        unsafe {
+            PdhCloseQuery(self.query);
+        }
+    }
+}
+
 pub struct Collector {
     sys: System,
     networks: Networks,
@@ -291,6 +454,8 @@ pub struct Collector {
     disk_pdh: Option<DiskPdh>,
     commit_pdh: Option<CommitPdh>,
     paging_pdh: Option<PagingPdh>,
+    /// 系统级信号采样器（F-RC2）：磁盘繁忙度 + DPC/中断/上下文切换
+    sys_pdh: Option<SysPdh>,
 }
 
 impl Collector {
@@ -309,6 +474,7 @@ impl Collector {
         let disk_pdh = DiskPdh::new();
         let commit_pdh = CommitPdh::new();
         let paging_pdh = PagingPdh::new();
+        let sys_pdh = SysPdh::new();
 
         Self {
             sys,
@@ -319,6 +485,7 @@ impl Collector {
             disk_pdh,
             commit_pdh,
             paging_pdh,
+            sys_pdh,
         }
     }
 
@@ -395,6 +562,12 @@ impl Collector {
             None => 0.0,
         };
 
+        // 系统级信号（F-RC2）：磁盘繁忙度 + DPC/中断/上下文切换，每 tick 采样。
+        let sys = match &self.sys_pdh {
+            Some(s) => s.sample(),
+            None => SysSample::default(),
+        };
+
         // Slow channel (every 5 ticks): CPU freq, GPU usage, temperature via WMI.
         // These are expensive/rarely-changing, so leaving them on the slow
         // channel is fine.
@@ -428,6 +601,11 @@ impl Collector {
             page_reads_per_sec,
             disk_read_bps,
             disk_write_bps,
+            disk_busy_percent: sys.disk_busy_percent,
+            disk_avg_io_ms: sys.disk_avg_io_ms,
+            dpc_percent: sys.dpc_percent,
+            interrupt_percent: sys.interrupt_percent,
+            context_switches_per_sec: sys.context_switches_per_sec,
             net_sent_bps,
             net_recv_bps,
             net_sent_total,
@@ -588,6 +766,32 @@ mod tests {
         assert!(
             !full.top_processes.is_empty(),
             "卡顿帧应构建 top_processes（真实进程数 > 0）"
+        );
+    }
+
+    /// F-RC2：每 tick 采样的系统级信号字段应存在且为有限非负数
+    /// （PDH 不可用时回落 0.0，不崩溃）。
+    #[test]
+    fn collector_collect_includes_sys_signals() {
+        let mut collector = Collector::new();
+        let sample = collector.collect();
+
+        // 全部有限、非负（磁盘繁忙度/IO 延迟/DPC/中断/上下文切换）
+        for v in [
+            sample.disk_busy_percent,
+            sample.disk_avg_io_ms,
+            sample.dpc_percent,
+            sample.interrupt_percent,
+            sample.context_switches_per_sec,
+        ] {
+            assert!(v.is_finite(), "系统信号应为有限值，got: {}", v);
+            assert!(v >= 0.0, "系统信号应非负，got: {}", v);
+        }
+        // 磁盘繁忙度上限 100%（% Disk Time 不可能超过 100）
+        assert!(
+            sample.disk_busy_percent <= 100.0,
+            "磁盘繁忙度不应超过 100%，got: {}",
+            sample.disk_busy_percent
         );
     }
 

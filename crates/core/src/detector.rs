@@ -14,9 +14,15 @@ pub struct Detector {
     /// spike 滞回状态（各指标独立）：触发后需明显回落才解除，
     /// 配合「连续确认」（recent 中 ≥6/10 超阈值）避免瞬时抖动误报
     cpu_spike_active: bool,
-    disk_spike_active: bool,
     net_spike_active: bool,
     mem_spike_active: bool,
+    /// F-RC2 系统级信号滞回状态（各指标独立）：触发后需降到「阈值×滞回比例」
+    /// 以下才解除，避免阈值附近反复横跳。磁盘繁忙度用 `disk_busy_active` 替代
+    /// 原磁盘 B/s spike（繁忙度才是磁盘真正饱和的真信号）。
+    disk_busy_active: bool,
+    dpc_active: bool,
+    interrupt_active: bool,
+    ctx_switch_active: bool,
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
@@ -37,9 +43,12 @@ impl Detector {
             current_causes: Vec::new(),
             cpu_active: false,
             cpu_spike_active: false,
-            disk_spike_active: false,
             net_spike_active: false,
             mem_spike_active: false,
+            disk_busy_active: false,
+            dpc_active: false,
+            interrupt_active: false,
+            ctx_switch_active: false,
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
@@ -248,6 +257,73 @@ impl Detector {
             ));
         }
 
+        // ===== F-RC2 系统级信号（带阈值 + 滞回）=====
+        // 这些信号每 tick 即时采样（非 spike 滑动基线），用硬阈值 + 滞回判定，
+        // 与 CPU 硬阈值模型一致。滞回比例取自 `sys_signal_hysteresis_ratio`
+        // （默认 0.5：触发后需降到阈值的一半才解除）。
+
+        // 磁盘真繁忙度：% Disk Time 或 单次 IO 延迟，任一超阈值即判定磁盘繁忙。
+        // 替代原磁盘 B/s spike——吞吐高不代表磁盘饱和，繁忙度/IO 延迟才是真信号。
+        let disk_busy = sample.disk_busy_percent > self.config.disk_busy_threshold_percent
+            || sample.disk_avg_io_ms > self.config.disk_io_threshold_ms;
+        if disk_busy {
+            self.disk_busy_active = true;
+        } else if sample.disk_busy_percent
+            <= self.config.disk_busy_threshold_percent * self.config.sys_signal_hysteresis_ratio
+            && sample.disk_avg_io_ms
+                <= self.config.disk_io_threshold_ms * self.config.sys_signal_hysteresis_ratio
+        {
+            self.disk_busy_active = false;
+        }
+        if self.disk_busy_active {
+            causes.push(format!(
+                "Disk busy {:.1}% (IO {:.1}ms)",
+                sample.disk_busy_percent, sample.disk_avg_io_ms
+            ));
+        }
+
+        // % DPC Time：DPC 长时间占用 CPU 会挤占普通线程（「CPU 不忙但系统卡」）。
+        self.dpc_active = sys_signal_hysteresis(
+            self.dpc_active,
+            sample.dpc_percent,
+            self.config.dpc_threshold_percent,
+            self.config.sys_signal_hysteresis_ratio,
+        );
+        if self.dpc_active {
+            causes.push(format!(
+                "DPC time {:.1}% > {}%",
+                sample.dpc_percent, self.config.dpc_threshold_percent
+            ));
+        }
+
+        // % Interrupt Time：中断处理长时间占用 CPU 同样挤占普通线程。
+        self.interrupt_active = sys_signal_hysteresis(
+            self.interrupt_active,
+            sample.interrupt_percent,
+            self.config.interrupt_threshold_percent,
+            self.config.sys_signal_hysteresis_ratio,
+        );
+        if self.interrupt_active {
+            causes.push(format!(
+                "Interrupt time {:.1}% > {}%",
+                sample.interrupt_percent, self.config.interrupt_threshold_percent
+            ));
+        }
+
+        // Context Switches/sec：上下文切换风暴会拖垮调度（系统级卡顿真信号）。
+        self.ctx_switch_active = sys_signal_hysteresis(
+            self.ctx_switch_active,
+            sample.context_switches_per_sec,
+            self.config.context_switch_threshold_per_sec,
+            self.config.sys_signal_hysteresis_ratio,
+        );
+        if self.ctx_switch_active {
+            causes.push(format!(
+                "Context switches {:.0}/s > {:.0}/s",
+                sample.context_switches_per_sec, self.config.context_switch_threshold_per_sec
+            ));
+        }
+
         causes
     }
 
@@ -277,18 +353,10 @@ impl Detector {
             &mut self.cpu_spike_active,
         );
 
-        let disk_r: Vec<f32> = recent.iter().map(|s| s.disk_write_bps as f32).collect();
-        let disk_b: Vec<f32> = baseline.iter().map(|s| s.disk_write_bps as f32).collect();
-        Self::spike_check(
-            &mut causes,
-            "Disk write",
-            "B/s",
-            &disk_r,
-            &disk_b,
-            self.config.disk_rate_spike_ratio,
-            self.config.spike_min_bps as f32,
-            &mut self.disk_spike_active,
-        );
+        // 磁盘 B/s spike 已移除：F-RC2 改用每 tick 的磁盘真繁忙度（% Disk Time /
+        // Avg Disk sec/Transfer）判定 `DiskBusy` cause（见 `check_hard_thresholds`），
+        // 吞吐高不代表磁盘饱和，繁忙度才是真信号。`disk_rate_spike_ratio` 配置项保留
+        // 供 F-RC12 what-if 复用，但检测器不再据此产出磁盘 spike。
 
         let net_r: Vec<f32> = recent
             .iter()
@@ -395,6 +463,22 @@ fn avg(v: &[f32]) -> f32 {
         0.0
     } else {
         v.iter().sum::<f32>() / v.len() as f32
+    }
+}
+
+/// 系统级信号滞回步进（F-RC2）：进入 > `threshold`；退出 < `threshold * ratio`；
+/// 滞回带内（`threshold*ratio` ~ `threshold`）维持当前 `active` 不变，
+/// 避免信号在阈值附近抖动导致反复横跳。返回更新后的激活状态。
+///
+/// `DiskBusy` 是「% Disk Time 或 IO 延迟」的复合信号（OR 进入 / AND 退出），
+/// 语义不同于单一阈值，故不走本helper，在 `check_hard_thresholds` 内单独处理。
+fn sys_signal_hysteresis(active: bool, value: f32, threshold: f32, ratio: f32) -> bool {
+    if value > threshold {
+        true
+    } else if value <= threshold * ratio {
+        false
+    } else {
+        active
     }
 }
 
@@ -533,6 +617,150 @@ mod tests {
             d2.current_causes.is_empty(),
             "分页速率未达阈值不应触发，got: {:?}",
             d2.current_causes
+        );
+    }
+
+    /// F-RC2：磁盘真繁忙度（% Disk Time 或 IO 延迟）超阈值应触发 `DiskBusy` cause，
+    /// 且落库结构化根因为 `CauseKind::DiskBusy`（替代原磁盘 B/s spike）。
+    #[test]
+    fn analyze_disk_busy_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.disk_busy_percent = 98.0; // % Disk Time 超 95
+        d.analyze(&s);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Disk busy")),
+            "磁盘繁忙度超阈值应触发 DiskBusy，got: {:?}",
+            d.current_causes
+        );
+
+        // IO 延迟口径同样应触发（与 % Disk Time 为「或」）
+        let mut s2 = make_sample(30.0, 2000, 10.0);
+        s2.disk_avg_io_ms = 120.0;
+        let mut d2 = Detector::new(&config);
+        d2.analyze(&s2);
+        assert!(
+            d2.current_causes.iter().any(|c| c.contains("Disk busy")),
+            "IO 延迟超阈值应触发 DiskBusy，got: {:?}",
+            d2.current_causes
+        );
+
+        // 落库结构化根因
+        for _ in 0..2 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::DiskBusy),
+            "cause_kinds 应含 DiskBusy，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC2：% DPC Time 超阈值应触发 `DpcInterrupt` cause 并落库 `CauseKind::DpcInterrupt`。
+    #[test]
+    fn analyze_dpc_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.dpc_percent = 15.0;
+        d.analyze(&s);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("DPC time")),
+            "DPC time 超阈值应触发 DpcInterrupt，got: {:?}",
+            d.current_causes
+        );
+        for _ in 0..2 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::DpcInterrupt),
+            "cause_kinds 应含 DpcInterrupt，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC2：% Interrupt Time 超阈值应触发 `InterruptStorm` cause 并落库 `CauseKind::InterruptStorm`。
+    #[test]
+    fn analyze_interrupt_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.interrupt_percent = 18.0;
+        d.analyze(&s);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Interrupt time")),
+            "Interrupt time 超阈值应触发 InterruptStorm，got: {:?}",
+            d.current_causes
+        );
+        for _ in 0..2 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::InterruptStorm),
+            "cause_kinds 应含 InterruptStorm，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC2：`Context Switches/sec` 超阈值应触发 `ContextSwitchStorm` cause
+    /// 并落库 `CauseKind::ContextSwitchStorm`。
+    #[test]
+    fn analyze_context_switch_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.context_switches_per_sec = 80_000.0;
+        d.analyze(&s);
+        assert!(
+            d.current_causes
+                .iter()
+                .any(|c| c.contains("Context switches")),
+            "Context switches 超阈值应触发 ContextSwitchStorm，got: {:?}",
+            d.current_causes
+        );
+        for _ in 0..2 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(
+            event.cause_kinds.contains(&CauseKind::ContextSwitchStorm),
+            "cause_kinds 应含 ContextSwitchStorm，got: {:?}",
+            event.cause_kinds
+        );
+    }
+
+    /// F-RC2 回归：磁盘高吞吐（disk_write_bps 大）不再触发「Disk write spike」——
+    /// 已改用磁盘真繁忙度（% Disk Time / IO 延迟）判定，避免吞吐高但磁盘不忙时误报。
+    #[test]
+    fn analyze_no_disk_write_spike_cause() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 高磁盘写吞吐，但磁盘不忙、IO 延迟低、其它资源正常
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.disk_write_bps = 50_000_000; // 50 MB/s
+        d.analyze(&s);
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Disk write")),
+            "高吞吐但磁盘不忙不应触发磁盘 spike，got: {:?}",
+            d.current_causes
         );
     }
 
