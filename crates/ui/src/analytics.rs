@@ -20,7 +20,8 @@ use std::path::Path;
 
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use find_stutter_core::{
-    CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent,
+    CauseKind, DetectionConfig, ProcessBrief, ProcessModule, RootCauseReport, Sample, Severity,
+    StackSample, StutterEvent, WindowsEventRecord,
 };
 use rusqlite::{params, Connection, OpenFlags};
 
@@ -128,7 +129,122 @@ pub fn open_readonly(db_path: &Path) -> anyhow::Result<Connection> {
     let _ = conn.execute_batch("PRAGMA journal_mode=WAL;");
     Ok(conn)
 }
+// =====================================================================
+// F-RC15：分析结论落库（root_cause_reports，GUI 窄写权 + UPSERT 幂等）
+// =====================================================================
+/// 当前分析算法版本（写 root_cause_reports.algorithm_version，用于回溯审计 / 新旧结论对比）。
+/// 算法升级后递增；GUI 读回旧结论时发现版本不一致，可提示用户重新生成。
+pub const ANALYSIS_ALGO_VERSION: &str = "rc5-rc14.v1";
 
+/// F-RC15：打开一个「窄写权」连接，仅供 GUI 写入 root_cause_reports 分析结论。
+///
+/// 设计要点：
+/// - 整个分析页其余读路径严格保持只读（`open_readonly`），不碰 samples / stutter_events；
+/// - 本连接仅在用户点击「保存结论」时创建，只执行 root_cause_reports 的 UPSERT，
+///   写完即弃，持有时间极短；
+/// - WAL 模式下读写并发安全，service 写库不受影响。
+pub fn open_report_writer(db_path: &Path) -> anyhow::Result<Connection> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    Ok(conn)
+}
+
+/// F-RC15：幂等确保 root_cause_reports 表存在（兼容旧库 / 旧版本 GUI 首次写结论）。
+/// 与 logger 侧共享同一 DDL 定义（find_stutter_core::logger），避免 SQL 重复。
+pub fn ensure_report_table(conn: &Connection) -> anyhow::Result<()> {
+    find_stutter_core::logger::ensure_root_cause_report_table(conn)
+}
+
+/// F-RC15：UPSERT 一条分析结论。按 event_id 幂等（一事件一条），algorithm_version 记录
+/// 算法版本——重算后覆盖旧结论，读回可对比新旧（PRD §5.1/R12）。
+/// 与 logger 侧共享同一 UPSERT 语句（find_stutter_core::logger），避免 SQL 重复。
+pub fn save_root_cause_report(conn: &Connection, report: &RootCauseReport) -> anyhow::Result<()> {
+    find_stutter_core::logger::upsert_root_cause_report(conn, report)
+}
+
+// =====================================================================
+// F-RC16：软件根因回溯数据（root_cause_reports + 三张子表）
+// =====================================================================
+/// 某事件的软件根因回溯数据：已保存结论 + 进程模块 / 事件日志 / 调用栈热点。
+#[derive(Debug, Clone, Default)]
+pub struct SoftwareRootCauseData {
+    /// 已保存的分析结论（无则为 None）
+    pub report: Option<RootCauseReport>,
+    /// 进程已加载模块快照（F-RC14-b）
+    pub modules: Vec<ProcessModule>,
+    /// 白名单命中的事件日志（F-RC14-c）
+    pub win_events: Vec<WindowsEventRecord>,
+    /// 调用栈热点（F-RC14-d）
+    pub stack_samples: Vec<StackSample>,
+}
+
+/// F-RC16：回读某事件的软件根因回溯数据（结论 + 三张子表），全程只读。
+/// 表不存在（旧库）时优雅返回默认空结构，不报错。
+pub fn load_software_root_cause(
+    conn: &Connection,
+    event_id: i64,
+) -> anyhow::Result<SoftwareRootCauseData> {
+    let mut out = SoftwareRootCauseData::default();
+    let report_sql = "SELECT event_id, algorithm_version, primary_cause, confidence, cause_chain, software_root_cause, baseline_delta, computed_at FROM root_cause_reports WHERE event_id = ?1";
+    if let Ok(mut stmt) = conn.prepare_cached(report_sql) {
+        let mut rows = stmt.query(params![event_id])?;
+        if let Some(row) = rows.next()? {
+            out.report = Some(RootCauseReport {
+                event_id: row.get(0)?,
+                algorithm_version: row.get(1)?,
+                primary_cause: row.get(2)?,
+                confidence: row.get::<_, f64>(3)? as f32,
+                cause_chain: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                software_root_cause: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or(serde_json::Value::Null),
+                baseline_delta: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or(serde_json::Value::Null),
+                computed_at: row.get(7)?,
+            });
+        }
+    }
+    let modules_sql = "SELECT pid, process_name, module_path, module_size FROM process_modules WHERE event_id = ?1 ORDER BY module_size DESC";
+    if let Ok(mut stmt) = conn.prepare_cached(modules_sql) {
+        let mut rows = stmt.query(params![event_id])?;
+        while let Some(row) = rows.next()? {
+            out.modules.push(ProcessModule {
+                pid: row.get(0)?,
+                process_name: row.get(1)?,
+                module_path: row.get(2)?,
+                module_size: row.get::<_, i64>(3)? as u64,
+            });
+        }
+    }
+    let win_sql = "SELECT channel, provider, win_event_id, level, message, ts FROM windows_events WHERE event_id = ?1 ORDER BY ts DESC";
+    if let Ok(mut stmt) = conn.prepare_cached(win_sql) {
+        let mut rows = stmt.query(params![event_id])?;
+        while let Some(row) = rows.next()? {
+            out.win_events.push(WindowsEventRecord {
+                channel: row.get(0)?,
+                provider: row.get(1)?,
+                win_event_id: row.get(2)?,
+                level: row.get(3)?,
+                message: row.get(4)?,
+                ts: row.get(5)?,
+            });
+        }
+    }
+    let stack_sql = "SELECT pid, process_name, module, rva, sample_count FROM stack_samples WHERE event_id = ?1 ORDER BY sample_count DESC";
+    if let Ok(mut stmt) = conn.prepare_cached(stack_sql) {
+        let mut rows = stmt.query(params![event_id])?;
+        while let Some(row) = rows.next()? {
+            out.stack_samples.push(StackSample {
+                pid: row.get(0)?,
+                process_name: row.get(1)?,
+                module: row.get(2)?,
+                rva: row.get::<_, i64>(3)? as u64,
+                sample_count: row.get::<_, i64>(4)? as u64,
+            });
+        }
+    }
+    Ok(out)
+}
 /// 幂等创建时间戳索引（PRD §3.3 / M2）。
 ///
 /// 旧库 `stutter_events`/`samples` 无 timestamp 索引，按时间范围聚合会全表扫描；
@@ -1459,6 +1575,38 @@ pub fn cause_kind_label(kind: CauseKind) -> &'static str {
         CauseKind::ContextSwitchStorm => "上下文切换风暴",
         CauseKind::NetSpike => "网络突增",
         CauseKind::UiFrozen => "界面冻结",
+        CauseKind::ProcessHandleLeak => "句柄泄漏",
+        CauseKind::GdiObjectLeak => "GDI 对象泄漏",
+        CauseKind::DriverTimeout => "驱动超时",
+        CauseKind::ServiceCrash => "服务崩溃",
+        CauseKind::DiskIoError => "磁盘 I/O 错误",
+        CauseKind::HardwareError => "硬件错误",
+    }
+}
+
+/// F-RC15：把落库的稳定 CauseKind key（`{:?}` 变体名，如 "CpuHigh"）解析回枚举。
+/// 与 [`cause_kind_label`] 成对：落库存 key、展示转 label，回读不丢类型。
+pub fn cause_kind_from_key(key: &str) -> Option<CauseKind> {
+    match key {
+        "CpuHigh" => Some(CauseKind::CpuHigh),
+        "CpuSpike" => Some(CauseKind::CpuSpike),
+        "MemLow" => Some(CauseKind::MemLow),
+        "DiskBusy" => Some(CauseKind::DiskBusy),
+        "DiskSpike" => Some(CauseKind::DiskSpike),
+        "GpuHigh" => Some(CauseKind::GpuHigh),
+        "ThermalThrottle" => Some(CauseKind::ThermalThrottle),
+        "DpcInterrupt" => Some(CauseKind::DpcInterrupt),
+        "InterruptStorm" => Some(CauseKind::InterruptStorm),
+        "ContextSwitchStorm" => Some(CauseKind::ContextSwitchStorm),
+        "NetSpike" => Some(CauseKind::NetSpike),
+        "UiFrozen" => Some(CauseKind::UiFrozen),
+        "ProcessHandleLeak" => Some(CauseKind::ProcessHandleLeak),
+        "GdiObjectLeak" => Some(CauseKind::GdiObjectLeak),
+        "DriverTimeout" => Some(CauseKind::DriverTimeout),
+        "ServiceCrash" => Some(CauseKind::ServiceCrash),
+        "DiskIoError" => Some(CauseKind::DiskIoError),
+        "HardwareError" => Some(CauseKind::HardwareError),
+        _ => None,
     }
 }
 
@@ -1663,6 +1811,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();        let base = local_midnight_utc();
@@ -1681,6 +1830,7 @@ mod tests {
                     name: format!("app{}.exe", i % 2),
                     cpu_usage: 80.0,
                     mem_used_mb: 200,
+                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -1696,6 +1846,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -1716,6 +1867,7 @@ mod tests {
                     name: format!("app{}.exe", i % 2),
                     cpu_usage: 80.0,
                     mem_used_mb: 200,
+                    ..Default::default()
                 }],
                 ..Default::default()
             };
@@ -1850,6 +2002,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -1880,6 +2033,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: cpu,
             mem_used_mb: mem,
+            ..Default::default()
         };
         let culprits = vec![
             vec![pb(1, "app.exe", 90.0, 500), pb(2, "bg.exe", 10.0, 100)],
@@ -1918,6 +2072,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 50.0,
             mem_used_mb: 100,
+            ..Default::default()
         };
         let culprits = vec![
             vec![pb(1, "a.exe")],
@@ -2027,6 +2182,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2042,6 +2198,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2092,6 +2249,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2132,6 +2290,7 @@ mod tests {
             let cfg = StorageConfig {
                 db_path: db.clone(),
                 retention_days: 30,
+                event_retention_days: 30,
             };
             let logger = Logger::new(&cfg).unwrap();
             logger.write_event(&ev).unwrap();
@@ -2152,6 +2311,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 50.0,
             mem_used_mb: 100,
+            ..Default::default()
         };
         let culprits = vec![vec![pb(1, "app.exe")], vec![pb(2, "svc.exe")]];
         let causes = vec![
@@ -2182,6 +2342,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 50.0,
             mem_used_mb: 100,
+            ..Default::default()
         };
         let culprits = vec![vec![pb(1, "app.exe"), pb(2, "bg.exe")]];
         let causes = vec![vec![
@@ -2255,6 +2416,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 50.0,
             mem_used_mb: 100,
+            ..Default::default()
         };
         let culprits = vec![vec![pb(1, "app.exe")], vec![pb(2, "svc.exe")], vec![pb(3, "bg.exe")]];
         let causes = vec![
@@ -2264,7 +2426,7 @@ mod tests {
         ];
         let db = unique_db("events_sort");
         {
-            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30 };
+            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30 };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();
             let base = local_midnight_utc();
@@ -2375,6 +2537,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: cpu,
             mem_used_mb: mem,
+            ..Default::default()
         };
         let mut s1 = Sample::default();
         s1.cpu_usage = 100.0;
@@ -2443,6 +2606,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: cpu,
             mem_used_mb: mem,
+            ..Default::default()
         };
         // appA.exe 出现 3 次（cpu 均为 50）→ baseline: typical_cpu=50, appearances=3
         // appB.exe 仅出现 1 次（appearances<3）
@@ -2496,6 +2660,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 10.0,
             mem_used_mb: 50,
+            ..Default::default()
         };
         // 事件1: A+B+C；事件2: A+B；事件3: A+B → A+B 共现 3 次，A+C / B+C 各 1 次
         let ev1 = mk_event(
@@ -2655,6 +2820,7 @@ mod tests {
             name: name.to_string(),
             cpu_usage: 10.0,
             mem_used_mb: 50,
+            ..Default::default()
         };
         // 2 个同 signature 事件：CpuHigh + appA.exe + 中桶(2000/3000ms)
         let mk = |dur: u64| {
@@ -2710,9 +2876,10 @@ mod tests {
             name: name.to_string(),
             cpu_usage: cpu,
             mem_used_mb: mem,
+            ..Default::default()
         };
         let db = unique_db("full_events");
-        let mut ev = find_stutter_core::StutterEvent {
+        let ev = find_stutter_core::StutterEvent {
             timestamp: local_midnight_utc() + ChronoDuration::minutes(5),
             duration_ms: 1500,
             severity: Severity::Major,
@@ -2738,7 +2905,7 @@ mod tests {
             ..Default::default()
         };
         {
-            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30 };
+            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30 };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();
             logger.write_event(&ev).unwrap();

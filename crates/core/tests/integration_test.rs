@@ -1,6 +1,39 @@
 use find_stutter_core::*;
 use std::time::Duration;
 
+// F-RC15 集成测试辅助：回读某事件的软件根因子表行数与结论版本（本地连接，不改生产 API）。
+#[derive(Default)]
+struct BackCounts {
+    modules: u64,
+    win_events: u64,
+    stack_samples: u64,
+    reports: u64,
+    report_version: Option<String>,
+}
+
+fn read_back_counts(db_path: &str, event_id: i64) -> BackCounts {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    let mut out = BackCounts::default();
+    let count = |sql: &str| -> u64 {
+        conn.query_row(sql, rusqlite::params![event_id], |r| r.get::<_, i64>(0))
+            .unwrap_or(0) as u64
+    };
+    out.modules = count("SELECT COUNT(*) FROM process_modules WHERE event_id = ?1");
+    out.win_events = count("SELECT COUNT(*) FROM windows_events WHERE event_id = ?1");
+    out.stack_samples = count("SELECT COUNT(*) FROM stack_samples WHERE event_id = ?1");
+    out.reports = count("SELECT COUNT(*) FROM root_cause_reports WHERE event_id = ?1");
+    if out.reports > 0 {
+        out.report_version = conn
+            .query_row(
+                "SELECT algorithm_version FROM root_cause_reports WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+    }
+    out
+}
+
 // ========== Config Tests ==========
 
 #[test]
@@ -341,4 +374,109 @@ fn collector_detector_pipeline() {
 
     // Pipeline should not crash
     assert!(true);
+}
+// ========== Integration: F-RC14/F-RC15 软件根因数据落库 + 级联清理 + 结论 UPSERT ==========
+
+#[test]
+fn software_root_cause_tables_write_and_cascade_cleanup() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let db_path = std::env::temp_dir()
+        .join(format!("fs_src_test_{}.db", nanos))
+        .to_str()
+        .unwrap()
+        .to_string();
+    let config = StorageConfig {
+        db_path: db_path.clone(),
+        retention_days: 30,
+        event_retention_days: 30,
+    };
+    let mut logger = Logger::new(&config).unwrap();
+
+    // 1) 写一个事件，拿到真实主键 id
+    let event = StutterEvent {
+        timestamp: chrono::Utc::now(),
+        duration_ms: 3000,
+        severity: Severity::Major,
+        causes: vec!["CPU High".to_string()],
+        cause_kinds: vec![CauseKind::CpuHigh, CauseKind::ProcessHandleLeak],
+        culprits: vec![ProcessBrief {
+            pid: 777,
+            name: "hog.exe".into(),
+            cpu_usage: 95.0,
+            mem_used_mb: 512,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let event_id = logger.write_event(&event).unwrap();
+    assert!(event_id > 0, "write_event 必须返回真实自增主键");
+
+    // 2) 写三张子表数据
+    let modules = vec![ProcessModule {
+        pid: 777,
+        process_name: "hog.exe".into(),
+        module_path: "C:\\Windows\\System32\\ntdll.dll".into(),
+        module_size: 2_097_152,
+    }];
+    let win_events = vec![WindowsEventRecord {
+        channel: "System".into(),
+        provider: "disk".into(),
+        win_event_id: 7,
+        level: "Warning".into(),
+        message: "The device \\Device\\Harddisk0\\DR0 has a bad block.".into(),
+        ts: chrono::Utc::now().to_rfc3339(),
+    }];
+    let stack_samples = vec![StackSample {
+        pid: 777,
+        process_name: "hog.exe".into(),
+        module: "C:\\Windows\\System32\\ntdll.dll".into(),
+        rva: 0x1234,
+        sample_count: 42,
+    }];
+    logger
+        .write_software_root_cause_data(event_id, &modules, &win_events, &stack_samples)
+        .unwrap();
+    logger.flush().unwrap();
+
+    // 3) 回读校验各表命中
+    let read = read_back_counts(&db_path, event_id);
+    assert_eq!(read.modules, 1);
+    assert_eq!(read.win_events, 1);
+    assert_eq!(read.stack_samples, 1);
+
+    // 4) 结论 UPSERT：写两次同 event_id，仅一条且为最新版本
+    let report = RootCauseReport {
+        event_id,
+        algorithm_version: "rc5-rc14.v1".into(),
+        primary_cause: "CPU 占用高".into(),
+        confidence: 0.8,
+        cause_chain: vec!["CPU 占用高".into(), "句柄泄漏".into()],
+        software_root_cause: serde_json::json!({"software_cause": "句柄泄漏"}),
+        baseline_delta: serde_json::json!({"deviation": ""}),
+        computed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    logger.write_root_cause_report(&report).unwrap();
+    let report_v2 = RootCauseReport {
+        algorithm_version: "rc5-rc14.v2".into(),
+        ..report.clone()
+    };
+    logger.write_root_cause_report(&report_v2).unwrap();
+    let read = read_back_counts(&db_path, event_id);
+    assert_eq!(read.reports, 1, "UPSERT 后同 event_id 应只有一条结论");
+    assert_eq!(read.report_version, Some("rc5-rc14.v2".to_string()));
+
+    // 5) 级联清理：retention=0 清空事件 → 子表随 FK ON DELETE CASCADE 一并清空
+    logger.cleanup_with_retention(0).unwrap();
+    let read = read_back_counts(&db_path, event_id);
+    assert_eq!(read.modules, 0, "级联删除后 modules 应清空");
+    assert_eq!(read.win_events, 0, "级联删除后 win_events 应清空");
+    assert_eq!(read.stack_samples, 0, "级联删除后 stack_samples 应清空");
+    assert_eq!(read.reports, 0, "级联删除后 root_cause_reports 应清空");
+
+    std::fs::remove_file(&db_path).ok();
+    std::fs::remove_file(format!("{}-wal", db_path)).ok();
+    std::fs::remove_file(format!("{}-shm", db_path)).ok();
 }

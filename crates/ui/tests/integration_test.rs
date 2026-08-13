@@ -119,6 +119,7 @@ fn reader_poll_picks_up_running_service() {
     let cfg = StorageConfig {
         db_path: db.clone(),
         retention_days: 30,
+        event_retention_days: 30,
     };
     let mut logger = Logger::new(&cfg).unwrap();
     logger.touch_heartbeat().unwrap();
@@ -156,6 +157,7 @@ fn reader_poll_stopped_when_no_heartbeat() {
     let cfg = StorageConfig {
         db_path: db.clone(),
         retention_days: 30,
+        event_retention_days: 30,
     };
     let mut logger = Logger::new(&cfg).unwrap();
     // 只写 sample，不写心跳

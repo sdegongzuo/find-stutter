@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use slint::{Brush, Color, ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
-use find_stutter_core::{DetectionConfig, Sample};
+use find_stutter_core::{DetectionConfig, Sample, StutterEvent};
 
 use crate::analytics::{
     self, parse_event_sort_column, EventRow, EventSnapshot, EventSort, ResourceView, TimeRange,
@@ -105,6 +105,10 @@ impl AnalysisWindow {
         let table_events: Arc<Mutex<Vec<EventRow>>> = Arc::new(Mutex::new(Vec::new()));
         // F-RC10/12：当前钻取卡事件的资源快照（供 what-if 重算）
         let wi_sample: Arc<Mutex<Option<Sample>>> = Arc::new(Mutex::new(None));
+        // F-RC15/16：当前钻取卡事件（id + 完整事件，供「保存结论 / 回溯结论」回调使用）
+        let rc_current: Arc<Mutex<Option<(i64, StutterEvent)>>> = Arc::new(Mutex::new(None));
+        // F-RC15：当前钻取卡「基线偏离」文本（保存结论时写入 baseline_delta）
+        let rc_deviation_holder: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let resource_view: Arc<Mutex<ResourceView>> = Arc::new(Mutex::new(ResourceView::default()));
 
         // 皮肤注入：让 Analysis 主框架跟随 skin.toml（与 Overlay/ProcessList 一致）
@@ -388,6 +392,8 @@ impl AnalysisWindow {
         let current_for_row = current_range.clone();
         let custom_for_row = custom_range.clone();
         let wi_for_row = wi_sample.clone();
+        let rc_current_for_row = rc_current.clone();
+        let rc_deviation_for_row = rc_deviation_holder.clone();
         ui.on_row_clicked(move |idx: i32| {
             let events = te_for_row.lock().unwrap().clone();
             if idx < 0 || idx as usize >= events.len() {
@@ -406,6 +412,12 @@ impl AnalysisWindow {
             let mut rc_chain = String::new();
             let mut rc_deviation = String::from("（无元凶数据）");
             let mut rc_profile = String::from("（无画像数据）");
+            // F-RC14/16：软件根因区块（元凶软件 / 事件日志 / 可疑模块 / 调用栈热点 / 结论状态）
+            let mut rc_software_root = String::from("（未识别到软件级根因）");
+            let mut rc_win_events = String::from("（无事件日志命中）");
+            let mut rc_modules = String::from("（无可疑模块）");
+            let mut rc_stack_hotspots = String::from("（无调用栈热点）");
+            let mut rc_saved_version = String::from("尚未保存结论");
             if let Ok(conn) = analytics::open_readonly(&db_for_row) {
                 if let Some(snap) = analytics::load_event_snapshot(&conn, e.ts_secs) {
                     detail.push_str(&format!(
@@ -468,6 +480,141 @@ impl AnalysisWindow {
                     };
                     // 存储 snapshot 供 what-if 重算（F-RC12）
                     *wi_for_row.lock().unwrap() = Some(ev.snapshot.clone());
+                    // 存储基线偏离文本（F-RC15 保存结论用）
+                    *rc_deviation_for_row.lock().unwrap() = rc_deviation.clone();
+                    // 存储当前事件供「保存结论 / 回溯结论」回调（F-RC15/16）
+                    *rc_current_for_row.lock().unwrap() = Some((e.id, ev.clone()));
+                    // F-RC15：打开钻取卡即自动落库结论（幂等 UPSERT，窄写权连接用完即弃）。
+                    // 二次打开由「回溯结论」直接回读；算法版本变更后下次打开自动覆盖旧结论。
+                    let auto_report = build_root_cause_report(e.id, ev, rc_confidence, &rc_deviation);
+                    if let Ok(writer) = analytics::open_report_writer(&db_for_row) {
+                        let _ = analytics::ensure_report_table(&writer)
+                            .and_then(|_| analytics::save_root_cause_report(&writer, &auto_report));
+                        let _ = writer.close();
+                    }
+                    // F-RC14/16：软件根因区块（元凶软件 + 事件日志 / 可疑模块 / 调用栈热点）
+                    let srd = analytics::load_software_root_cause(&conn, e.id)
+                        .unwrap_or_default();
+                    // 软件级主因 + 元凶软件卡片（exe_path / 句柄 / GDI/USER / 进程级 IO 速率）
+                    let sw_cause = ev.cause_kinds.iter().find(|k| k.is_software());
+                    // F-RC14-b：进程级磁盘读写元凶判定——某进程 io_*_bps 显著高于其余
+                    // culprit（≥3× 且非零）时标「磁盘狂读写元凶」（PRD §F-RC14-b）
+                    let total_io = |c: &find_stutter_core::ProcessBrief| {
+                        c.io_read_bps.unwrap_or(0) + c.io_write_bps.unwrap_or(0)
+                    };
+                    let max_io = ev.culprits.iter().map(total_io).max().unwrap_or(0);
+                    let second_io = ev
+                        .culprits
+                        .iter()
+                        .map(total_io)
+                        .filter(|v| *v < max_io)
+                        .max()
+                        .unwrap_or(0);
+                    let io_dominant = max_io > 0 && (second_io == 0 || max_io >= second_io * 3);
+                    let culprit_desc: Vec<String> = ev
+                        .culprits
+                        .iter()
+                        .map(|c| {
+                            let mut parts = vec![format!("{} (PID {})", c.name, c.pid)];
+                            if io_dominant && total_io(c) == max_io {
+                                parts.insert(0, "⚠️ 磁盘狂读写元凶".to_string());
+                            }
+                            if let Some(exe) = &c.exe_path {
+                                parts.push(format!("路径 {}", exe));
+                            }
+                            if let Some(h) = c.handle_count {
+                                parts.push(format!("句柄 {}", h));
+                            }
+                            if c.gdi_objects.is_some() || c.user_objects.is_some() {
+                                parts.push(format!(
+                                    "GDI {}/USER {}",
+                                    c.gdi_objects.unwrap_or(0),
+                                    c.user_objects.unwrap_or(0)
+                                ));
+                            }
+                            if c.io_read_bps.is_some() || c.io_write_bps.is_some() {
+                                parts.push(format!(
+                                    "IO 读 {}/写 {}",
+                                    fmt_bytes(c.io_read_bps.unwrap_or(0) as f64),
+                                    fmt_bytes(c.io_write_bps.unwrap_or(0) as f64)
+                                ));
+                            }
+                            parts.join("；")
+                        })
+                        .collect();
+                    rc_software_root = match sw_cause {
+                        Some(k) => format!(
+                            "{}（元凶软件）\n{}",
+                            analytics::cause_kind_label(*k),
+                            culprit_desc.join("\n")
+                        ),
+                        None if culprit_desc.is_empty() => "（未识别到软件级根因）".to_string(),
+                        None => format!("（未识别到软件级主因）\n{}", culprit_desc.join("\n")),
+                    };
+                    // 事件日志命中（白名单，最多 4 条）
+                    if !srd.win_events.is_empty() {
+                        rc_win_events = srd
+                            .win_events
+                            .iter()
+                            .take(4)
+                            .map(|we| {
+                                let msg: String = we
+                                    .message
+                                    .chars()
+                                    .take(48)
+                                    .collect();
+                                format!(
+                                    "[{}] {} 事件{} [{}] {}",
+                                    we.channel, we.provider, we.win_event_id, we.level, msg
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    // F-RC16：模块列表全部展示（不过滤），非系统目录模块加 ⚠️ 标记（验收 705）
+                    if !srd.modules.is_empty() {
+                        rc_modules = srd
+                            .modules
+                            .iter()
+                            .map(|m| {
+                                let name = std::path::Path::new(&m.module_path)
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&m.module_path);
+                                let lower = m.module_path.to_lowercase();
+                                let is_system = lower.starts_with("c:\\windows\\system32")
+                                    || lower.starts_with("c:\\windows\\syswow64")
+                                    || lower.starts_with("c:\\windows\\microsoft.net");
+                                let warn = if is_system { "" } else { "⚠️ " };
+                                format!("{}{} (0x{:X} B)", warn, name, m.module_size)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    // 调用栈热点（按采样数取前 5）
+                    if !srd.stack_samples.is_empty() {
+                        rc_stack_hotspots = srd
+                            .stack_samples
+                            .iter()
+                            .take(5)
+                            .map(|s| {
+                                let name = std::path::Path::new(&s.module)
+                                    .file_name()
+                                    .and_then(|x| x.to_str())
+                                    .unwrap_or(&s.module);
+                                format!(
+                                    "{}!{} +0x{:X} ×{}",
+                                    s.process_name, name, s.rva, s.sample_count
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                    }
+                    // 已保存结论（回溯状态）
+                    if let Some(rpt) = &srd.report {
+                        rc_saved_version =
+                            format!("已保存：v{} @ {}", rpt.algorithm_version, rpt.computed_at);
+                    }
                 }
             }
             if let Some(ui) = weak_row.upgrade() {
@@ -479,6 +626,13 @@ impl AnalysisWindow {
                 ui.set_rc_chain(SharedString::from(rc_chain));
                 ui.set_rc_deviation(SharedString::from(rc_deviation));
                 ui.set_rc_profile(SharedString::from(rc_profile));
+                // F-RC14/16：软件根因区块 + 结论状态
+                ui.set_rc_software_root(SharedString::from(rc_software_root));
+                ui.set_rc_win_events(SharedString::from(rc_win_events));
+                ui.set_rc_modules(SharedString::from(rc_modules));
+                ui.set_rc_stack_hotspots(SharedString::from(rc_stack_hotspots));
+                ui.set_rc_saved_version(SharedString::from(rc_saved_version));
+                ui.set_rc_saved_status(SharedString::from(""));
                 // what-if 初值 = detector 默认阈值（不改 service）
                 let dflt = DetectionConfig::default();
                 ui.set_wi_cpu(SharedString::from(dflt.cpu_threshold.to_string()));
@@ -540,7 +694,104 @@ impl AnalysisWindow {
                 ui.set_root_cause_visible(false);
             }
         });
+        // F-RC15/16：钻取卡「保存结论」→ GUI 窄写权 UPSERT root_cause_reports（不改 service 数据）
+        let rc_current_for_save = rc_current.clone();
+        let rc_dev_for_save = rc_deviation_holder.clone();
+        let weak_save = ui.as_weak();
+        let db_for_save = db_path.clone();
+        ui.on_rc_save_report(move || {
+            let current = rc_current_for_save.lock().unwrap().clone();
+            let deviation_text = rc_dev_for_save.lock().unwrap().clone();
+            if let Some(ui) = weak_save.upgrade() {
+                let status = match current {
+                    None => "请先点选一条事件再保存".to_string(),
+                    Some((event_id, ev)) => {
+                        // F-RC15：结论以稳定 CauseKind key 落库（build_root_cause_report）
+                        let report = build_root_cause_report(
+                            event_id,
+                            &ev,
+                            ui.get_rc_confidence(),
+                            &deviation_text,
+                        );
+                        match analytics::open_report_writer(&db_for_save) {
+                            Ok(writer) => {
+                                let r = analytics::ensure_report_table(&writer)
+                                    .and_then(|_| analytics::save_root_cause_report(&writer, &report));
+                                let _ = writer.close();
+                                match r {
+                                    Ok(()) => {
+                                        let label = format!("v{} @ {}", report.algorithm_version, report.computed_at);
+                                        ui.set_rc_saved_version(SharedString::from(format!("已保存：{}", label)));
+                                        format!("✓ 已保存结论（{}）", label)
+                                    }
+                                    Err(e) => format!("保存失败：{}", e),
+                                }
+                            }
+                            Err(e) => format!("打开写库连接失败：{}", e),
+                        }
+                    }
+                };
+                ui.set_rc_saved_status(SharedString::from(status));
+            }
+        });
 
+        // F-RC15/16：钻取卡「回溯结论」→ 只读回读该事件已保存结论并覆盖展示
+        let rc_current_for_load = rc_current.clone();
+        let weak_load = ui.as_weak();
+        let db_for_load = db_path.clone();
+        ui.on_rc_load_report(move || {
+            let current = rc_current_for_load.lock().unwrap().clone();
+            if let Some(ui) = weak_load.upgrade() {
+                let status = match current {
+                    None => "请先点选一条事件再回溯".to_string(),
+                    Some((event_id, _)) => {
+                        match analytics::open_readonly(&db_for_load) {
+                            Ok(reader) => match analytics::load_software_root_cause(&reader, event_id) {
+                                Ok(srd) => match srd.report {
+                                    Some(rpt) => {
+                                        // F-RC15：落库存稳定 key，回溯展示转中文标签
+                                        let primary_label = analytics::cause_kind_from_key(&rpt.primary_cause)
+                                            .map(analytics::cause_kind_label)
+                                            .unwrap_or(rpt.primary_cause.as_str());
+                                        let chain_labels: Vec<String> = rpt
+                                            .cause_chain
+                                            .iter()
+                                            .map(|k| {
+                                                analytics::cause_kind_from_key(k)
+                                                    .map(analytics::cause_kind_label)
+                                                    .unwrap_or(k.as_str())
+                                                    .to_string()
+                                            })
+                                            .collect();
+                                        ui.set_rc_primary(SharedString::from(primary_label));
+                                        ui.set_rc_confidence(rpt.confidence);
+                                        ui.set_rc_confidence_label(SharedString::from(format!("{:.0}%", rpt.confidence * 100.0)));
+                                        ui.set_rc_chain(SharedString::from(chain_labels.join(" → ")));
+                                        if let Some(sw) = rpt
+                                            .software_root_cause
+                                            .get("software_cause")
+                                            .and_then(|v| v.as_str())
+                                        {
+                                            let sw_label = analytics::cause_kind_from_key(sw)
+                                                .map(analytics::cause_kind_label)
+                                                .unwrap_or(sw)
+                                                .to_string();
+                                            ui.set_rc_software_root(SharedString::from(sw_label));
+                                        }
+                                        ui.set_rc_saved_version(SharedString::from(format!("已保存：v{} @ {}", rpt.algorithm_version, rpt.computed_at)));
+                                        format!("✓ 已回溯：v{} @ {}", rpt.algorithm_version, rpt.computed_at)
+                                    }
+                                    None => "该事件尚无已保存结论".to_string(),
+                                },
+                                Err(e) => format!("回溯失败：{}", e),
+                            },
+                            Err(e) => format!("打开只读连接失败：{}", e),
+                        }
+                    }
+                };
+                ui.set_rc_saved_status(SharedString::from(status));
+            }
+        });
         // F-RC12：what-if「用当前阈值重算」→ 用滑块阈值对当前事件 snapshot 调 detect_core
         // （纯客户端模拟，不改 service / config）
         let wi_sample_for_wi = wi_sample.clone();
@@ -868,6 +1119,49 @@ impl AnalysisWindow {
     /// 底层 Slint 窗口（供 lib.rs 1Hz tick 守护 tool-window 样式）。
     pub fn window(&self) -> &slint::Window {
         self.ui.window()
+    }
+}
+
+/// F-RC15：从当前事件 + 实时分析结果组装落库结论。
+/// primary_cause / cause_chain 存 CauseKind 枚举稳定 key（`{:?}` 即变体名，如 "CpuHigh"），
+/// 不存中文显示标签——落库回读不丢类型，跨语言环境可稳定对比（PRD §5.1/R12）。
+fn build_root_cause_report(
+    event_id: i64,
+    ev: &find_stutter_core::StutterEvent,
+    confidence: f32,
+    deviation_text: &str,
+) -> find_stutter_core::RootCauseReport {
+    let primary_key = ev
+        .primary_cause
+        .map(|k| format!("{:?}", k))
+        .unwrap_or_else(|| "Unknown".to_string());
+    let chain: Vec<String> = analytics::cause_chain(ev)
+        .iter()
+        .map(|k| format!("{:?}", k))
+        .collect();
+    let sw_key = ev
+        .cause_kinds
+        .iter()
+        .find(|k| k.is_software())
+        .map(|k| format!("{:?}", k));
+    let sw = serde_json::json!({
+        "software_cause": sw_key,
+        "culprits": ev
+            .culprits
+            .iter()
+            .map(|c| c.name.clone())
+            .collect::<Vec<_>>(),
+    });
+    let baseline = serde_json::json!({ "deviation": deviation_text });
+    find_stutter_core::RootCauseReport {
+        event_id,
+        algorithm_version: analytics::ANALYSIS_ALGO_VERSION.to_string(),
+        primary_cause: primary_key,
+        confidence,
+        cause_chain: chain,
+        software_root_cause: sw,
+        baseline_delta: baseline,
+        computed_at: chrono::Utc::now().to_rfc3339(),
     }
 }
 

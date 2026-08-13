@@ -37,6 +37,10 @@ spike_ratio = 3.0
 spike_min_bps = 2000000
 # 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
+# F-RC14-a：进程句柄泄漏判定阈值（句柄数超过即标记 ProcessHandleLeak 候选）
+handle_leak_threshold = 10000
+# F-RC14-a：进程 GDI 对象泄漏判定阈值（GDI 对象数超过即标记 GdiObjectLeak 候选）
+gdi_leak_threshold = 10000
 
 [ui]
 # 皮肤名称，对应 skins 目录下的 TOML 文件（默认 "default"）
@@ -74,6 +78,8 @@ process_refresh_ms = 30000
 db_path = "stutter.db"
 # 数据保留天数，超过自动清理
 retention_days = 30
+# stutter_events（及软件根因子表）独立保留天数：与 samples 的 30 天不同周期（PRD §3.4.6）
+event_retention_days = 7
 
 [notifications]
 # 检测到卡顿是否弹出提醒

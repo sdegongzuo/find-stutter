@@ -120,7 +120,7 @@ impl Default for Sample {
 ///
 /// 采集器每次采样本地按 CPU / 内存排序取 top 进程，检测器在卡顿持续期间
 /// 累积这些快照（按 pid 取最大用量），卡顿结束时提取 top 进程作为 culprits。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProcessBrief {
     pub pid: u32,
     pub name: String,
@@ -128,6 +128,27 @@ pub struct ProcessBrief {
     pub cpu_usage: f32,
     /// 该进程内存占用（MB）
     pub mem_used_mb: u64,
+    // ===== F-RC14-a/b：软件根因定位字段（v0.3 新增）=====
+    // 仅卡顿帧（collect_with(true)）采集，非卡顿帧跳过（对齐 top_processes 既有节制）。
+    // 全部 #[serde(default)]：旧库 culprits JSON 反序列化新结构时不崩（PRD §3.4.1）。
+    /// 可执行文件完整路径（如 C:\\...\\browser.exe；来自 sysinfo process.exe()）
+    #[serde(default)]
+    pub exe_path: Option<String>,
+    /// 句柄数（GetProcessHandleCount；句柄泄漏信号）
+    #[serde(default)]
+    pub handle_count: Option<u32>,
+    /// GDI 对象数（GetGuiResources(GR_GDIOBJECTS)；GUI 泄漏经典信号）
+    #[serde(default)]
+    pub gdi_objects: Option<u32>,
+    /// USER 对象数（GetGuiResources(GR_USEROBJECTS)）
+    #[serde(default)]
+    pub user_objects: Option<u32>,
+    /// 该进程磁盘读速率（B/s；GetProcessIoCounters 差分）
+    #[serde(default)]
+    pub io_read_bps: Option<u64>,
+    /// 该进程磁盘写速率（B/s；GetProcessIoCounters 差分）
+    #[serde(default)]
+    pub io_write_bps: Option<u64>,
 }
 
 impl ProcessBrief {
@@ -218,6 +239,16 @@ pub enum CauseKind {
     ContextSwitchStorm,
     NetSpike,
     UiFrozen,
+    // ===== 软件/驱动/硬件级 cause（v0.3 F-RC14 新增）=====
+    // 来源不是 PDH 阈值，而是「进程指纹阈值 + Windows 事件日志回溯」：
+    // - ProcessHandleLeak / GdiObjectLeak：句柄 / GDI+USER 对象超阈值（F-RC14-a）
+    // - DriverTimeout / ServiceCrash / DiskIoError / HardwareError：事件日志白名单命中（F-RC14-c）
+    ProcessHandleLeak,
+    GdiObjectLeak,
+    DriverTimeout,
+    ServiceCrash,
+    DiskIoError,
+    HardwareError,
 }
 
 /// 稳定类型 key → 结构化 `CauseKind` 的**单一映射表**。
@@ -258,6 +289,37 @@ impl CauseKind {
             }
         }
         None
+    }
+
+    /// 该 cause 是否为「软件/驱动/硬件级」cause（F-RC14）。
+    ///
+    /// 软件级 cause 整体优先于资源级 cause 作为 primary_cause（PRD §5.6）——
+    /// 驱动超时 / 服务崩溃才是用户能采取行动的真根因。
+    pub fn is_software(self) -> bool {
+        matches!(
+            self,
+            CauseKind::ProcessHandleLeak
+                | CauseKind::GdiObjectLeak
+                | CauseKind::DriverTimeout
+                | CauseKind::ServiceCrash
+                | CauseKind::DiskIoError
+                | CauseKind::HardwareError
+        )
+    }
+
+    /// 软件级 cause 的严重程度排序（PRD §3.3）：数值越小越严重，用于多软件级 cause 同时
+    /// 命中时排序取第一：HardwareError > DriverTimeout > ServiceCrash > DiskIoError
+    /// > ProcessHandleLeak > GdiObjectLeak。非软件级 cause 返回 None。
+    pub fn software_priority(self) -> Option<u8> {
+        match self {
+            CauseKind::HardwareError => Some(0),
+            CauseKind::DriverTimeout => Some(1),
+            CauseKind::ServiceCrash => Some(2),
+            CauseKind::DiskIoError => Some(3),
+            CauseKind::ProcessHandleLeak => Some(4),
+            CauseKind::GdiObjectLeak => Some(5),
+            _ => None,
+        }
     }
 }
 
@@ -365,6 +427,15 @@ pub struct DetectionConfig {
     /// `ThermalThrottle` cause（单一高温但频率正常不算降频）。
     #[serde(default = "default_thermal_freq_drop_ratio")]
     pub thermal_freq_drop_ratio: f32,
+    // ===== F-RC14-a 软件根因：句柄 / GDI 泄漏阈值 =====
+    /// 句柄泄漏阈值：单进程 handle_count 超过即记 ProcessHandleLeak cause。
+    /// 默认 10000（正常 Chrome 即可上万句柄，需根据实际采集数据校准）。
+    #[serde(default = "default_handle_leak_threshold")]
+    pub handle_leak_threshold: u32,
+    /// GDI+USER 对象泄漏阈值：单进程 gdi_objects + user_objects 超过即记
+    /// GdiObjectLeak cause。默认 10000。
+    #[serde(default = "default_gdi_leak_threshold")]
+    pub gdi_leak_threshold: u32,
 }
 
 impl Default for DetectionConfig {
@@ -389,6 +460,8 @@ impl Default for DetectionConfig {
             ui_freeze_timeout_ms: 200,
             thermal_threshold_celsius: 85.0,
             thermal_freq_drop_ratio: 0.85,
+            handle_leak_threshold: default_handle_leak_threshold(),
+            gdi_leak_threshold: default_gdi_leak_threshold(),
         }
     }
 }
@@ -432,6 +505,14 @@ fn default_thermal_freq_drop_ratio() -> f32 {
     0.85
 }
 
+// F-RC14-a 句柄 / GDI 泄漏阈值默认值
+fn default_handle_leak_threshold() -> u32 {
+    10_000
+}
+fn default_gdi_leak_threshold() -> u32 {
+    10_000
+}
+
 /// 采样配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplingConfig {
@@ -453,6 +534,14 @@ impl Default for SamplingConfig {
 pub struct StorageConfig {
     pub db_path: String,
     pub retention_days: u32,
+    /// stutter_events（及其软件根因子表）独立保留天数：与 samples 的 30 天不同周期，
+    /// 按 PRD §3.4.6 卡顿事件保留 7 天（同机制、不同周期）。缺省 7，旧配置无此项也可解析。
+    #[serde(default = "default_event_retention_days")]
+    pub event_retention_days: u32,
+}
+
+fn default_event_retention_days() -> u32 {
+    7
 }
 
 impl Default for StorageConfig {
@@ -460,6 +549,7 @@ impl Default for StorageConfig {
         Self {
             db_path: "stutter.db".to_string(),
             retention_days: 30,
+            event_retention_days: 7,
         }
     }
 }
@@ -662,6 +752,78 @@ impl Config {
     }
 }
 
+// ===================== F-RC14 软件根因定位数据结构 =====================
+
+/// 某 culprit 进程已加载的模块列表快照（F-RC14-b，卡顿事件生成时 snap 一次）。
+/// 落 `process_modules` 表；识别注入的可疑 DLL / 第三方驱动模块。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessModule {
+    /// 进程 ID
+    pub pid: u32,
+    /// 进程名
+    pub process_name: String,
+    /// 模块完整路径（如 C:\\Windows\\System32\\foo.dll）
+    pub module_path: String,
+    /// 模块大小（字节）
+    pub module_size: u64,
+}
+
+/// Windows 事件日志回溯命中记录（F-RC14-c，落 `windows_events` 表）。
+/// 卡顿事件生成时回溯 [onset-30s, now] 窗口的高价值白名单事件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowsEventRecord {
+    /// 日志通道（System / Application）
+    pub channel: String,
+    /// 事件源（如 Display / disk / Service Control Manager / Microsoft-Windows-WHEA-Logger）
+    pub provider: String,
+    /// Windows 事件 ID（如 4101 / 7 / 51 / 7031 / 41）
+    pub win_event_id: u32,
+    /// 级别（Error / Warning）
+    pub level: String,
+    /// 事件消息（截断到 512 字符，防膨胀）
+    pub message: String,
+    /// 事件发生时刻（RFC3339）
+    pub ts: String,
+}
+
+/// ETW 调用栈采样聚合热点（F-RC14-d，落 `stack_samples` 表）。
+/// 只解析到「模块名 + RVA 偏移」级别（不做完整 PDB 符号化，PRD §1.4）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StackSample {
+    /// 进程 ID
+    pub pid: u32,
+    /// 进程名
+    pub process_name: String,
+    /// 热点模块名（exe / dll）
+    pub module: String,
+    /// 模块内相对偏移（RVA）
+    pub rva: u64,
+    /// 该 (process, module, rva) 热点采样命中次数（聚合后）
+    pub sample_count: u64,
+}
+
+/// 分析结论落库记录（F-RC15，落 `root_cause_reports` 表，按 event_id UPSERT）。
+/// 可回溯、可审计：algorithm_version 记录算法版本，升级后可对比新旧结论。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootCauseReport {
+    /// 关联卡顿事件 id（stutter_events.id，一事件一条，UNIQUE）
+    pub event_id: i64,
+    /// 分析算法版本（如 rc5-rc14.v1）
+    pub algorithm_version: String,
+    /// 主因枚举（字符串）
+    pub primary_cause: String,
+    /// 置信度 0..1
+    pub confidence: f32,
+    /// 因果链（CauseKind 枚举字符串数组，F-RC9 结果）
+    pub cause_chain: Vec<String>,
+    /// 软件根因定位结论（F-RC14 摘要：进程 / 模块 / 事件 ID）
+    pub software_root_cause: serde_json::Value,
+    /// 偏离基线摘要（F-RC7 结果）
+    pub baseline_delta: serde_json::Value,
+    /// 计算时刻（RFC3339）
+    pub computed_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +896,9 @@ mod tests {
         // F-RC4 温度→降频根因阈值默认值
         assert_eq!(c.thermal_threshold_celsius, 85.0);
         assert_eq!(c.thermal_freq_drop_ratio, 0.85);
+        // F-RC14-a 泄漏阈值默认值
+        assert_eq!(c.handle_leak_threshold, 10_000);
+        assert_eq!(c.gdi_leak_threshold, 10_000);
     }
 
     #[test]

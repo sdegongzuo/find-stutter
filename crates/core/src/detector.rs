@@ -1395,12 +1395,14 @@ mod tests {
                 name: "heavy.exe".into(),
                 cpu_usage: 88.0,
                 mem_used_mb: 1024,
+                ..Default::default()
             },
             ProcessBrief {
                 pid: 1002,
                 name: "bg.exe".into(),
                 cpu_usage: 5.0,
                 mem_used_mb: 2048,
+                ..Default::default()
             },
         ];
         for _ in 0..3 {

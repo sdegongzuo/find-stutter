@@ -15,7 +15,12 @@
 //! 6. 每 10 ticks 调 `flush()` 刷盘
 //! 7. 每 3600 ticks（约 1 小时）调 `cleanup()` 清理过期数据
 
-use find_stutter_core::{Collector, Config, Detector, Logger};
+use find_stutter_core::software_root_cause::{
+    enrich_software_causes, is_whitelisted_win_event, merge_software_causes,
+};
+use find_stutter_core::win32::{read_windows_events, snapshot_process_modules};
+use find_stutter_core::types::{ProcessBrief, ProcessModule, WindowsEventRecord};
+use find_stutter_core::{Collector, Config, Detector, Logger, StackSampler};
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -97,6 +102,31 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // F-RC14-d：ETW 调用栈采样器（初始化失败自动静默降级，不影响采集热路径）。
+    // 采样窗口在独立后台线程执行（PRD §F-RC14-d / 验收 687：绝不阻塞采集热路径）：
+    // 主循环只把 (event_id, culprits) 塞进通道即返回，worker 线程完成采样后补写库。
+    diag_log("run_foreground: creating StackSampler + background ETW worker");
+    let stack_sampler = StackSampler::new();
+    diag_log(&format!("run_foreground: StackSampler created, enabled={}", stack_sampler.enabled()));
+    let (etw_tx, etw_rx) = std::sync::mpsc::channel::<(i64, Vec<ProcessBrief>)>();
+    let worker_db = config.storage.db_path.clone();
+    std::thread::Builder::new()
+        .name("etw-worker".into())
+        .spawn(move || {
+            // 后台线程独占 StackSampler：慢速采样与落库都在这里，每次事件限频一轮
+            while let Ok((event_id, culprits)) = etw_rx.recv() {
+                let samples = stack_sampler.sample(&culprits);
+                if samples.is_empty() {
+                    continue;
+                }
+                if let Err(e) = Logger::write_stack_samples(&worker_db, event_id, &samples) {
+                    warn!("ETW worker: write_stack_samples failed: {}", e);
+                }
+            }
+        })
+        .map_err(|e| anyhow::anyhow!("ETW worker thread spawn failed: {}", e))?;
+    diag_log("run_foreground: ETW worker started");
+
     // 启动时立即写一次心跳，让 GUI 一启动就能看到「服务在跑」
     if let Err(e) = logger.touch_heartbeat() {
         warn!("initial touch_heartbeat failed: {}", e);
@@ -130,13 +160,49 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         let sample = collector.collect_with(detector.needs_process_snapshot());
 
         if let Some(event) = detector.analyze(&sample) {
+            let culprits = event.culprits.clone();
+            let onset_secs = event.onset_ts.map(|ms| ms / 1000).unwrap_or_else(|| {
+                event.timestamp.timestamp()
+            });
+            // F-RC14-b/c/d：卡顿触发后（限频）回溯事件日志 / 模块 / 调用栈
+            let now_secs = chrono::Utc::now().timestamp();
+            let since = onset_secs - 30;
+            let win_events: Vec<WindowsEventRecord> = read_windows_events(since, now_secs)
+                .into_iter()
+                .filter(is_whitelisted_win_event)
+                .collect();
+            let mut modules: Vec<ProcessModule> = Vec::new();
+            for c in &culprits {
+                modules.extend(snapshot_process_modules(c.pid, &c.name));
+            }
+            let sw = enrich_software_causes(
+                &culprits,
+                &win_events,
+                config.detection.handle_leak_threshold,
+                config.detection.gdi_leak_threshold,
+            );
+            let merged = merge_software_causes(event, sw);
             info!(
                 "stutter detected: {:?} — {}",
-                event.severity,
-                event.causes.join(", ")
+                merged.severity,
+                merged.causes.join(", ")
             );
-            if let Err(e) = logger.write_event(&event) {
-                warn!("write_event failed: {}", e);
+            match logger.write_event(&merged) {
+                Ok(event_id) => {
+                    // F-RC14-d：后台 ETW worker 异步采样并补写 stack_samples（不阻塞热路径）
+                    if etw_tx.send((event_id, culprits)).is_err() {
+                        warn!("ETW worker 通道已关闭，跳过本次调用栈采样");
+                    }
+                    if let Err(e) = logger.write_software_root_cause_data(
+                        event_id,
+                        &modules,
+                        &win_events,
+                        &Vec::new(),
+                    ) {
+                        warn!("write_software_root_cause_data failed: {}", e);
+                    }
+                }
+                Err(e) => warn!("write_event failed: {}", e),
             }
         }
 
@@ -298,6 +364,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -326,6 +393,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();

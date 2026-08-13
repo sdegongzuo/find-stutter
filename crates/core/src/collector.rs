@@ -6,7 +6,12 @@ use sysinfo::{Networks, System};
 use wmi::{Variant, WMIConnection};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
-    ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, LPARAM, SetLastError, WPARAM,
+    CloseHandle, ERROR_SUCCESS, ERROR_TIMEOUT, GetLastError, HANDLE, LPARAM, SetLastError,
+    WPARAM,
+};
+use windows::Win32::System::Threading::{
+    GetGuiResources, GetProcessHandleCount, GetProcessIoCounters, OpenProcess, GR_GDIOBJECTS,
+    GR_USEROBJECTS, IO_COUNTERS, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, SendMessageTimeoutW, SMTO_ABORTIFHUNG, SMTO_BLOCK, WM_NULL,
@@ -113,6 +118,120 @@ impl Drop for DiskPdh {
         unsafe {
             PdhCloseQuery(self.query);
         }
+    }
+}
+/// F-RC14-a/b：进程指纹采样器（句柄 / GDI / USER / 进程级 IO 速率）。
+///
+/// 仅在卡顿帧（collect_with(true)）调用，进程打开开销一次性、限频；
+/// 非卡顿帧完全跳过（对齐 top_processes 既有节制，PRD §3.4.2）。
+///
+/// IO 速率由 GetProcessIoCounters 的累积字节计数跨帧差分得到
+/// （io_read_bps / io_write_bps），故需保留上次计数与采样时刻；
+/// 句柄 / GDI / USER 为瞬时值，取当前读数即可。
+struct ProcessFingerprintSampler {
+    /// pid -> (read_bytes, write_bytes) 上次 IO 累积计数
+    io_prev: HashMap<u32, (u64, u64)>,
+    /// 上次 IO 采样时刻（首采为 None，不产出速率）
+    io_last: Option<std::time::Instant>,
+}
+
+/// 单个进程的软件指纹（F-RC14-a/b 采集结果，合并进 ProcessBrief）。
+#[derive(Debug, Clone, Default)]
+struct ProcessFingerprint {
+    exe_path: Option<String>,
+    handle_count: Option<u32>,
+    gdi_objects: Option<u32>,
+    user_objects: Option<u32>,
+    io_read_bps: Option<u64>,
+    io_write_bps: Option<u64>,
+}
+
+impl ProcessFingerprint {
+    /// 把指纹一次性合并进 ProcessBrief（六字段合并收拢到一处，避免散落拷贝）。
+    fn apply_to(&self, p: &mut ProcessBrief) {
+        p.exe_path = self.exe_path.clone();
+        p.handle_count = self.handle_count;
+        p.gdi_objects = self.gdi_objects;
+        p.user_objects = self.user_objects;
+        p.io_read_bps = self.io_read_bps;
+        p.io_write_bps = self.io_write_bps;
+    }
+}
+
+impl ProcessFingerprintSampler {
+    fn new() -> Self {
+        Self {
+            io_prev: HashMap::new(),
+            io_last: None,
+        }
+    }
+
+    /// 打开进程句柄（只读、限权 PROCESS_QUERY_LIMITED_INFORMATION）。失败（如拒绝访问）返回 None。
+    fn open_process(pid: u32) -> Option<HANDLE> {
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok() }
+    }
+
+    /// 句柄数（GetProcessHandleCount）
+    fn handle_count(h: HANDLE) -> Option<u32> {
+        unsafe {
+            let mut n = 0u32;
+            GetProcessHandleCount(h, &mut n).ok()?;
+            Some(n)
+        }
+    }
+
+    /// GDI 对象数（GetGuiResources GR_GDIOBJECTS）
+    fn gdi_objects(h: HANDLE) -> u32 {
+        unsafe { GetGuiResources(h, GR_GDIOBJECTS) }
+    }
+
+    /// USER 对象数（GetGuiResources GR_USEROBJECTS）
+    fn user_objects(h: HANDLE) -> u32 {
+        unsafe { GetGuiResources(h, GR_USEROBJECTS) }
+    }
+
+    /// IO 累积字节计数（读、写）
+    fn io_bytes(h: HANDLE) -> Option<(u64, u64)> {
+        unsafe {
+            let mut io = IO_COUNTERS::default();
+            GetProcessIoCounters(h, &mut io).ok()?;
+            Some((io.ReadTransferCount, io.WriteTransferCount))
+        }
+    }
+
+    /// 采样一组进程的软件指纹。仅对 pids 内进程打开句柄（限频）；
+    /// IO 速率为跨帧差分，首采该 pid 时为 None。
+    fn sample(&mut self, sys: &System, pids: &[u32]) -> HashMap<u32, ProcessFingerprint> {
+        let now = std::time::Instant::now();
+        let elapsed = self.io_last.map(|t| t.elapsed().as_secs_f64());
+        let mut out = HashMap::new();
+        for &pid in pids {
+            let mut fp = ProcessFingerprint::default();
+            // 可执行文件完整路径：来自 sysinfo（无需再打开进程）
+            if let Some(proc) = sys.process(sysinfo::Pid::from_u32(pid)) {
+                fp.exe_path = proc.exe().map(|p| p.to_string_lossy().into_owned());
+            }
+            // 打开进程一次，句柄 / GDI / USER / IO 一起取，随后关闭
+            if let Some(h) = Self::open_process(pid) {
+                fp.handle_count = Self::handle_count(h);
+                fp.gdi_objects = Some(Self::gdi_objects(h));
+                fp.user_objects = Some(Self::user_objects(h));
+                if let Some((cur_r, cur_w)) = Self::io_bytes(h) {
+                    if let (Some((pr, pw)), Some(dt)) = (self.io_prev.get(&pid), elapsed) {
+                        let dt = dt.max(0.001);
+                        fp.io_read_bps = Some((cur_r.saturating_sub(*pr) as f64 / dt) as u64);
+                        fp.io_write_bps = Some((cur_w.saturating_sub(*pw) as f64 / dt) as u64);
+                    }
+                    self.io_prev.insert(pid, (cur_r, cur_w));
+                }
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+            }
+            out.insert(pid, fp);
+        }
+        self.io_last = Some(now);
+        out
     }
 }
 
@@ -499,6 +618,8 @@ pub struct Collector {
     paging_pdh: Option<PagingPdh>,
     /// 系统级信号采样器（F-RC2）：磁盘繁忙度 + DPC/中断/上下文切换
     sys_pdh: Option<SysPdh>,
+    /// F-RC14-a/b：进程指纹采样器（句柄/GDI/USER/进程级 IO 速率）
+    fingerprint: ProcessFingerprintSampler,
 }
 
 impl Collector {
@@ -529,6 +650,7 @@ impl Collector {
             commit_pdh,
             paging_pdh,
             sys_pdh,
+            fingerprint: ProcessFingerprintSampler::new(),
         }
     }
 
@@ -624,7 +746,7 @@ impl Collector {
         // 用于卡顿 culprit 归因（detector 在卡顿持续期间累积，结束时提取 top）。
         // 非卡顿时跳过（need_processes == false），省掉每 tick 的全进程遍历排序。
         let top_processes = if need_processes {
-            Self::collect_top_processes(&self.sys)
+            self.collect_top_processes()
         } else {
             Vec::new()
         };
@@ -666,8 +788,9 @@ impl Collector {
     ///
     /// sysinfo 0.39：`process.memory()` 返回字节，`/ (1024*1024)` 转 MB；
     /// `process.cpu_usage()` 为全局 CPU 百分比；`pid.as_u32()` 取进程 ID。
-    fn collect_top_processes(sys: &System) -> Vec<ProcessBrief> {
-        let all: Vec<ProcessBrief> = sys
+    fn collect_top_processes(&mut self) -> Vec<ProcessBrief> {
+        let all: Vec<ProcessBrief> = self
+            .sys
             .processes()
             .iter()
             .map(|(pid, p)| ProcessBrief {
@@ -675,10 +798,24 @@ impl Collector {
                 name: p.name().to_string_lossy().into_owned(),
                 cpu_usage: p.cpu_usage(),
                 mem_used_mb: p.memory() / (1024 * 1024),
+                ..Default::default()
             })
             .collect();
 
-        ProcessBrief::merge_top(all, 8, 8, 12)
+        let top = ProcessBrief::merge_top(all, 8, 8, 12);
+
+        // F-RC14-a/b：仅对进入 top 的进程采样软件指纹（限频、一次性打开）。
+        // IO 速率需跨帧差分，故非卡顿帧（不调本函数）不更新基线，避免陈旧计数污染。
+        let pids: Vec<u32> = top.iter().map(|p| p.pid).collect();
+        let fps = self.fingerprint.sample(&self.sys, &pids);
+        top.into_iter()
+            .map(|mut p| {
+                if let Some(fp) = fps.get(&p.pid) {
+                    fp.apply_to(&mut p);
+                }
+                p
+            })
+            .collect()
     }
 
     fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>) {

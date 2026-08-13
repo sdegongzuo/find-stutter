@@ -1,7 +1,11 @@
-use crate::types::{Sample, StutterEvent, StorageConfig};
+use crate::types::{
+    ProcessModule, RootCauseReport, Sample, StackSample, StorageConfig, StutterEvent,
+    WindowsEventRecord,
+};
 use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
+
 
 pub struct Logger {
     conn: Connection,
@@ -10,12 +14,40 @@ pub struct Logger {
     last_flush: Instant,
 }
 
+/// F-RC15 共享落库：幂等确保 root_cause_reports 表存在（兼容旧库首次写结论）。
+/// 由 logger（服务侧）与 analytics（GUI 侧窄写权连接）共同调用，避免 SQL 重复定义。
+pub fn ensure_root_cause_report_table(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS root_cause_reports (event_id INTEGER PRIMARY KEY REFERENCES stutter_events(id) ON DELETE CASCADE, algorithm_version TEXT NOT NULL, primary_cause TEXT NOT NULL, confidence REAL NOT NULL, cause_chain TEXT NOT NULL, software_root_cause TEXT NOT NULL, baseline_delta TEXT NOT NULL, computed_at TEXT NOT NULL)")?;
+    Ok(())
+}
+
+/// F-RC15 共享落库：UPSERT 一条分析结论。按 event_id 幂等（一事件一条），algorithm_version
+/// 记录算法版本——重算后覆盖旧结论，读回可对比新旧（PRD §5.1/R12）。
+pub fn upsert_root_cause_report(conn: &Connection, report: &RootCauseReport) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO root_cause_reports (event_id, algorithm_version, primary_cause, confidence, cause_chain, software_root_cause, baseline_delta, computed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON CONFLICT(event_id) DO UPDATE SET algorithm_version = excluded.algorithm_version, primary_cause = excluded.primary_cause, confidence = excluded.confidence, cause_chain = excluded.cause_chain, software_root_cause = excluded.software_root_cause, baseline_delta = excluded.baseline_delta, computed_at = excluded.computed_at",
+        params![
+            report.event_id,
+            report.algorithm_version,
+            report.primary_cause,
+            report.confidence as f64,
+            serde_json::to_string(&report.cause_chain)?,
+            serde_json::to_string(&report.software_root_cause)?,
+            serde_json::to_string(&report.baseline_delta)?,
+            report.computed_at,
+        ],
+    )?;
+    Ok(())
+}
+
 impl Logger {
     pub fn new(config: &StorageConfig) -> anyhow::Result<Self> {
         let conn = Connection::open(&config.db_path)?;
         // 开启 WAL：采集线程每秒写入，GUI / 导出命令并发读取时互不阻塞
         // （P3 服务化采集 + GUI 只读模式的基础）
-        let _ = conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+        let _ = conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;",
+        );
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +95,52 @@ impl Logger {
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 timestamp TEXT NOT NULL,
                 pid INTEGER NOT NULL
+            );
+            -- F-RC14-b：进程已加载模块快照（卡顿事件生成时 snap，随事件级联清理）。
+            -- FK ON DELETE CASCADE：stutter_events 清理时子表自动删除，无孤儿行（PRD §3.4.6）。
+            CREATE TABLE IF NOT EXISTS process_modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES stutter_events(id) ON DELETE CASCADE,
+                pid INTEGER NOT NULL,
+                process_name TEXT NOT NULL,
+                module_path TEXT NOT NULL,
+                module_size INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_modules_event ON process_modules(event_id);
+            -- F-RC14-c：Windows 事件日志回溯命中（白名单过滤后落库）。
+            CREATE TABLE IF NOT EXISTS windows_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES stutter_events(id) ON DELETE CASCADE,
+                channel TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                win_event_id INTEGER NOT NULL,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                ts TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_winevents_event ON windows_events(event_id);
+            -- F-RC14-d：ETW 调用栈采样聚合热点（模块 + RVA 级别）。
+            CREATE TABLE IF NOT EXISTS stack_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL REFERENCES stutter_events(id) ON DELETE CASCADE,
+                pid INTEGER NOT NULL,
+                process_name TEXT NOT NULL,
+                module TEXT NOT NULL,
+                rva INTEGER NOT NULL,
+                sample_count INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_stack_event ON stack_samples(event_id);
+            -- F-RC15：分析结论表（GUI 窄写权；event_id UNIQUE，UPSERT 幂等）。
+            -- algorithm_version 落库，读回比对可决定重算，新旧结论可对比（PRD §5.1/R12）。
+            CREATE TABLE IF NOT EXISTS root_cause_reports (
+                event_id INTEGER PRIMARY KEY REFERENCES stutter_events(id) ON DELETE CASCADE,
+                algorithm_version TEXT NOT NULL,
+                primary_cause TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                cause_chain TEXT NOT NULL,
+                software_root_cause TEXT NOT NULL,
+                baseline_delta TEXT NOT NULL,
+                computed_at TEXT NOT NULL
             );",
         )?;
 
@@ -193,7 +271,7 @@ impl Logger {
         Ok(())
     }
 
-    pub fn write_event(&self, event: &StutterEvent) -> anyhow::Result<()> {
+    pub fn write_event(&self, event: &StutterEvent) -> anyhow::Result<i64> {
         let causes = serde_json::to_string(&event.causes)?;
         let snapshot = serde_json::to_string(&event.snapshot)?;
         let culprits = serde_json::to_string(&event.culprits)?;
@@ -217,9 +295,81 @@ impl Logger {
                 onset_ts,
             ],
         )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// F-RC14-b/c/d：一次性落库事件的软件根因数据（已加载模块 / 事件日志 / 调用栈热点）。
+    /// 三张子表均有 FK ON DELETE CASCADE，随 stutter_events 清理级联删除，不会留孤儿行。
+    pub fn write_software_root_cause_data(
+        &self,
+        event_id: i64,
+        modules: &[ProcessModule],
+        win_events: &[WindowsEventRecord],
+        stack_samples: &[StackSample],
+    ) -> anyhow::Result<()> {
+        for m in modules {
+            self.conn.execute(
+                "INSERT INTO process_modules (event_id, pid, process_name, module_path, module_size) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    event_id,
+                    m.pid as i64,
+                    m.process_name,
+                    m.module_path,
+                    m.module_size as i64,
+                ],
+            )?;
+        }
+        for ev in win_events {
+            self.conn.execute(
+                "INSERT INTO windows_events (event_id, channel, provider, win_event_id, level, message, ts) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event_id,
+                    ev.channel,
+                    ev.provider,
+                    ev.win_event_id as i64,
+                    ev.level,
+                    ev.message,
+                    ev.ts,
+                ],
+            )?;
+        }
+        for s in stack_samples {
+            self.conn.execute(
+                "INSERT INTO stack_samples (event_id, pid, process_name, module, rva, sample_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_id,
+                    s.pid as i64,
+                    s.process_name,
+                    s.module,
+                    s.rva as i64,
+                    s.sample_count as i64,
+                ],
+            )?;
+        }
         Ok(())
     }
 
+    /// F-RC14-d 后台线程专用：把 ETW 调用栈热点写入 stack_samples（独立开连接，
+    /// 供服务端后台 ETW 采样线程在卡顿事件落库后异步补写，绝不阻塞采集热路径）。
+    pub fn write_stack_samples(db_path: &str, event_id: i64, samples: &[StackSample]) -> anyhow::Result<()> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        // 与主 logger 连接并发写时避免立刻 SQLITE_BUSY（后台线程补写）
+        conn.busy_timeout(Duration::from_millis(3000))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON")?;
+        {
+            let mut stmt = conn.prepare("INSERT INTO stack_samples (event_id, pid, process_name, module, rva, sample_count) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")?;
+            for s in samples {
+                stmt.execute(params![event_id, s.pid as i64, s.process_name, s.module, s.rva as i64, s.sample_count as i64])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// F-RC15：UPSERT 分析结论（GUI 侧窄写权连接调用；按 event_id 幂等，
+    /// algorithm_version 变更后覆盖旧结论，供新旧对比 / 回溯审计）。
+    pub fn write_root_cause_report(&self, report: &RootCauseReport) -> anyhow::Result<()> {
+        upsert_root_cause_report(&self.conn, report)
+    }
     pub fn export_csv(&self, from: &str, to: &str, output: &str) -> anyhow::Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT timestamp, cpu_usage, cpu_per_core, cpu_freq_mhz, mem_usage_percent,
@@ -298,16 +448,34 @@ impl Logger {
     }
 
     pub fn cleanup(&self) -> anyhow::Result<()> {
-        let cutoff = Utc::now() - ChronoDuration::days(self.config.retention_days as i64);
-        let cutoff_str = cutoff.to_rfc3339();
-        self.conn
-            .execute("DELETE FROM samples WHERE timestamp < ?1", params![cutoff_str])?;
+        self.cleanup_inner(
+            self.config.retention_days as i64,
+            self.config.event_retention_days as i64,
+        )
+    }
+
+    /// 按指定保留天数清理过期数据（测试/运维用：samples 与事件同一天数）。
+    pub fn cleanup_with_retention(&self, retention_days: i64) -> anyhow::Result<()> {
+        self.cleanup_inner(retention_days, retention_days)
+    }
+
+    /// PRD §3.4.6：samples 按 30 天、stutter_events 按 7 天（不同周期、同机制）清理。
+    /// 删除 stutter_events 时，process_modules / windows_events / stack_samples /
+    /// root_cause_reports 四张子表由 FK ON DELETE CASCADE 级联删除。
+    fn cleanup_inner(&self, sample_days: i64, event_days: i64) -> anyhow::Result<()> {
+        let samples_cutoff = Utc::now() - ChronoDuration::days(sample_days);
+        let events_cutoff = Utc::now() - ChronoDuration::days(event_days);
+        self.conn.execute(
+            "DELETE FROM samples WHERE timestamp < ?1",
+            params![samples_cutoff.to_rfc3339()],
+        )?;
         self.conn.execute(
             "DELETE FROM stutter_events WHERE timestamp < ?1",
-            params![cutoff_str],
+            params![events_cutoff.to_rfc3339()],
         )?;
         Ok(())
     }
+
 
     pub fn event_count_today(&self) -> anyhow::Result<u32> {
         // 按用户本地时区的「今日」[当地 00:00, 当前时刻] 统计：
@@ -505,6 +673,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&config).unwrap();
 
@@ -555,6 +724,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let result = Logger::new(&config);
@@ -580,6 +750,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         // Logger::new 建表 + 迁移 + 建索引后，sqlite_master 里应存在两个时间戳索引
@@ -627,6 +798,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -658,6 +830,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -684,6 +857,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -711,6 +885,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -734,6 +909,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -773,6 +949,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -800,6 +977,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -833,6 +1011,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
         let logger = Logger::new(&config).unwrap();
 
@@ -842,6 +1021,7 @@ mod tests {
             name: "x.exe".into(),
             cpu_usage: 50.0,
             mem_used_mb: 100,
+            ..Default::default()
         }];
         logger.write_event(&ev).unwrap();
 
@@ -873,6 +1053,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -890,6 +1071,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -914,6 +1096,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -941,6 +1124,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -974,6 +1158,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 0, // 0 days = everything is old
+            event_retention_days: 0,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1006,6 +1191,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30, // 30 days = recent data stays
+            event_retention_days: 30,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1035,6 +1221,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 0,
+            event_retention_days: 0,
         };
 
         let logger = Logger::new(&config).unwrap();

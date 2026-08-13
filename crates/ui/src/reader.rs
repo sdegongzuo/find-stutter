@@ -364,6 +364,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -394,6 +395,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         // 只建表 + 写一条 sample，不写心跳
         let mut logger = Logger::new(&cfg).unwrap();
@@ -426,6 +428,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let logger = Logger::new(&cfg).unwrap();
         // 写一个 2 小时前的心跳
@@ -457,6 +460,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -500,6 +504,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -531,6 +536,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -548,6 +554,7 @@ mod tests {
                 name: "hog.exe".into(),
                 cpu_usage: 90.0,
                 mem_used_mb: 512,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -570,6 +577,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -735,6 +743,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
+            event_retention_days: 30,
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -751,6 +760,7 @@ mod tests {
                 name: "hog.exe".into(),
                 cpu_usage: 90.0,
                 mem_used_mb: 512,
+                ..Default::default()
             }],
             ..Default::default()
         };

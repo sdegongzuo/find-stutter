@@ -1026,6 +1026,14 @@ export component Analysis inherits Window {
     in property <string> rc-deviation: "";
     // 画像对比（match_profile 结果：匹配已知画像 / 新情况）
     in property <string> rc-profile: "";
+    // F-RC14/16：软件根因区块（元凶软件 + 事件日志命中 / 可疑模块 / 调用栈热点）
+    in property <string> rc-software-root: "";
+    in property <string> rc-win-events: "";
+    in property <string> rc-modules: "";
+    in property <string> rc-stack-hotspots: "";
+    // F-RC15/16：结论保存/回溯状态（Rust 端写入）
+    in property <string> rc-saved-version: "";
+    in-out property <string> rc-saved-status: "";
     // 前导曲线（事件 ±60s 资源图）；rc-has-leading 控制占位文本
     in property <image> rc-leading-image;
     in property <bool> rc-has-leading: false;
@@ -1061,6 +1069,9 @@ export component Analysis inherits Window {
     callback row-clicked(int);
     // F-RC10/12/13：根因钻取卡「关闭」→ Rust 端隐藏模态
     callback root-cause-closed();
+    // F-RC15/16：根因钻取卡「保存结论 / 回溯结论」→ Rust 端 UPSERT / 只读回读
+    callback rc-save-report();
+    callback rc-load-report();
     // F-RC12：what-if「用当前阈值重算」→ Rust 端用 wi-* 阈值对当前事件 snapshot 调 detect_core
     callback what-if-requested();
     // F3（高级）：切换某资源指标显隐（名 "cpu"/"mem"/"disk_read"/"disk_write"/"gpu"，状态）
@@ -1544,8 +1555,8 @@ export component Analysis inherits Window {
             height: 100%;
             background: #00000099;
             Rectangle {
-                width: 820px;
-                height: 660px;
+                width: 920px;
+                height: 900px;
                 x: (root.width - self.width) / 2;
                 y: (root.height - self.height) / 2;
                 background: #ffffff;
@@ -1613,6 +1624,29 @@ export component Analysis inherits Window {
                             Text { text: root.wi-result; color: #2c7a3d; font-size: 11px; wrap: word-wrap; }
                         }
                     }
+                            // F-RC14/16：软件根因区块（元凶软件 / 事件日志 / 可疑模块 / 调用栈热点）
+                            Rectangle {
+                                background: #f5f6fa; border-radius: 6px;
+                                VerticalLayout { padding: 8px; spacing: 4px;
+                                    Text { text: "软件根因（F-RC14）"; color: #1e1e2e; font-size: 12px; font-weight: 700; }
+                                    Text { text: "软件级主因：" + root.rc-software-root; color: #1e1e2e; font-size: 12px; wrap: word-wrap; }
+                                    Text { text: "事件日志命中：" + root.rc-win-events; color: #606066; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "可疑模块：" + root.rc-modules; color: #606066; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: "调用栈热点：" + root.rc-stack-hotspots; color: #606066; font-size: 11px; wrap: word-wrap; }
+                                }
+                            }
+                            // F-RC15/16：结论保存 / 回溯
+                            Rectangle {
+                                background: #f5f6fa; border-radius: 6px;
+                                VerticalLayout { padding: 8px; spacing: 4px;
+                                    HorizontalLayout { spacing: 6px;
+                                        Button { text: "保存结论"; clicked => { root.rc-save-report(); } }
+                                        Button { text: "回溯结论"; clicked => { root.rc-load-report(); } }
+                                    }
+                                    Text { text: "结论状态：" + root.rc-saved-version; color: #606066; font-size: 11px; wrap: word-wrap; }
+                                    Text { text: root.rc-saved-status; color: #2c7a3d; font-size: 11px; wrap: word-wrap; }
+                                }
+                            }
                 }
             }
         }
