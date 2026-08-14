@@ -41,8 +41,12 @@ spike_ratio = 3.0
 spike_min_bps = 2000000
 # 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
-# F-RC14-a：进程句柄泄漏判定阈值（句柄数超过即标记 ProcessHandleLeak 候选）
+# F-RC14-a：进程句柄泄漏判定阈值（句柄数超过即进入句柄趋势判定）
 handle_leak_threshold = 10000
+# F-RC14-a 方案 B：句柄增长阈值——卡顿窗口内后半段句柄均值较前半段净增超过该值
+# 才算真泄漏（ProcessHandleLeak）；仅绝对值高但无增长只标 HandleHigh「句柄数偏高」
+# （中性提示，如 AI/数据库等稳定大句柄常驻服务，不误判为泄漏）
+handle_leak_growth_threshold = 2000
 # F-RC14-a：进程 GDI 对象泄漏判定阈值（GDI 对象数超过即标记 GdiObjectLeak 候选）
 gdi_leak_threshold = 10000
 

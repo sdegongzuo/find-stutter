@@ -46,14 +46,60 @@ pub fn is_whitelisted_win_event(ev: &WindowsEventRecord) -> bool {
 /// F-RC14-a + F-RC14-c：汇总软件级 cause（进程指纹阈值 + 事件日志命中），
 /// 按严重程度排序（software_priority 升序）并去重。
 ///
-/// - 进程指纹：句柄数超 handle_leak_threshold → ProcessHandleLeak；
-///   GDI+USER 对象数超 gdi_leak_threshold → GdiObjectLeak。
+/// - 进程指纹（方案 B）：句柄趋势判定——窗口内句柄数持续增长（后半段净增
+///   >= handle_growth_threshold）→ ProcessHandleLeak；绝对值高但无增长 → HandleHigh
+///   （中性提示，不参与主因）；GDI+USER 对象数超 gdi_leak_threshold → GdiObjectLeak。
 /// - 事件日志：白名单命中的事件映射为 DriverTimeout / ServiceCrash /
 ///   DiskIoError / HardwareError（同类型去重，不按条数重复计）。
+/// 句柄趋势判定结果：None（正常）/ High（偏高，中性）/ Leak（持续增长=真泄漏）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandleTrend {
+    None,
+    High,
+    Leak,
+}
+
+/// 方案 B：句柄是否「泄漏」看趋势而非绝对值。
+///
+/// 输入是卡顿窗口内某进程的句柄数采样序列 `history`（为空时回退到单帧 `current`）。
+/// - 全程未超 `abs_threshold` → None（正常占用）；
+/// - 后半段句柄均值较前半段净增 >= `growth_threshold` → Leak（持续增长不回落 = 真泄漏）；
+/// - 绝对值高但无增长 → High（稳定大句柄进程如 AI/数据库服务，中性提示非泄漏）。
+fn handle_trend(
+    history: &[u32],
+    current: u32,
+    abs_threshold: u32,
+    growth_threshold: u32,
+) -> HandleTrend {
+    let values: Vec<u32> = if history.is_empty() {
+        vec![current]
+    } else {
+        history.to_vec()
+    };
+    let max = values.iter().copied().max().unwrap_or(0);
+    if max <= abs_threshold {
+        return HandleTrend::None;
+    }
+    let n = values.len();
+    if n < 2 {
+        // 仅一帧无法判断趋势，按「偏高」中性处理，不武断判泄漏
+        return HandleTrend::High;
+    }
+    let half = n / 2;
+    let first: f64 = values[..half].iter().map(|&v| v as f64).sum::<f64>() / half as f64;
+    let second: f64 = values[half..].iter().map(|&v| v as f64).sum::<f64>() / (n - half) as f64;
+    if second - first >= growth_threshold as f64 {
+        HandleTrend::Leak
+    } else {
+        HandleTrend::High
+    }
+}
 pub fn enrich_software_causes(
     culprits: &[ProcessBrief],
     win_events: &[WindowsEventRecord],
+    handle_history: &std::collections::HashMap<u32, Vec<u32>>,
     handle_leak_threshold: u32,
+    handle_growth_threshold: u32,
     gdi_leak_threshold: u32,
 ) -> Vec<CauseKind> {
     let mut out: Vec<CauseKind> = Vec::new();
@@ -63,8 +109,17 @@ pub fn enrich_software_causes(
         }
     };
     for c in culprits {
-        if c.handle_count.unwrap_or(0) > handle_leak_threshold {
-            push_once(CauseKind::ProcessHandleLeak);
+        // 方案 B：句柄泄漏按趋势判定（绝对值高但稳定 → HandleHigh 中性提示，不判泄漏）
+        let history = handle_history.get(&c.pid).map(|v| v.as_slice()).unwrap_or(&[]);
+        match handle_trend(
+            history,
+            c.handle_count.unwrap_or(0),
+            handle_leak_threshold,
+            handle_growth_threshold,
+        ) {
+            HandleTrend::Leak => push_once(CauseKind::ProcessHandleLeak),
+            HandleTrend::High => push_once(CauseKind::HandleHigh),
+            HandleTrend::None => {}
         }
         let gdi_user = c.gdi_objects.unwrap_or(0) as u64 + c.user_objects.unwrap_or(0) as u64;
         if gdi_user > gdi_leak_threshold as u64 {
@@ -85,6 +140,16 @@ pub fn enrich_software_causes(
 /// 句柄 / GDI 泄漏带上最可疑的进程名与数值；事件日志类带上 provider + 事件 ID。
 pub fn software_cause_text(kind: CauseKind, culprits: &[ProcessBrief]) -> String {
     match kind {
+        CauseKind::HandleHigh => {
+            let p = culprits
+                .iter()
+                .filter(|c| c.handle_count.unwrap_or(0) > 0)
+                .max_by_key(|c| c.handle_count.unwrap_or(0));
+            match p {
+                Some(c) => format!("句柄数偏高: {} {} 句柄（无增长趋势）", c.name, c.handle_count.unwrap_or(0)),
+                None => "句柄数偏高 (进程句柄数高但无增长)".to_string(),
+            }
+        }
         CauseKind::ProcessHandleLeak => {
             let p = culprits
                 .iter()
@@ -147,7 +212,9 @@ pub fn merge_software_causes(mut ev: StutterEvent, sw: Vec<CauseKind>) -> Stutte
         .collect();
     resource.retain(|k| !software.contains(k));
     ev.cause_kinds = software.into_iter().chain(resource).collect();
-    if let Some(top) = ev.cause_kinds.first() {
+    // 主因选择跳过 HandleHigh：句柄数偏高只是中性提示，不抢真实主因。
+    // 真泄漏（ProcessHandleLeak）仍是软件级主因候选。
+    if let Some(top) = ev.cause_kinds.iter().find(|k| **k != CauseKind::HandleHigh) {
         ev.primary_cause = Some(*top);
     }
     ev
@@ -156,6 +223,7 @@ pub fn merge_software_causes(mut ev: StutterEvent, sw: Vec<CauseKind>) -> Stutte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn win_event(channel: &str, provider: &str, id: u32) -> WindowsEventRecord {
         WindowsEventRecord {
@@ -228,11 +296,14 @@ mod tests {
 
     #[test]
     fn enrich_leak_causes_by_threshold() {
+        let mut history = HashMap::new();
+        // a.exe 句柄从 16000 持续增长到 20000（后半段净增 > 2000 → 真泄漏）
+        history.insert(1u32, vec![16000, 18000, 20000]);
         let culprits = vec![
-            culprit(1, "a.exe", 20000, 100, 100), // 句柄超 10000
+            culprit(1, "a.exe", 20000, 100, 100),
             culprit(2, "b.exe", 100, 12000, 100), // GDI+USER 超 10000
         ];
-        let causes = enrich_software_causes(&culprits, &[], 10_000, 10_000);
+        let causes = enrich_software_causes(&culprits, &[], &history, 10_000, 2_000, 10_000);
         assert!(causes.contains(&CauseKind::ProcessHandleLeak));
         assert!(causes.contains(&CauseKind::GdiObjectLeak));
         // 严重度排序：同为泄漏级，ProcessHandleLeak(4) 在 GdiObjectLeak(5) 前
@@ -242,7 +313,7 @@ mod tests {
     #[test]
     fn enrich_no_leak_below_threshold() {
         let culprits = vec![culprit(1, "a.exe", 5000, 100, 100)];
-        let causes = enrich_software_causes(&culprits, &[], 10_000, 10_000);
+        let causes = enrich_software_causes(&culprits, &[], &HashMap::new(), 10_000, 2_000, 10_000);
         assert!(causes.is_empty());
     }
 
@@ -253,7 +324,7 @@ mod tests {
             win_event("System", "Service Control Manager", 7031),
             win_event("System", "Microsoft-Windows-WHEA-Logger", 18),
         ];
-        let causes = enrich_software_causes(&[], &evs, 10_000, 10_000);
+        let causes = enrich_software_causes(&[], &evs, &HashMap::new(), 10_000, 2_000, 10_000);
         // 严重度：HardwareError(0) > DriverTimeout(1) > ServiceCrash(2)
         assert_eq!(causes, vec![
             CauseKind::HardwareError,
@@ -265,7 +336,7 @@ mod tests {
             win_event("System", "disk", 7),
             win_event("System", "disk", 51),
         ];
-        let causes2 = enrich_software_causes(&[], &dup, 10_000, 10_000);
+        let causes2 = enrich_software_causes(&[], &dup, &HashMap::new(), 10_000, 2_000, 10_000);
         assert_eq!(causes2, vec![CauseKind::DiskIoError]);
     }
 
@@ -293,5 +364,42 @@ mod tests {
         let out = merge_software_causes(ev, vec![]);
         assert_eq!(out.primary_cause, Some(CauseKind::MemLow));
         assert_eq!(out.cause_kinds, vec![CauseKind::MemLow]);
+    }
+
+    #[test]
+    fn handle_trend_classifies() {
+        // 未超绝对值阈值 → None
+        assert_eq!(handle_trend(&[100, 200, 300], 0, 10_000, 2_000), HandleTrend::None);
+        // 稳定高位（如常驻 AI/数据库服务）→ High，不武断判泄漏
+        assert_eq!(handle_trend(&[28000, 28100, 27900], 0, 10_000, 2_000), HandleTrend::High);
+        // 持续增长不回落 → Leak
+        assert_eq!(handle_trend(&[16000, 18000, 20000], 0, 10_000, 2_000), HandleTrend::Leak);
+        // 仅单帧且高 → High（无趋势不武断）
+        assert_eq!(handle_trend(&[], 20000, 10_000, 2_000), HandleTrend::High);
+        // 增长但未超增长阈值 → High
+        assert_eq!(handle_trend(&[18000, 18500, 19000], 0, 10_000, 2_000), HandleTrend::High);
+    }
+
+    #[test]
+    fn enrich_stable_high_handle_is_high_not_leak() {
+        // 模拟 HnPCAIService 这类稳定大句柄进程：绝对值 2.8 万但无增长 → HandleHigh 而非泄漏
+        let mut history = HashMap::new();
+        history.insert(2u32, vec![28000, 28100, 27900]);
+        let culprits = vec![culprit(2, "b.exe", 28000, 0, 0)];
+        let causes = enrich_software_causes(&culprits, &[], &history, 10_000, 2_000, 10_000);
+        assert!(!causes.contains(&CauseKind::ProcessHandleLeak), "稳定大句柄不得判泄漏");
+        assert!(causes.contains(&CauseKind::HandleHigh), "应标 HandleHigh 中性提示");
+    }
+
+    #[test]
+    fn merge_handle_high_does_not_take_primary() {
+        let mut ev = StutterEvent::default();
+        ev.cause_kinds = vec![CauseKind::CpuHigh];
+        ev.primary_cause = Some(CauseKind::CpuHigh);
+        ev.culprits = vec![culprit(1, "a.exe", 20000, 0, 0)];
+        let out = merge_software_causes(ev, vec![CauseKind::HandleHigh]);
+        // 中性提示不抢主因
+        assert_eq!(out.primary_cause, Some(CauseKind::CpuHigh));
+        assert!(out.causes.iter().any(|c| c.contains("句柄数偏高: a.exe")));
     }
 }

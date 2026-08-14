@@ -244,6 +244,8 @@ pub enum CauseKind {
     // - ProcessHandleLeak / GdiObjectLeak：句柄 / GDI+USER 对象超阈值（F-RC14-a）
     // - DriverTimeout / ServiceCrash / DiskIoError / HardwareError：事件日志白名单命中（F-RC14-c）
     ProcessHandleLeak,
+    /// 句柄数高但无持续增长趋势（中性提示，不参与主因；区别于真正的泄漏）。
+    HandleHigh,
     GdiObjectLeak,
     DriverTimeout,
     ServiceCrash,
@@ -272,6 +274,8 @@ const PREFIX_TO_KIND: &[(&str, CauseKind)] = &[
     ("Available memory", CauseKind::MemLow),
     ("Commit charge", CauseKind::MemLow),
     ("Memory paging", CauseKind::MemLow),
+    ("句柄泄漏", CauseKind::ProcessHandleLeak),
+    ("句柄数偏高", CauseKind::HandleHigh),
 ];
 
 impl CauseKind {
@@ -299,6 +303,7 @@ impl CauseKind {
         matches!(
             self,
             CauseKind::ProcessHandleLeak
+                | CauseKind::HandleHigh
                 | CauseKind::GdiObjectLeak
                 | CauseKind::DriverTimeout
                 | CauseKind::ServiceCrash
@@ -317,6 +322,8 @@ impl CauseKind {
             CauseKind::ServiceCrash => Some(2),
             CauseKind::DiskIoError => Some(3),
             CauseKind::ProcessHandleLeak => Some(4),
+            // 中性提示：优先级最低，且 merge 选主因时会跳过（不抢主因）
+            CauseKind::HandleHigh => Some(6),
             CauseKind::GdiObjectLeak => Some(5),
             _ => None,
         }
@@ -430,10 +437,16 @@ pub struct DetectionConfig {
     #[serde(default = "default_thermal_freq_drop_ratio")]
     pub thermal_freq_drop_ratio: f32,
     // ===== F-RC14-a 软件根因：句柄 / GDI 泄漏阈值 =====
-    /// 句柄泄漏阈值：单进程 handle_count 超过即记 ProcessHandleLeak cause。
-    /// 默认 10000（正常 Chrome 即可上万句柄，需根据实际采集数据校准）。
+    /// 句柄泄漏阈值：单进程 handle_count 超过即进入句柄趋势判定（F-RC14-a 方案 B）。
+    /// 仅绝对值超过还不够——必须窗口内句柄数持续增长（后半段均值较前半段净增
+    /// >= handle_leak_growth_threshold）才判为 ProcessHandleLeak；否则只标 HandleHigh
+    /// （句柄数偏高，中性提示）。默认 10000（正常 Chrome 即可上万句柄，需实际校准）。
     #[serde(default = "default_handle_leak_threshold")]
     pub handle_leak_threshold: u32,
+    /// 句柄增长阈值：卡顿窗口内后半段句柄均值较前半段净增超过该值才算「泄漏」。
+    /// 防止把稳定占用大量句柄的进程（AI/数据库/杀毒等常驻服务）误判为泄漏。
+    #[serde(default = "default_handle_leak_growth_threshold")]
+    pub handle_leak_growth_threshold: u32,
     /// GDI+USER 对象泄漏阈值：单进程 gdi_objects + user_objects 超过即记
     /// GdiObjectLeak cause。默认 10000。
     #[serde(default = "default_gdi_leak_threshold")]
@@ -463,6 +476,7 @@ impl Default for DetectionConfig {
             thermal_threshold_celsius: 85.0,
             thermal_freq_drop_ratio: 0.85,
             handle_leak_threshold: default_handle_leak_threshold(),
+            handle_leak_growth_threshold: default_handle_leak_growth_threshold(),
             gdi_leak_threshold: default_gdi_leak_threshold(),
         }
     }
@@ -510,6 +524,10 @@ fn default_thermal_freq_drop_ratio() -> f32 {
 // F-RC14-a 句柄 / GDI 泄漏阈值默认值
 fn default_handle_leak_threshold() -> u32 {
     10_000
+}
+
+fn default_handle_leak_growth_threshold() -> u32 {
+    2_000
 }
 fn default_gdi_leak_threshold() -> u32 {
     10_000

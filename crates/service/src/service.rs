@@ -137,6 +137,9 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
 
     let tick = Duration::from_millis(config.sampling.interval_ms);
     let mut count: u64 = 0;
+    // F-RC14-a 方案 B：累积卡顿窗口内各 pid 的句柄数采样序列，供句柄「趋势」判定
+    // （绝对值高但无增长 = 中性提示，持续增长 = 真泄漏）。事件结束后清空。
+    let mut handle_history: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
 
     while RUNNING.load(Ordering::SeqCst) {
         count += 1;
@@ -159,6 +162,11 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         // 卡顿进行中/刚结束一帧时才构建（detector.needs_process_snapshot()）。
         let sample = collector.collect_with(detector.needs_process_snapshot());
 
+        // 累积本帧 top 进程句柄数（卡顿窗口内多次采样，供句柄趋势判定）
+        for p in &sample.top_processes {
+            handle_history.entry(p.pid).or_default().push(p.handle_count.unwrap_or(0));
+        }
+
         if let Some(event) = detector.analyze(&sample) {
             let culprits = event.culprits.clone();
             let onset_secs = event.onset_ts.map(|ms| ms / 1000).unwrap_or_else(|| {
@@ -178,7 +186,9 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
             let sw = enrich_software_causes(
                 &culprits,
                 &win_events,
+                &handle_history,
                 config.detection.handle_leak_threshold,
+                config.detection.handle_leak_growth_threshold,
                 config.detection.gdi_leak_threshold,
             );
             let merged = merge_software_causes(event, sw);
@@ -204,6 +214,8 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
                 }
                 Err(e) => warn!("write_event failed: {}", e),
             }
+            // 事件已结束：清空句柄历史，避免跨事件污染下一轮趋势判定
+            handle_history.clear();
         }
 
         if let Err(e) = logger.write_sample(&sample) {
