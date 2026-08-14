@@ -59,9 +59,17 @@ target/release/find-stutter.exe
 - **CLI 导出**：将指定时间范围的采样数据导出为 CSV（`samples` 表的每秒指标），或查询当日卡顿次数。
 - **进程详情页**：右键菜单「进程详情」打开任务管理器风格进程列表——同名进程按 PPID
   聚合分组（孙进程扁平化到所属 root），显示 PID / 名称 / CPU / 内存（提交大小）/
-  物理内存（工作集）/ 磁盘 / 网络 / 累计网络；点击列头排序、聚合行点击展开/收起、
+  物理内存（专用工作集）/ 磁盘 / 网络 / 累计网络；点击列头排序、聚合行点击展开/收起、
   关键字 / PID / 端口号搜索、双击行打开进程详情面板（路径 / 命令行 / 线程 / 句柄 /
   内存明细等，文本可拖选 + Ctrl+C 复制，标题栏「复制」按钮全量复制）。
+- **Chromium 家族标注**：进程详情页对 msedgewebview2.exe / msedge.exe /
+  chrome.exe 按任务管理器口径标注——内嵌 WebView2 的浏览器进程显示宿主
+  「WebView2: MarkFlowy」，子进程显示角色「WebView2 实用工具: Network Service」、
+  「Chrome GPU 进程」等（按命令行 --type / --utility-sub-type 解析 + 父进程链）；
+  搜索框同样支持按这些展示名查找（输入宿主名即可找到对应 WebView2 组）。
+- **WebView2 按宿主分组**：msedgewebview2.exe 进程按宿主应用分组——同一宿主
+  的全部 WebView2 进程（含多个浏览器实例）合并为一个组（如「WebView2: MarkFlowy」），
+  不同宿主各自独立成组；与宿主自身的非 WebView2 进程互不混组。
 
 ## 架构
 

@@ -279,7 +279,7 @@ struct ProcessRowData {
     cpu: string,           // "45.2%"（归一化后）
     cpu-high: bool,        // CPU 超过高亮阈值（标红加粗）
     mem: string,           // "512 MB"（提交大小 Commit Size）
-    physical-mem: string,  // "420 MB"（物理内存/工作集）
+    physical-mem: string,  // "420 MB"（物理内存/专用工作集）
     mem-high: bool,        // 内存超过高亮阈值（标红加粗）
     disk: string,          // "R 12K/s W 3K/s"（速率）
     disk-full: string,     // 磁盘完整详情
@@ -387,10 +387,10 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 物理内存（工作集；右对齐）
+        // 物理内存（专用工作集；右对齐）
         Text {
-            min-width: 64px;
-            max-width: 64px;
+            min-width: 76px;
+            max-width: 76px;
             height: 100%;
             text: data.physical-mem;
             color: #1e1e2e;
@@ -623,6 +623,7 @@ export component ProcessList inherits Window {
                     min-width: 64px;
                     max-width: 64px;
                     height: 100%;
+                    Tooltip { text: @markdown("提交大小（Commit Size），与任务管理器「详细信息」页「内存」列口径一致"); }
                     TouchArea { clicked => { root.sort-requested("mem"); } }
                     Text {
                         width: 100%;
@@ -635,14 +636,15 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
-                    min-width: 64px;
-                    max-width: 64px;
+                    min-width: 76px;
+                    max-width: 76px;
                     height: 100%;
+                    Tooltip { text: @markdown("专用工作集（Private Working Set），与任务管理器「进程」页「内存」列口径一致"); }
                     TouchArea { clicked => { root.sort-requested("pmem"); } }
                     Text {
                         width: 100%;
                         height: 100%;
-                        text: "物理内存" + (root.sort-column == "pmem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
+                        text: "专用工作集" + (root.sort-column == "pmem" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
                         font-size: 11px;
                         horizontal-alignment: right;

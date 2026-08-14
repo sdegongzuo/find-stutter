@@ -49,7 +49,9 @@ pub struct ProcessRow {
     /// 内存字节数（提交大小 Commit Size = `PagefileUsage`，与任务管理器
     /// 「详细信息」页「内存」列口径一致；取不到时回退工作集）
     pub memory_bytes: u64,
-    /// 物理内存字节数（工作集 Working Set；`sysinfo` 的 `p.memory()`）。
+    /// 物理内存字节数（专用工作集 Private Working Set =
+    /// `PROCESS_MEMORY_COUNTERS_EX2.PrivateWorkingSetSize`，不含与其他进程
+    /// 共享的物理页；与任务管理器「进程」页「内存」列口径一致）。
     /// 「物理内存」列用；`memory_bytes` 是提交大小，两者并存展示。
     pub physical_mem_bytes: u64,
     /// 内存占用百分比（相对全机物理内存；高亮判断用）
@@ -93,6 +95,218 @@ struct IoSnapshot {
     other: u64,
 }
 
+/// Chromium 家族进程（WebView2 / Edge / Chrome）的角色，取自命令行 --type 开关。
+///
+/// 与任务管理器「进程」页的显示口径一致：Chromium 系所有进程都叫同一个 exe
+/// （msedgewebview2.exe / msedge.exe / chrome.exe），靠命令行参数区分角色；
+/// 内嵌的 WebView2 再沿父进程链标注宿主应用（如「WebView2: MarkFlowy」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChromiumRole {
+    /// 浏览器主进程（无 --type 或 --type=browser）
+    Browser,
+    /// 网页渲染进程（--type=renderer）
+    Renderer,
+    /// GPU 进程（--type=gpu-process）
+    Gpu,
+    /// 实用工具进程（--type=utility）；String 为可读子类型名
+    /// （如 "Network Service"），空串表示命令行未给出 --utility-sub-type
+    Utility(String),
+    /// 崩溃处理（--type=crashpad-handler）
+    Crashpad,
+    /// 其他未知 --type（原样保留）
+    Other(String),
+}
+
+/// 进程名 → Chromium 家族展示前缀（WebView2 / Edge / Chrome）。
+/// 返回 None 表示非 Chromium 家族进程。
+fn chromium_family_prefix(name: &str) -> Option<&'static str> {
+    match name.to_ascii_lowercase().as_str() {
+        "msedgewebview2.exe" => Some("WebView2"),
+        "msedge.exe" => Some("Edge"),
+        "chrome.exe" => Some("Chrome"),
+        _ => None,
+    }
+}
+
+/// 是否属于 Chromium 家族进程（宿主链判断用：同家族进程沿父链向上归到宿主应用）。
+fn is_chromium_family(name: &str) -> bool {
+    chromium_family_prefix(name).is_some()
+}
+
+/// 解析 Chromium 进程命令行 → 角色。
+fn chromium_role_from_args(args: &[std::ffi::OsString]) -> ChromiumRole {
+    let mut type_val: Option<String> = None;
+    let mut sub: Option<String> = None;
+    for a in args {
+        let s = a.to_string_lossy();
+        if let Some(v) = s.strip_prefix("--type=") {
+            type_val = Some(v.to_string());
+        } else if let Some(v) = s.strip_prefix("--utility-sub-type=") {
+            sub = Some(v.to_string());
+        }
+    }
+    match type_val.as_deref() {
+        None | Some("browser") => ChromiumRole::Browser,
+        Some("renderer") => ChromiumRole::Renderer,
+        Some("gpu-process") => ChromiumRole::Gpu,
+        Some("crashpad-handler") => ChromiumRole::Crashpad,
+        Some("utility") => ChromiumRole::Utility(
+            sub.as_deref().map(utility_subtype_label).unwrap_or_default(),
+        ),
+        Some(other) => ChromiumRole::Other(other.to_string()),
+    }
+}
+
+/// utility 子类型（如 network.mojom.NetworkService）→ 可读名，
+/// 对齐任务管理器「WebView2 实用工具: Network Service」的显示。
+fn utility_subtype_label(raw: &str) -> String {
+    if raw.contains("NetworkService") {
+        "Network Service".into()
+    } else if raw.contains("StorageService") {
+        "Storage Service".into()
+    } else if raw.contains("AudioService") {
+        "Audio Service".into()
+    } else if raw.contains("VideoCapture") {
+        "Video Capture".into()
+    } else if raw.contains("PdfService") {
+        "PDF Service".into()
+    } else if raw.contains("ScreenCapture") {
+        "Screen Capture".into()
+    } else {
+        // 兜底：取最后一个 '.' 之后的段（mojom.XxxService → XxxService）
+        raw.rsplit('.').next().unwrap_or(raw).to_string()
+    }
+}
+
+/// 沿父链向上找 Chromium 家族进程的宿主应用：
+/// 一直走到第一个非 Chromium 家族的进程（对 WebView2 来说就是宿主应用，如 MarkFlowy）。
+/// 父链断裂 / 环 / 找不到宿主时返回 None。
+fn host_display_name(pid: u32, rows: &[ProcessRow], idx: &HashMap<u32, usize>) -> Option<String> {
+    let mut cur = pid;
+    for _ in 0..16 {
+        let row = idx.get(&cur).map(|&i| &rows[i])?;
+        if !is_chromium_family(&row.name) {
+            let d = row.display_name.trim();
+            return Some(if d.is_empty() { row.name.clone() } else { d.to_string() });
+        }
+        let parent = row.parent_pid;
+        if parent == 0 || parent == cur {
+            return None;
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// 按 Chromium 角色改写展示名（任务管理器风格）。
+/// 在 display_name 已填充友好名之后调用；roles 是采样时收集的 pid → 角色。
+fn annotate_chromium_rows(rows: &mut [ProcessRow], roles: &HashMap<u32, ChromiumRole>) {
+    let idx: HashMap<u32, usize> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.pid, i))
+        .collect();
+    for i in 0..rows.len() {
+        let role = roles.get(&rows[i].pid);
+        if role.is_none() { continue; }
+        let role = role.unwrap();
+        let prefix = chromium_family_prefix(&rows[i].name);
+        if prefix.is_none() { continue; }
+        let prefix = prefix.unwrap();
+        rows[i].display_name = match role {
+            // 浏览器主进程：
+            // - WebView2（内嵌）→ 标注宿主「WebView2: MarkFlowy」
+            // - Edge / Chrome（独立应用）→ 保留应用名（FileDescription：Microsoft Edge / Google Chrome）
+            ChromiumRole::Browser if prefix == "WebView2" => match host_display_name(rows[i].pid, rows, &idx) {
+                Some(host) => format!("{}: {}", prefix, host),
+                None => prefix.to_string(),
+            },
+            ChromiumRole::Browser => rows[i].display_name.clone(),
+            ChromiumRole::Renderer => format!("{} 渲染进程", prefix),
+            ChromiumRole::Gpu => format!("{} GPU 进程", prefix),
+            ChromiumRole::Utility(sub) if !sub.is_empty() => format!("{} 实用工具: {}", prefix, sub),
+            ChromiumRole::Utility(_) => format!("{} 实用工具", prefix),
+            ChromiumRole::Crashpad => format!("{} 崩溃处理", prefix),
+            ChromiumRole::Other(t) => format!("{} {}", prefix, t),
+        };
+    }
+}
+
+/// 沿父链向上找 WebView2 进程的宿主 PID：
+/// 一直走到第一个不在 wv_pids 集合中的父进程（即宿主应用）。
+/// 父链断裂 / 环 / 找不到时返回 None。
+fn webview2_host_pid(
+    pid: u32,
+    rows: &[ProcessRow],
+    wv_pids: &std::collections::HashSet<u32>,
+) -> Option<u32> {
+    let mut cur = pid;
+    for _ in 0..16 {
+        let row = rows.iter().find(|r| r.pid == cur)?;
+        let parent = row.parent_pid;
+        if parent == 0 || parent == cur {
+            return None;
+        }
+        if !wv_pids.contains(&parent) {
+            return Some(parent);
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// WebView2 分组：按宿主分组——同一宿主的全部 msedgewebview2.exe 进程
+/// （含多个浏览器实例）合并为一个组。宿主 = 父链上第一个非 WebView2 进程；
+/// 取不到宿主（父链断裂/进程已退出）的归入一个兜底组。
+/// root 优先选浏览器进程（父进程不在 WebView2 集合内），保证组标题能带上宿主。
+fn push_webview2_groups(
+    group_rows: &[ProcessRow],
+    all_rows: &[ProcessRow],
+    out: &mut Vec<GroupedProcess>,
+) {
+    let wv_pids: std::collections::HashSet<u32> = all_rows
+        .iter()
+        .filter(|r| r.name.eq_ignore_ascii_case("msedgewebview2.exe"))
+        .map(|r| r.pid)
+        .collect();
+
+    let mut by_host: std::collections::BTreeMap<u32, Vec<&ProcessRow>> = Default::default();
+    let mut no_host: Vec<&ProcessRow> = Vec::new();
+    for r in group_rows {
+        match webview2_host_pid(r.pid, all_rows, &wv_pids) {
+            Some(host) => by_host.entry(host).or_default().push(r),
+            None => no_host.push(r),
+        }
+    }
+
+    let mut host_groups: Vec<Vec<&ProcessRow>> = by_host.into_values().collect();
+    if !no_host.is_empty() {
+        host_groups.push(no_host);
+    }
+
+    for mut members in host_groups {
+        // 组内按 PID 稳定排序；root 优先选浏览器进程（父不在 WebView2 集合内）
+        members.sort_by_key(|r| r.pid);
+        let root_idx = members
+            .iter()
+            .position(|r| !wv_pids.contains(&r.parent_pid))
+            .unwrap_or(0);
+        let root = members[root_idx].clone();
+        let children: Vec<ProcessRow> = members
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != root_idx)
+            .map(|(_, r)| (*r).clone())
+            .collect();
+        out.push(GroupedProcess {
+            name: root.name.clone(),
+            root,
+            children,
+            services: Default::default(),
+        });
+    }
+}
+
 impl ProcessSampler {
     /// 创建采样器并预热（第一次 refresh 建立 CPU 基线）。
     pub fn new() -> Self {
@@ -129,6 +343,8 @@ impl ProcessSampler {
 
         let mut rows: Vec<ProcessRow> = Vec::with_capacity(self.sys.processes().len());
         let mut next_io: HashMap<u32, IoSnapshot> = HashMap::new();
+        // Chromium 家族（WebView2/Edge/Chrome）pid → 角色（命令行 --type 解析，供展示名标注）
+        let mut roles: HashMap<u32, ChromiumRole> = HashMap::new();
 
         for (pid, p) in self.sys.processes() {
             let pid_u32 = pid.as_u32();
@@ -150,11 +366,21 @@ impl ProcessSampler {
             };
             next_io.insert(pid_u32, cur);
 
-            // 内存口径与任务管理器「详细信息」页一致：提交大小（Commit
-            // Size = PagefileUsage，含已换出到页面文件的私有页）。取不到
-            // （权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
+            // Chromium 家族（WebView2/Edge/Chrome）角色：命令行取不到
+            // （权限不足/进程已退出）时跳过，该进程保持原展示名不做标注
+            let exe_name = p.name().to_string_lossy();
+            if is_chromium_family(&exe_name) && !p.cmd().is_empty() {
+                roles.insert(pid_u32, chromium_role_from_args(p.cmd()));
+            }
+
+            // 内存双口径（任务管理器对齐，一次 GetProcessMemoryInfo 取全）：
+            // - 提交大小（Commit Size = PagefileUsage）→「详细信息」页「内存」列
+            // - 专用工作集（Private Working Set = PrivateWorkingSetSize）→「进程」页「内存」列
+            // 取不到（权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
             let ws = p.memory();
-            let mem = process_commit_bytes(pid_u32).unwrap_or(ws);
+            let detail = process_memory_detail(pid_u32);
+            let mem = detail.map_or(ws, |d| d.0); // 提交大小
+            let pws = detail.map_or(ws, |d| d.1); // 专用工作集
             // 监听/UDP 端口：port_map 里有就取，没有就是空（绝大多数进程无端口）
             let ports = self.port_cache.get(&pid_u32).cloned().unwrap_or_default();
             rows.push(ProcessRow {
@@ -165,7 +391,7 @@ impl ProcessSampler {
                 display_name: String::new(),
                 cpu_usage: p.cpu_usage(),
                 memory_bytes: mem,
-                physical_mem_bytes: ws,
+                physical_mem_bytes: pws,
                 memory_pct: mem_pct(mem, total_mem),
                 disk_read_bps: read_bps,
                 disk_write_bps: write_bps,
@@ -182,6 +408,13 @@ impl ProcessSampler {
         // 统一填充展示名（友好名）；循环内不调用 &mut self 方法，避免借用冲突
         for r in &mut rows {
             r.display_name = self.cached_display_name(r.pid, &r.name);
+        }
+
+        // Chromium 家族标注（任务管理器风格）：
+        // - WebView2 浏览器进程显示宿主「WebView2: MarkFlowy」
+        // - Edge/Chrome/WebView2 子进程显示角色「WebView2 实用工具: Network Service」等
+        if !roles.is_empty() {
+            annotate_chromium_rows(&mut rows, &roles);
         }
 
         // 裁剪展示名缓存：仅保留当前存在的 pid（防内存增长 / pid 复用串味）
@@ -281,7 +514,11 @@ pub fn filter_processes(rows: &[ProcessRow], keyword: &str) -> Vec<ProcessRow> {
         return rows.to_vec();
     }
     rows.iter()
-        .filter(|r| r.name.to_ascii_lowercase().contains(&kw) || r.pid.to_string().contains(&kw))
+        .filter(|r| {
+            r.name.to_ascii_lowercase().contains(&kw)
+                || r.pid.to_string().contains(&kw)
+                || r.display_name.to_ascii_lowercase().contains(&kw)
+        })
         .cloned()
         .collect()
 }
@@ -334,7 +571,14 @@ pub fn group_processes(
     }
 
     let mut out: Vec<GroupedProcess> = Vec::new();
-    for (_key, group_rows) in by_name {
+    for (key, group_rows) in by_name {
+        // WebView2（msedgewebview2.exe）：按宿主分组——同一宿主的全部
+        // WebView2 进程（含多个浏览器实例）合并为一个组；宿主 = 父链上第一个
+        // 非 WebView2 进程，取不到时归入一个兜底组。其他进程仍走同名+PPID。
+        if key == "msedgewebview2.exe" {
+            push_webview2_groups(&group_rows, rows, &mut out);
+            continue;
+        }
         let pids: std::collections::HashSet<u32> =
             group_rows.iter().map(|r| r.pid).collect();
         let pid_to_row: std::collections::HashMap<u32, &ProcessRow> =
@@ -832,11 +1076,11 @@ pub fn process_detail(pid: u32, name: &str, row: Option<&ProcessRow>, nb_cpus: u
     if let Some(t) = process_start_time(pid) {
         lines.push(format!("启动时间: {}", t));
     }
-    if let Some((ws, priv_bytes)) = process_memory_detail(pid) {
+    if let Some((commit, pws, _)) = process_memory_detail(pid) {
         lines.push(format!(
-            "内存: 工作集 {} / 私有 {}",
-            format_mem(ws),
-            format_mem(priv_bytes)
+            "内存: 提交大小 {} / 专用工作集 {}",
+            format_mem(commit),
+            format_mem(pws)
         ));
     }
     lines.join("\n")
@@ -947,39 +1191,43 @@ fn process_start_time(pid: u32) -> Option<String> {
     }
 }
 
-/// 进程内存明细：工作集 + 提交大小（`GetProcessMemoryInfo`）。
-/// 元组第二项 `PagefileUsage` = 提交大小（Commit Size），即任务管理器
-/// 「详细信息」页「内存」列的取值口径。
+/// 进程内存明细：提交大小 + 专用工作集 + 工作集（一次 `GetProcessMemoryInfo`）。
+/// 元组顺序 (提交大小, 专用工作集, 工作集)：
+/// - `PagefileUsage` = 提交大小（Commit Size），任务管理器「详细信息」页「内存」列口径
+/// - `PrivateWorkingSetSize` = 专用工作集（Private Working Set），任务管理器「进程」页「内存」列口径
+/// - `WorkingSetSize` = 工作集（含与其他进程共享的物理页）
+/// 需要 `PROCESS_MEMORY_COUNTERS_EX2`（Windows 8.1+，本工具目标平台 Win10/11）。
 #[cfg(windows)]
-fn process_memory_detail(pid: u32) -> Option<(u64, u64)> {
+fn process_memory_detail(pid: u32) -> Option<(u64, u64, u64)> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::ProcessStatus::{
-        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
     };
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut mc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
-        mc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        let ok = GetProcessMemoryInfo(handle, &mut mc, mc.cb);
+        let mut mc: PROCESS_MEMORY_COUNTERS_EX2 = std::mem::zeroed();
+        mc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        // cb 传 EX2 结构大小，系统按需填充扩展字段（PrivateWorkingSetSize /
+        // SharedCommitUsage）；GetProcessMemoryInfo 签名只接受基结构指针，
+        // 以裸指针转换传入（Win32 惯例，Windows 8.1+ 支持 EX2 结构）。
+        let p = &mut mc as *mut PROCESS_MEMORY_COUNTERS_EX2 as *mut PROCESS_MEMORY_COUNTERS;
+        let ok = GetProcessMemoryInfo(handle, p, mc.cb);
         let _ = CloseHandle(handle);
         ok.ok()?;
-        Some((mc.WorkingSetSize as u64, mc.PagefileUsage as u64))
+        Some((
+            mc.PagefileUsage as u64,
+            mc.PrivateWorkingSetSize as u64,
+            mc.WorkingSetSize as u64,
+        ))
     }
 }
 
-/// 进程提交大小（Commit Size = `PagefileUsage`，含已换出到页面文件的私有页）。
-/// 任务管理器「详细信息」页「内存」列的取值口径。失败（权限不足 /
-/// 进程已退出）返回 None，调用方应回退其他口径。
-#[cfg(windows)]
-fn process_commit_bytes(pid: u32) -> Option<u64> {
-    process_memory_detail(pid).map(|(_, commit)| commit)
-}
-
+/// 非 Windows 兜底：无 PSAPI，返回 None（调用方回退 sysinfo 工作集）。
 #[cfg(not(windows))]
-fn process_commit_bytes(_pid: u32) -> Option<u64> {
+fn process_memory_detail(_pid: u32) -> Option<(u64, u64, u64)> {
     None
 }
 
@@ -2640,7 +2888,11 @@ fn filter_groups(
         .filter(|g| {
             g.name.to_ascii_lowercase().contains(&kw)
                 || g.root.pid.to_string().contains(&kw)
-                || g.children.iter().any(|c| c.pid.to_string().contains(&kw))
+                || g.root.display_name.to_ascii_lowercase().contains(&kw)
+                || g.children.iter().any(|c| {
+                    c.pid.to_string().contains(&kw)
+                        || c.display_name.to_ascii_lowercase().contains(&kw)
+                })
         })
         .cloned()
         .collect()
@@ -3018,13 +3270,13 @@ mod tests {
 
     #[test]
     fn sort_groups_by_pmem() {
-        // 物理内存列：提交大小相同、工作集不同 → 按工作集排序
+        // 物理内存列：提交大小相同、专用工作集不同 → 按专用工作集排序
         let mut rows = vec![
             row(1, "a.exe", 10.0, 100),
             row(2, "b.exe", 10.0, 100),
             row(3, "c.exe", 10.0, 100),
         ];
-        rows[1].physical_mem_bytes = 900 * 1024 * 1024; // b 工作集最大
+        rows[1].physical_mem_bytes = 900 * 1024 * 1024; // b 专用工作集最大
         rows[2].physical_mem_bytes = 500 * 1024 * 1024; // c 次之
         let mut groups = group_processes(&rows, &no_services());
         sort_groups(&mut groups, "pmem", false);
@@ -3360,5 +3612,244 @@ mod tests {
         assert!(d.name.contains("Google Chrome"));
         assert!(d.name_full.contains("chrome.exe"));
         assert_eq!(d.group_key, "chrome.exe");
+    }
+
+    // ===== Chromium 家族标注（WebView2 / Edge / Chrome 角色 + 宿主）=====
+
+    /// 命令行参数辅助：&str 切片 → OsString 数组
+    fn cmd(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn chromium_role_browser_when_no_type() {
+        // 无 --type 或 --type=browser 都是浏览器主进程
+        assert_eq!(chromium_role_from_args(&cmd(&[])), ChromiumRole::Browser);
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=browser", "--foo"])),
+            ChromiumRole::Browser
+        );
+    }
+
+    #[test]
+    fn chromium_role_renderer_gpu_crashpad() {
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=renderer"])),
+            ChromiumRole::Renderer
+        );
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=gpu-process"])),
+            ChromiumRole::Gpu
+        );
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=crashpad-handler"])),
+            ChromiumRole::Crashpad
+        );
+    }
+
+    #[test]
+    fn chromium_role_utility_maps_subtype() {
+        // 常见 utility 子类型 → 可读名（对齐任务管理器）
+        assert_eq!(
+            chromium_role_from_args(&cmd(&[
+                "--type=utility",
+                "--utility-sub-type=network.mojom.NetworkService",
+            ])),
+            ChromiumRole::Utility("Network Service".into())
+        );
+        assert_eq!(
+            chromium_role_from_args(&cmd(&[
+                "--type=utility",
+                "--utility-sub-type=storage.mojom.StorageService",
+            ])),
+            ChromiumRole::Utility("Storage Service".into())
+        );
+        // 未知子类型 → 取最后一个 '.' 后的段
+        assert_eq!(
+            chromium_role_from_args(&cmd(&[
+                "--type=utility",
+                "--utility-sub-type=mojom.SomeOddThing",
+            ])),
+            ChromiumRole::Utility("SomeOddThing".into())
+        );
+        // 无子类型 → 空串
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=utility"])),
+            ChromiumRole::Utility(String::new())
+        );
+    }
+
+    #[test]
+    fn chromium_role_unknown_type_kept() {
+        assert_eq!(
+            chromium_role_from_args(&cmd(&["--type=zygote"])),
+            ChromiumRole::Other("zygote".into())
+        );
+    }
+
+    #[test]
+    fn chromium_family_prefix_and_check() {
+        assert_eq!(chromium_family_prefix("msedgewebview2.exe"), Some("WebView2"));
+        assert_eq!(chromium_family_prefix("MSEDGEWEBVIEW2.EXE"), Some("WebView2"));
+        assert_eq!(chromium_family_prefix("msedge.exe"), Some("Edge"));
+        assert_eq!(chromium_family_prefix("chrome.exe"), Some("Chrome"));
+        assert_eq!(chromium_family_prefix("markflowy.exe"), None);
+        assert!(is_chromium_family("chrome.exe"));
+        assert!(!is_chromium_family("explorer.exe"));
+    }
+
+    #[test]
+    fn annotate_webview2_browser_with_host() {
+        // markflowy(宿主, PID 100) → WebView2 浏览器(200) → 实用工具子进程(201)
+        let mut rows = vec![
+            row_p(100, 0, "markflowy.exe", 1.0, 10),
+            row_p(200, 100, "msedgewebview2.exe", 1.0, 10),
+            row_p(201, 200, "msedgewebview2.exe", 1.0, 10),
+        ];
+        rows[0].display_name = "MarkFlowy".into();
+        let mut roles = std::collections::HashMap::new();
+        roles.insert(200, ChromiumRole::Browser);
+        roles.insert(201, ChromiumRole::Utility("Network Service".into()));
+        annotate_chromium_rows(&mut rows, &roles);
+        // 浏览器 → 「WebView2: 宿主」；子进程 → 角色标签；宿主本身不受影响
+        assert_eq!(rows[1].display_name, "WebView2: MarkFlowy");
+        assert_eq!(rows[2].display_name, "WebView2 实用工具: Network Service");
+        assert_eq!(rows[0].display_name, "MarkFlowy");
+    }
+
+    #[test]
+    fn annotate_chrome_keeps_app_name_and_labels_children() {
+        // explorer(宿主) → chrome 浏览器(300) → GPU 子进程(301)
+        let mut rows = vec![
+            row_p(300, 500, "chrome.exe", 1.0, 10),
+            row_p(301, 300, "chrome.exe", 1.0, 10),
+        ];
+        rows[0].display_name = "Google Chrome".into();
+        rows[1].display_name = "Google Chrome".into();
+        let mut roles = std::collections::HashMap::new();
+        roles.insert(300, ChromiumRole::Browser);
+        roles.insert(301, ChromiumRole::Gpu);
+        annotate_chromium_rows(&mut rows, &roles);
+        // Chrome 是独立应用：浏览器保留应用名，子进程标注角色
+        assert_eq!(rows[0].display_name, "Google Chrome");
+        assert_eq!(rows[1].display_name, "Chrome GPU 进程");
+    }
+
+    #[test]
+    fn annotate_webview2_no_host_falls_back() {
+        // 浏览器父链断裂（parent=0）→ 找不到宿主，回退为「WebView2」
+        let mut rows = vec![row_p(400, 0, "msedgewebview2.exe", 1.0, 10)];
+        let mut roles = std::collections::HashMap::new();
+        roles.insert(400, ChromiumRole::Browser);
+        annotate_chromium_rows(&mut rows, &roles);
+        assert_eq!(rows[0].display_name, "WebView2");
+    }
+
+    #[test]
+    fn annotate_skips_non_chromium() {
+        // 非 Chromium 进程（无角色记录）保持原展示名
+        let mut rows = vec![row_p(500, 0, "explorer.exe", 1.0, 10)];
+        rows[0].display_name = "Explorer".into();
+        annotate_chromium_rows(&mut rows, &std::collections::HashMap::new());
+        assert_eq!(rows[0].display_name, "Explorer");
+    }
+
+    #[test]
+    fn filter_groups_by_display_name() {
+        // 按展示名搜索：输入宿主名可找到 WebView2 组
+        let mut wv = GroupedProcess {
+            name: "msedgewebview2.exe".into(),
+            root: row_p(200, 100, "msedgewebview2.exe", 1.0, 10),
+            children: vec![],
+            services: vec![],
+        };
+        wv.root.display_name = "WebView2: MarkFlowy".into();
+        let groups = vec![wv];
+        let f = filter_groups(&groups, "markflowy", &std::collections::HashSet::new());
+        assert_eq!(f.len(), 1);
+        // 不匹配的展示名 → 空
+        let f2 = filter_groups(&groups, "notexist", &std::collections::HashSet::new());
+        assert!(f2.is_empty());
+    }
+
+    // ===== WebView2 按宿主分组 ===== 
+
+    #[test]
+    fn group_webview2_grouped_by_host() {
+        // markflowy(100) → WebView2 浏览器(200) → 子进程(201)；
+        // markflowy 还有第二个浏览器实例(202) → 应与 200/201 合并进同一组；
+        // widgets(300) → WebView2 浏览器(400) → 子进程(401) → 独立一组
+        let rows = vec![
+            row_p(100, 0, "markflowy.exe", 1.0, 10),
+            row_p(200, 100, "msedgewebview2.exe", 1.0, 10),
+            row_p(201, 200, "msedgewebview2.exe", 1.0, 10),
+            row_p(202, 100, "msedgewebview2.exe", 1.0, 10), // 同宿主的第二个浏览器
+            row_p(300, 0, "Widgets.exe", 1.0, 10),
+            row_p(400, 300, "msedgewebview2.exe", 1.0, 10),
+            row_p(401, 400, "msedgewebview2.exe", 1.0, 10),
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let wv: Vec<&GroupedProcess> = groups
+            .iter()
+            .filter(|g| g.name == "msedgewebview2.exe")
+            .collect();
+        // 两个宿主 → 两个 WebView2 组（不是把所有 WebView2 合成一组）
+        assert_eq!(wv.len(), 2, "按宿主分组：应有两个 WebView2 组");
+        // markflowy 的组应含其两个浏览器实例 + 子进程 = 3 个
+        let mf = wv.iter().find(|g| g.root.parent_pid == 100).unwrap();
+        assert_eq!(mf.total_count(), 3, "同宿主多个浏览器实例应合并为一组");
+        // 宿主进程仍各自独立成组：markflowy + Widgets
+        assert_eq!(groups.len(), 4);
+    }
+
+    #[test]
+    fn group_webview2_distinct_hosts_separate() {
+        // 不同宿主 → 各自独立组，不合并
+        let rows = vec![
+            row_p(100, 0, "markflowy.exe", 1.0, 10),
+            row_p(200, 100, "msedgewebview2.exe", 1.0, 10),
+            row_p(300, 0, "Widgets.exe", 1.0, 10),
+            row_p(400, 300, "msedgewebview2.exe", 1.0, 10),
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let wv: Vec<&GroupedProcess> = groups
+            .iter()
+            .filter(|g| g.name == "msedgewebview2.exe")
+            .collect();
+        assert_eq!(wv.len(), 2);
+        assert_eq!(wv[0].total_count(), 1);
+        assert_eq!(wv[1].total_count(), 1);
+    }
+
+    #[test]
+    fn group_webview2_orphaned_fallback_single_group() {
+        // 父进程为 0（无法确定宿主）：所有 WebView2 归入一个兜底组
+        let rows = vec![
+            row_p(200, 0, "msedgewebview2.exe", 1.0, 10),
+            row_p(201, 200, "msedgewebview2.exe", 1.0, 10),
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let wv: Vec<&GroupedProcess> = groups
+            .iter()
+            .filter(|g| g.name == "msedgewebview2.exe")
+            .collect();
+        assert_eq!(wv.len(), 1);
+        assert_eq!(wv[0].total_count(), 2);
+    }
+
+    #[test]
+    fn group_display_webview2_host_title() {
+        // 组标题带宿主（来自 root 浏览器进程的标注展示名）
+        let rows = vec![
+            row_p(200, 100, "msedgewebview2.exe", 1.0, 10),
+            row_p(201, 200, "msedgewebview2.exe", 1.0, 10),
+        ];
+        let mut groups = group_processes(&rows, &no_services());
+        groups[0].root.display_name = "WebView2: MarkFlowy".into();
+        let agg = group_aggregate(&groups[0]);
+        let d = group_display(&groups[0], &agg, 8, 30.0, 16 * 1024 * 1024 * 1024);
+        assert!(d.name.contains("WebView2: MarkFlowy"));
+        assert!(d.name.contains("(2)"));
+        assert_eq!(d.group_key, "msedgewebview2.exe");
     }
 }
