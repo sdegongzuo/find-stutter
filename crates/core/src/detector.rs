@@ -285,10 +285,20 @@ impl Detector {
         // 分页活动速率（阶段 C）：\Memory\Page Reads/sec 是「真正的 swap 卡顿信号」。
         // 物理内存耗尽时 OS 被迫把页从 pagefile 换入，每次换页注入一次磁盘 I/O 延迟 → 卡顿。
         // 这是速率口径（流量），而非 swap 使用率存量——后者在 Windows 上易误报且会虚高
-        // severity，已降级为仅展示。作为独立内存压力来源，与 mem / commit 三个口径互补
-        // （任一成立即记内存压力）。无滞回（瞬时速率判断；单 tick 尖峰仅向进行中的卡顿
-        // 追加 cause，不会单独凭一次尖峰记录卡顿）。
-        if sample.page_reads_per_sec > self.config.page_reads_threshold {
+        // severity，已降级为仅展示。
+        // 修正（用户实测反馈）：Page Reads/sec 是瞬时抖动极大的计数器，开发机/模拟器场景
+        // （Android Studio / qemu / IDE 等）正常负载也频繁超阈值，但磁盘空闲、提交电荷不高时
+        // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「内存/磁盘压力
+        // 证据」（commit 高 / 内存使用率高 / 可用内存不足 / 磁盘繁忙）才记为卡顿 cause——
+        // paging 退化为真卡顿的「放大器」，避免孤立分页尖峰连环误报。
+        let paging_has_pressure_evidence = commit_ratio > self.config.commit_threshold_percent as f64
+            || sample.mem_usage_percent > self.config.mem_threshold_percent
+            || sample.mem_available_mb < self.config.mem_threshold_mb
+            || sample.disk_busy_percent > self.config.disk_busy_threshold_percent
+            || sample.disk_avg_io_ms > self.config.disk_io_threshold_ms;
+        if sample.page_reads_per_sec > self.config.page_reads_threshold
+            && paging_has_pressure_evidence
+        {
             causes.push(format!(
                 "Memory paging {:.1}/s > {}/s",
                 sample.page_reads_per_sec, self.config.page_reads_threshold
@@ -673,38 +683,54 @@ mod tests {
         );
     }
 
-    /// 回归：分页活动速率（Page Reads/sec）超过 `page_reads_threshold` 时，必须触发
-    /// 「Memory paging」原因——这是真正的 swap 卡顿信号（阶段 C）。其它内存口径正常时
-    /// 不应误报，只有分页速率这一条成立。
+    /// 回归：分页活动速率（Page Reads/sec）只有与「内存/磁盘压力证据」同时成立才触发
+    /// 「Memory paging」原因（阶段 C）。修正（用户实测反馈）：Page Reads/sec 瞬时抖动极大，
+    /// 开发机/模拟器正常负载也频繁超阈值，但磁盘空闲、提交电荷不高时系统并不卡顿——
+    /// 孤立分页尖峰不得连环误报，须有真实内存/磁盘压力（commit 高/内存使用率高/可用内存
+    /// 不足/磁盘繁忙）才记为卡顿 cause。
     #[test]
     fn analyze_high_page_reads_starts_stutter_tracking() {
         let mut config = DetectionConfig::default();
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // 内存/提交/CPU 都正常，但分页速率 200/s 远超默认阈值 50/s
+        // 分页速率超阈值（400/s > 默认 300/s）且 内存使用率爆表（95% > 90%）：
+        // 真实 swap 卡顿场景 → 必须触发且产出 'Memory paging'
         let mut s = make_sample(30.0, 2000, 10.0);
-        s.mem_usage_percent = 30.0;
-        s.page_reads_per_sec = 200.0;
+        s.mem_usage_percent = 95.0;
+        s.page_reads_per_sec = 400.0;
         d.analyze(&s);
         assert!(
             !d.current_causes.is_empty(),
-            "分页速率爆表必须触发卡顿原因"
+            "分页爆表 + 内存压力必须触发卡顿原因"
         );
         assert!(
             d.current_causes.iter().any(|c| c.contains("Memory paging")),
             "应产出 'Memory paging' 原因，got: {:?}",
             d.current_causes
         );
-        // 未达阈值时不触发
+
+        // 孤立分页高、无任何内存/磁盘压力（开发机/模拟器常见抖动）→ 不得触发（防误报）
+        let mut spike = make_sample(30.0, 2000, 10.0);
+        spike.mem_usage_percent = 30.0;
+        spike.page_reads_per_sec = 400.0; // 远超阈值，但系统内存/磁盘均无压力
+        let mut d3 = Detector::new(&config);
+        d3.analyze(&spike);
+        assert!(
+            d3.current_causes.is_empty(),
+            "孤立分页尖峰不应触发卡顿，got: {:?}",
+            d3.current_causes
+        );
+
+        // 未达阈值时不触发（即使内存有压力）
         let mut normal = make_sample(30.0, 2000, 10.0);
-        normal.mem_usage_percent = 30.0;
+        normal.mem_usage_percent = 95.0;
         normal.page_reads_per_sec = 5.0; // 远低于阈值
         let mut d2 = Detector::new(&config);
         d2.analyze(&normal);
         assert!(
-            d2.current_causes.is_empty(),
-            "分页速率未达阈值不应触发，got: {:?}",
+            d2.current_causes.iter().all(|c| !c.contains("Memory paging")),
+            "分页速率未达阈值不应触发 paging，got: {:?}",
             d2.current_causes
         );
     }

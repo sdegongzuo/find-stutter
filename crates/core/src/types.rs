@@ -380,8 +380,10 @@ pub struct DetectionConfig {
     pub commit_threshold_percent: f32,
     /// 分页活动速率阈值（/s）：\Memory\Page Reads/sec 超过该值即记为换页抖动
     /// （真正的 swap 卡顿信号，度量换页活动强度而非 swap 已用存量）。
-    /// 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。详见
-    /// docs/memory-stutter-detection.md 的阶段 C 说明。
+    /// 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。
+    /// 修正（用户实测）：Page Reads/sec 瞬时抖动极大，开发机/模拟器正常负载也常超 50/s，
+    /// 故默认调高到 300/s，且需与「内存/磁盘压力证据」同时成立才触发（见 detector.rs）。
+    /// 详见 docs/memory-stutter-detection.md 的阶段 C 说明。
     pub page_reads_threshold: f32,
     pub disk_rate_spike_ratio: f32,
     pub spike_ratio: f32,
@@ -446,7 +448,7 @@ impl Default for DetectionConfig {
             mem_threshold_percent: 90.0,
             mem_threshold_mb: 500,
             commit_threshold_percent: 90.0,
-            page_reads_threshold: 50.0,
+            page_reads_threshold: 300.0,
             disk_rate_spike_ratio: 10.0,
             spike_ratio: 3.0,
             spike_min_bps: 2_000_000,
@@ -880,7 +882,7 @@ mod tests {
         assert_eq!(c.mem_threshold_percent, 90.0);
         assert_eq!(c.mem_threshold_mb, 500);
         assert_eq!(c.commit_threshold_percent, 90.0);
-        assert_eq!(c.page_reads_threshold, 50.0);
+        assert_eq!(c.page_reads_threshold, 300.0);
         assert_eq!(c.disk_rate_spike_ratio, 10.0);
         assert_eq!(c.spike_ratio, 3.0);
         assert_eq!(c.spike_min_bps, 2_000_000);

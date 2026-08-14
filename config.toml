@@ -27,7 +27,11 @@ commit_threshold_percent = 90.0
 # 分页活动速率（Page Reads/sec）阈值（/s）：超过即记为换页抖动。这是「真正的 swap
 # 卡顿信号」——度量换页活动强度（流量）而非 swap 已用存量。正常负载通常 < 10/s，
 # 抖动（thrashing）时飙升到数百/数千 /s。详见 docs/memory-stutter-detection.md 阶段 C。
-page_reads_threshold = 50.0
+# 修正（用户实测反馈）：Page Reads/sec 瞬时抖动极大，开发机/模拟器（Android Studio /
+# qemu / IDE 等）正常负载也频繁超 50/s，但磁盘空闲、提交电荷不高时系统并不卡顿。
+# 故：1) 默认阈值调高到 300/s；2) paging 不再单指标硬触发——必须同时存在内存/磁盘
+# 压力证据（commit 高 / 内存使用率高 / 可用内存不足 / 磁盘繁忙）才记为卡顿 cause。
+page_reads_threshold = 300.0
 # 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
 disk_rate_spike_ratio = 10.0
 # 综合指标相对基线的突增倍数
