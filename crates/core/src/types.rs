@@ -328,6 +328,23 @@ impl CauseKind {
             _ => None,
         }
     }
+
+    /// 该 cause 是否为「系统压力类」卡顿根因——即能直接造成系统无响应的资源饱和信号。
+    ///
+    /// 用于 v0.3.x 误报治理（见 `Detector::analyze` 的事件生成闸门）：纯吞吐类 spike
+    /// （`NetSpike` / `DiskSpike`）本质是异步 I/O 突发（下载 / 构建 / git / 备份等），
+    /// 不直接导致系统无响应，**单凭它们不应记录一次卡顿事件**；必须与至少一个本方法
+    /// 返回 true 的压力类 cause 共存，才记为一次真实卡顿。
+    ///
+    /// 返回 false 的仅限纯吞吐 / 异步信号：`NetSpike`、`DiskSpike`、`GpuHigh`
+    /// （GPU 占用高同样不直接阻塞系统调度，且当前检测器未真正产出 GPU cause）。
+    /// 其余一律视为压力：CPU（`CpuHigh`/`CpuSpike`）、内存（`MemLow` 含可用/使用率/提交/分页）、
+    /// 磁盘繁忙（`DiskBusy`）、DPC/中断/上下文切换风暴、温度降频（`ThermalThrottle`）、
+    /// 前台冻结（`UiFrozen`）；软件/驱动/硬件级 cause（F-RC14）虽非 PDH 阈值，
+    /// 但属于用户可行动的真根因，同样参与主因、不会被闸门丢弃。
+    pub fn is_pressure(self) -> bool {
+        !matches!(self, CauseKind::NetSpike | CauseKind::DiskSpike | CauseKind::GpuHigh)
+    }
 }
 
 /// cause 的稳定类型 key：按已知前缀匹配，用于同类型去重/更新与 `CauseKind` 映射。
