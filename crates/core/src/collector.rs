@@ -1,6 +1,6 @@
 use crate::types::{ProcessBrief, Sample};
 use chrono::Utc;
-use log::warn;
+use log::{error, warn};
 use std::collections::HashMap;
 use sysinfo::{Networks, System};
 use wmi::{Variant, WMIConnection};
@@ -440,13 +440,19 @@ impl Default for SysSample {
 ///
 /// 这些都是瞬时/速率型计数器，开销极低（与 `DiskPdh` 同为 PDH 句柄，不走 WMI）。
 /// 数值全部用 `PDH_FMT_DOUBLE` 格式化以保留精度；CStatus != 0 或负数一律钳为 0。
+///
+/// **健壮性（修复前为「全有或全无」）**：任一计数器在本机不可用（如某些系统
+/// `\PhysicalDisk(_Total)\Avg Disk sec/Transfer` 找不到 `_Total` 实例）时，**仅禁用
+/// 该字段**并打日志，其余计数器照常工作——避免单个计数器失败拖垮 DPC/中断/磁盘
+/// 繁忙/上下文切换全部静默失效（此前因此导致 detector 的 DiskBusy/Dpc/Interrupt/
+/// ContextSwitch 判定从未触发，属于假阴性）。
 struct SysPdh {
     query: PDH_HQUERY,
-    disk_time: PDH_HCOUNTER,
-    disk_avg_io: PDH_HCOUNTER,
-    dpc_time: PDH_HCOUNTER,
-    interrupt_time: PDH_HCOUNTER,
-    ctx_switch: PDH_HCOUNTER,
+    disk_time: Option<PDH_HCOUNTER>,
+    disk_avg_io: Option<PDH_HCOUNTER>,
+    dpc_time: Option<PDH_HCOUNTER>,
+    interrupt_time: Option<PDH_HCOUNTER>,
+    ctx_switch: Option<PDH_HCOUNTER>,
 }
 
 impl SysPdh {
@@ -454,48 +460,68 @@ impl SysPdh {
         unsafe {
             let mut query: PDH_HQUERY = PDH_HQUERY::default();
             if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != ERROR_SUCCESS.0 {
-                warn!("PdhOpenQueryW (sys) failed");
+                error!("SysPdh: PdhOpenQueryW failed — 系统级信号采集整体不可用");
                 return None;
             }
 
-            let mut disk_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
-            let mut disk_avg_io: PDH_HCOUNTER = PDH_HCOUNTER::default();
-            let mut dpc_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
-            let mut interrupt_time: PDH_HCOUNTER = PDH_HCOUNTER::default();
-            let mut ctx_switch: PDH_HCOUNTER = PDH_HCOUNTER::default();
+            // 逐计数器独立添加：失败的仅禁用该字段（记 warn），不影响其余计数器。
+            // 修复此前「任一失败整体 return None」导致其余可用计数器也全被禁用的 bug。
+            let mut disk_time: Option<PDH_HCOUNTER> = None;
+            let mut disk_avg_io: Option<PDH_HCOUNTER> = None;
+            let mut dpc_time: Option<PDH_HCOUNTER> = None;
+            let mut interrupt_time: Option<PDH_HCOUNTER> = None;
+            let mut ctx_switch: Option<PDH_HCOUNTER> = None;
 
-            let disk_time_path = w!(r"\PhysicalDisk(_Total)\% Disk Time");
-            if PdhAddEnglishCounterW(query, disk_time_path, 0, &mut disk_time) != ERROR_SUCCESS.0 {
-                warn!("PdhAddEnglishCounterW (sys disk time) failed");
-                PdhCloseQuery(query);
-                return None;
-            }
-            let disk_avg_io_path = w!(r"\PhysicalDisk(_Total)\Avg Disk sec/Transfer");
-            if PdhAddEnglishCounterW(query, disk_avg_io_path, 0, &mut disk_avg_io)
-                != ERROR_SUCCESS.0
+            let mut c: PDH_HCOUNTER;
+            c = PDH_HCOUNTER::default();
+            if PdhAddEnglishCounterW(query, w!(r"\PhysicalDisk(_Total)\% Disk Time"), 0, &mut c)
+                == ERROR_SUCCESS.0
             {
-                warn!("PdhAddEnglishCounterW (sys disk avg io) failed");
-                PdhCloseQuery(query);
-                return None;
+                disk_time = Some(c);
+            } else {
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\PhysicalDisk(_Total)\\% Disk Time");
             }
-            let dpc_time_path = w!(r"\Processor(_Total)\% DPC Time");
-            if PdhAddEnglishCounterW(query, dpc_time_path, 0, &mut dpc_time) != ERROR_SUCCESS.0 {
-                warn!("PdhAddEnglishCounterW (sys dpc time) failed");
-                PdhCloseQuery(query);
-                return None;
-            }
-            let interrupt_time_path = w!(r"\Processor(_Total)\% Interrupt Time");
-            if PdhAddEnglishCounterW(query, interrupt_time_path, 0, &mut interrupt_time)
-                != ERROR_SUCCESS.0
+            c = PDH_HCOUNTER::default();
+            if PdhAddEnglishCounterW(query, w!(r"\PhysicalDisk(_Total)\Avg Disk sec/Transfer"), 0, &mut c)
+                == ERROR_SUCCESS.0
             {
-                warn!("PdhAddEnglishCounterW (sys interrupt time) failed");
-                PdhCloseQuery(query);
-                return None;
+                disk_avg_io = Some(c);
+            } else {
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\PhysicalDisk(_Total)\\Avg Disk sec/Transfer");
             }
-            let ctx_switch_path = w!(r"\System\Context Switches/sec");
-            if PdhAddEnglishCounterW(query, ctx_switch_path, 0, &mut ctx_switch) != ERROR_SUCCESS.0
+            c = PDH_HCOUNTER::default();
+            if PdhAddEnglishCounterW(query, w!(r"\Processor(_Total)\% DPC Time"), 0, &mut c)
+                == ERROR_SUCCESS.0
             {
-                warn!("PdhAddEnglishCounterW (sys ctx switch) failed");
+                dpc_time = Some(c);
+            } else {
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\Processor(_Total)\\% DPC Time");
+            }
+            c = PDH_HCOUNTER::default();
+            if PdhAddEnglishCounterW(query, w!(r"\Processor(_Total)\% Interrupt Time"), 0, &mut c)
+                == ERROR_SUCCESS.0
+            {
+                interrupt_time = Some(c);
+            } else {
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\Processor(_Total)\\% Interrupt Time");
+            }
+            c = PDH_HCOUNTER::default();
+            if PdhAddEnglishCounterW(query, w!(r"\System\Context Switches/sec"), 0, &mut c)
+                == ERROR_SUCCESS.0
+            {
+                ctx_switch = Some(c);
+            } else {
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\System\\Context Switches/sec");
+            }
+
+            // 全部计数器都不可用 → 整体放弃（关闭 query，返回 None）
+            if disk_time.is_none()
+                && disk_avg_io.is_none()
+                && dpc_time.is_none()
+                && interrupt_time.is_none()
+                && ctx_switch.is_none()
+            {
+                warn!("SysPdh: 所有系统级计数器均不可用，放弃采集");
                 PdhCloseQuery(query);
                 return None;
             }
@@ -515,33 +541,21 @@ impl SysPdh {
     }
 
     /// 采集当前系统级信号快照。
+    ///
+    /// 每个计数器独立取数：未添加（`None`）或取数失败 / CStatus != 0 的字段返回 0，
+    /// 不影响其他计数器——与 `new()` 的「逐计数器独立」策略一致。
     fn sample(&self) -> SysSample {
         unsafe {
             if PdhCollectQueryData(self.query) != ERROR_SUCCESS.0 {
                 return SysSample::default();
             }
 
-            let mut dt: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
-            let mut dio: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
-            let mut dpc: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
-            let mut intr: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
-            let mut ctx: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
-
-            if PdhGetFormattedCounterValue(self.disk_time, PDH_FMT_DOUBLE, None, &mut dt)
-                != ERROR_SUCCESS.0
-                || PdhGetFormattedCounterValue(self.disk_avg_io, PDH_FMT_DOUBLE, None, &mut dio)
-                    != ERROR_SUCCESS.0
-                || PdhGetFormattedCounterValue(self.dpc_time, PDH_FMT_DOUBLE, None, &mut dpc)
-                    != ERROR_SUCCESS.0
-                || PdhGetFormattedCounterValue(self.interrupt_time, PDH_FMT_DOUBLE, None, &mut intr)
-                    != ERROR_SUCCESS.0
-                || PdhGetFormattedCounterValue(self.ctx_switch, PDH_FMT_DOUBLE, None, &mut ctx)
-                    != ERROR_SUCCESS.0
-            {
-                return SysSample::default();
-            }
-
-            let d = |v: &PDH_FMT_COUNTERVALUE| -> f32 {
+            let get = |c: Option<PDH_HCOUNTER>| -> f32 {
+                let Some(c) = c else { return 0.0 };
+                let mut v: PDH_FMT_COUNTERVALUE = PDH_FMT_COUNTERVALUE::default();
+                if PdhGetFormattedCounterValue(c, PDH_FMT_DOUBLE, None, &mut v) != ERROR_SUCCESS.0 {
+                    return 0.0;
+                }
                 if v.CStatus == 0 {
                     v.Anonymous.doubleValue.max(0.0) as f32
                 } else {
@@ -549,13 +563,19 @@ impl SysPdh {
                 }
             };
 
+            let dt = get(self.disk_time);
+            let dio = get(self.disk_avg_io);
+            let dpc = get(self.dpc_time);
+            let intr = get(self.interrupt_time);
+            let ctx = get(self.ctx_switch);
+
             SysSample {
-                disk_busy_percent: d(&dt),
-                // Avg Disk sec/Transfer 是秒，×1000 转毫秒
-                disk_avg_io_ms: (d(&dio) * 1000.0),
-                dpc_percent: d(&dpc),
-                interrupt_percent: d(&intr),
-                context_switches_per_sec: d(&ctx),
+                disk_busy_percent: dt,
+                // Avg Disk sec/Transfer 是秒，×1000 转毫秒（该计数器本机不可用时恒为 0）
+                disk_avg_io_ms: (dio * 1000.0),
+                dpc_percent: dpc,
+                interrupt_percent: intr,
+                context_switches_per_sec: ctx,
             }
         }
     }
@@ -872,6 +892,12 @@ impl Collector {
                     None
                 }
             });
+
+        // 诊断：温度查询成功连接但无数据（本机无热区 / WMI 类不可用）时显式告警，
+        // 避免 cpu_temp 静默恒为 None（此前无任何日志，属于假阴性）。
+        if cpu_temp.is_none() {
+            warn!("WMI 温度查询无数据：cpu_temp 将保持 None（连接成功但热区/WMI 类可能不可用）");
+        }
 
         (cpu_freq, gpu_usage, cpu_temp)
     }
