@@ -1410,11 +1410,20 @@ pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
             sample.interrupt_percent, cfg.interrupt_threshold_percent
         ));
     }
-    // Context Switches/sec
-    if sample.context_switches_per_sec > cfg.context_switch_threshold_per_sec {
+    // Context Switches/sec（机器相对口径，与实时判定 detector.rs 一致：按逻辑核
+    // 归一 + CPU 侧压力证据；归一分母共用 types::logical_core_count，不漂移）。
+    // 单帧限制：无滞回状态，证据门只能逐帧生效——实时判定中「带内滞回保持」
+    // 的帧在此可能结论不同，属 what-if 单帧重算的固有限制（见标准 §3 第 10 行）。
+    let ctx_cores = crate::types::logical_core_count(sample) as f32;
+    let ctx_per_core = sample.context_switches_per_sec / ctx_cores;
+    if ctx_per_core > cfg.context_switch_threshold_per_core
+        && cfg.ctx_switch_has_pressure_evidence(sample)
+    {
         causes.push(format!(
-            "Context switches {:.0}/s > {:.0}/s",
-            sample.context_switches_per_sec, cfg.context_switch_threshold_per_sec
+            "Context switches {:.0}/s = {:.0}/core > {:.0}/core",
+            sample.context_switches_per_sec,
+            ctx_per_core,
+            cfg.context_switch_threshold_per_core
         ));
     }
     // Thermal：温度高 + 负载 + 有频率读数（单帧无历史峰值，以存在频率读数表征掉档）
@@ -2956,6 +2965,50 @@ mod tests {
             out4.iter().any(|c| c.contains("Memory paging")),
             "commit 作为证据应放行 paging: {:?}",
             out4
+        );
+    }
+
+    /// 2026-08-17 误报治理回归：what-if 单帧重算的上下文切换口径与实时判定
+    /// 一致——按核归一越线 **且** CPU 侧压力证据成立才产出 cause；
+    /// 无证据的高切换、多核日常基线均不产出。
+    #[test]
+    fn rc_detect_core_ctx_switch_per_core_with_evidence() {
+        let cfg = DetectionConfig::default();
+        // 14 核、150k/s ≈ 10.7k/core（越进入线 10k/core）+ CPU 85%（证据成立）
+        let mut s = Sample::default();
+        s.cpu_usage = 85.0;
+        s.mem_available_mb = 8000;
+        s.mem_usage_percent = 30.0;
+        s.cpu_per_core = vec![85.0; 14];
+        s.context_switches_per_sec = 150_000.0;
+        let out = detect_core(&s, &cfg);
+        assert!(
+            out.iter().any(|c| c.contains("Context switches")),
+            "按核越线 + CPU 证据应产出 ctx cause: {:?}",
+            out
+        );
+
+        // 同速率但 CPU 50% < 80% 证据线（DPC/中断正常）→ 不产出
+        let mut low = s.clone();
+        low.cpu_usage = 50.0;
+        low.cpu_per_core = vec![50.0; 14];
+        assert!(
+            !detect_core(&low, &cfg)
+                .iter()
+                .any(|c| c.contains("Context switches")),
+            "无 CPU 侧证据的高切换不应产出: {:?}",
+            detect_core(&low, &cfg)
+        );
+
+        // 日常基线 70k/s ≈ 5k/core（远离进入线）→ 不产出
+        let mut base = low.clone();
+        base.context_switches_per_sec = 70_000.0;
+        assert!(
+            !detect_core(&base, &cfg)
+                .iter()
+                .any(|c| c.contains("Context switches")),
+            "多核日常基线不应产出: {:?}",
+            detect_core(&base, &cfg)
         );
     }
 

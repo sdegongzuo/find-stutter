@@ -76,6 +76,14 @@ thermal_freq_drop_ratio = 0.85
 # 让短时睿频建立的峰值逐渐让位于持续负载频率（读数约 5s 一次）。
 # 1.0 = 不衰减
 thermal_freq_peak_decay = 0.995
+# 上下文切换风暴进入线（/s/核，按逻辑核数归一）：Context Switches/sec ÷ 核数
+# 超过本值才具备进入条件，且首次激活还需 CPU 侧压力证据（见下一项）。
+# 绝对阈值（原 50000/s）在多核开发机上会骑在日常基线上（14 核机日常 ~45k/s，
+# 33% 样本越线而退出线不可达）导致连环误报，故改为按核归一（2026-08-17 治理）
+context_switch_threshold_per_core = 10000.0
+# 切换风暴首次激活的 CPU 侧压力证据线（% 总使用率）：真风暴必伴随 CPU 饱和
+# 或 DPC/中断越线；低 CPU 的孤立高切换只是后台异步活动，不成事件
+context_switch_min_cpu_percent = 80.0
 
 [ui]
 # 皮肤名称，对应 skins 目录下的 TOML 文件（默认 "default"）

@@ -471,9 +471,19 @@ pub struct DetectionConfig {
     /// `% Interrupt Time` 阈值（%）：超过即记为 `InterruptStorm` cause（中断风暴）。
     #[serde(default = "default_interrupt_threshold_percent")]
     pub interrupt_threshold_percent: f32,
-    /// `Context Switches/sec` 阈值（/s）：超过即记为 `ContextSwitchStorm` cause（切换风暴）。
-    #[serde(default = "default_context_switch_threshold_per_sec")]
-    pub context_switch_threshold_per_sec: f32,
+    /// 上下文切换风暴进入线（/s/核，按逻辑核数归一）：`Context Switches/sec ÷ 核数`
+    /// 超过即具备进入 `ContextSwitchStorm` 的速率条件（首次激活还需 CPU 侧压力
+    /// 证据，见 `ctx_switch_has_pressure_evidence`）。绝对阈值（原 50000/s）在多核
+    /// 开发机上会骑在日常基线上——本机 14 核日常 ~45k/s，33% 样本越线而 ×0.5
+    /// 退出线（25k/s）几乎不可达，一次越线即滞回锁死数分钟，凌晨无人在场连环
+    /// major/critical 误报（2026-08-17 治理）。真风暴按核归一普遍 >10k/s/核。
+    #[serde(default = "default_context_switch_threshold_per_core")]
+    pub context_switch_threshold_per_core: f32,
+    /// 切换风暴首次激活的 CPU 侧压力证据线（% 总使用率）：真切换风暴必然伴随
+    /// CPU 饱和或 DPC/中断活跃（见 `ctx_switch_has_pressure_evidence`）；
+    /// 低 CPU 的孤立高切换只是后台异步活动的正常震荡，不得成事件。
+    #[serde(default = "default_context_switch_min_cpu_percent")]
+    pub context_switch_min_cpu_percent: f32,
     /// 系统级信号滞回比例（退出线 = 阈值 × 该比例）。避免在阈值附近反复横跳：
     /// 触发后需明显回落（降到阈值的一半，默认 0.5）才解除激活。
     #[serde(default = "default_sys_signal_hysteresis_ratio")]
@@ -541,7 +551,8 @@ impl Default for DetectionConfig {
             disk_io_threshold_ms: 50.0,
             dpc_threshold_percent: 10.0,
             interrupt_threshold_percent: 10.0,
-            context_switch_threshold_per_sec: 50_000.0,
+            context_switch_threshold_per_core: 10_000.0,
+            context_switch_min_cpu_percent: 80.0,
             sys_signal_hysteresis_ratio: 0.5,
             ui_freeze_timeout_ms: 200,
             thermal_threshold_celsius: 85.0,
@@ -566,6 +577,33 @@ impl DetectionConfig {
             || sample.mem_available_mb < self.mem_threshold_mb
             || sample.disk_busy_percent > self.disk_busy_threshold_percent
             || sample.disk_avg_io_ms > self.disk_io_threshold_ms
+    }
+
+    /// 上下文切换风暴的 CPU 侧压力证据（实时判定与 what-if 单帧重算共用，两处不漂移）：
+    /// 真切换风暴必然伴随 CPU 总使用率高，或 DPC/中断已越线挤占调度；
+    /// 低 CPU 的孤立高切换只是后台异步活动（下载/索引/备份）的正常震荡，
+    /// 不构成卡顿（2026-08-17 误报治理，语义对齐 `paging_has_pressure_evidence`）。
+    pub fn ctx_switch_has_pressure_evidence(&self, sample: &Sample) -> bool {
+        sample.cpu_usage > self.context_switch_min_cpu_percent
+            || sample.dpc_percent > self.dpc_threshold_percent
+            || sample.interrupt_percent > self.interrupt_threshold_percent
+    }
+}
+
+/// 上下文切换按核归一用的逻辑核数（2026-08-17 误报治理）：
+/// 优先取样本 `cpu_per_core` 长度（采集自带、随机器自校准）；what-if 从库里
+/// 读出的历史样本无该向量，缺失时退回 `available_parallelism`（≥1）。
+/// 实时判定（detector.rs）与 what-if 单帧重算（analytics.rs）**共用本函数**，
+/// 保证归一分母口径不漂移。
+pub fn logical_core_count(sample: &Sample) -> u32 {
+    let n = sample.cpu_per_core.len() as u32;
+    if n > 0 {
+        n
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+            .max(1)
     }
 }
 
@@ -616,8 +654,11 @@ fn default_dpc_threshold_percent() -> f32 {
 fn default_interrupt_threshold_percent() -> f32 {
     10.0
 }
-fn default_context_switch_threshold_per_sec() -> f32 {
-    50_000.0
+fn default_context_switch_threshold_per_core() -> f32 {
+    10_000.0
+}
+fn default_context_switch_min_cpu_percent() -> f32 {
+    80.0
 }
 fn default_sys_signal_hysteresis_ratio() -> f32 {
     0.5
@@ -1023,7 +1064,8 @@ mod tests {
         assert_eq!(c.disk_io_threshold_ms, 50.0);
         assert_eq!(c.dpc_threshold_percent, 10.0);
         assert_eq!(c.interrupt_threshold_percent, 10.0);
-        assert_eq!(c.context_switch_threshold_per_sec, 50_000.0);
+        assert_eq!(c.context_switch_threshold_per_core, 10_000.0);
+        assert_eq!(c.context_switch_min_cpu_percent, 80.0);
         assert_eq!(c.sys_signal_hysteresis_ratio, 0.5);
         assert_eq!(c.ui_freeze_timeout_ms, 200);
         // F-RC4 温度→降频根因阈值默认值
@@ -1032,6 +1074,19 @@ mod tests {
         // F-RC14-a 泄漏阈值默认值
         assert_eq!(c.handle_leak_threshold, 10_000);
         assert_eq!(c.gdi_leak_threshold, 10_000);
+    }
+
+    /// 按核归一的核数选取：样本 `cpu_per_core` 优先（采集自带），缺失退回
+    /// `available_parallelism`（≥1）。实时判定与 what-if 共用，口径不漂移。
+    #[test]
+    fn logical_core_count_prefers_sample_per_core() {
+        let mut s = Sample::default();
+        assert!(
+            logical_core_count(&s) >= 1,
+            "cpu_per_core 缺失时应退回 available_parallelism（≥1）"
+        );
+        s.cpu_per_core = vec![50.0; 14];
+        assert_eq!(logical_core_count(&s), 14, "样本自带核数优先");
     }
 
     #[test]

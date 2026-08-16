@@ -521,10 +521,19 @@ impl Detector {
             self.config.hysteresis_hold_max_secs,
         );
         if self.dpc_active {
-            causes.push(format!(
-                "DPC time {:.1}% > {}%",
-                sample.dpc_percent, self.config.dpc_threshold_percent
-            ));
+            if sample.dpc_percent > self.config.dpc_threshold_percent {
+                causes.push(format!(
+                    "DPC time {:.1}% > {}%",
+                    sample.dpc_percent, self.config.dpc_threshold_percent
+                ));
+            } else {
+                // 滞回带内维持激活：数值已回落但未到退出线，
+                // 文案标注「滞回保持」，避免出现 "8% > 10%" 的矛盾文案（标准 §4）
+                causes.push(format!(
+                    "DPC time {:.1}%（滞回保持，阈值 {}%）",
+                    sample.dpc_percent, self.config.dpc_threshold_percent
+                ));
+            }
         }
 
         // % Interrupt Time：中断处理长时间占用 CPU 同样挤占普通线程。
@@ -541,30 +550,69 @@ impl Detector {
             self.config.hysteresis_hold_max_secs,
         );
         if self.interrupt_active {
-            causes.push(format!(
-                "Interrupt time {:.1}% > {}%",
-                sample.interrupt_percent, self.config.interrupt_threshold_percent
-            ));
+            if sample.interrupt_percent > self.config.interrupt_threshold_percent {
+                causes.push(format!(
+                    "Interrupt time {:.1}% > {}%",
+                    sample.interrupt_percent, self.config.interrupt_threshold_percent
+                ));
+            } else {
+                // 滞回带内维持激活：数值已回落但未到退出线，
+                // 文案标注「滞回保持」，避免出现 "8% > 10%" 的矛盾文案（标准 §4）
+                causes.push(format!(
+                    "Interrupt time {:.1}%（滞回保持，阈值 {}%）",
+                    sample.interrupt_percent, self.config.interrupt_threshold_percent
+                ));
+            }
         }
 
         // Context Switches/sec：上下文切换风暴会拖垮调度（系统级卡顿真信号）。
-        self.ctx_switch_active = sys_signal_hysteresis(
+        // 机器相对口径（2026-08-17 误报治理）：原绝对阈值 50000/s 在多核开发机上
+        // 骑在日常基线上（本机 14 核日常 ~45k/s，33% 样本越线；×0.5 退出线
+        // 25000/s 低于机器地板，连续低于它的最长段仅 2s）——一次越线即滞回
+        // 锁死数分钟，凌晨无人在场连环 major/critical 误报。改为两点：
+        // 1) 按逻辑核数归一（/s ÷ 核数 > context_switch_threshold_per_core），
+        //    核数取样本 cpu_per_core 长度（随机器自校准），缺失退回
+        //    available_parallelism（共用 types::logical_core_count）；
+        // 2) 首次激活需 CPU 侧压力证据（真风暴必伴随 CPU 饱和或 DPC/中断活跃；
+        //    低 CPU 的高切换只是后台异步活动）。已激活后的滞回退出不受证据影响。
+        // 归一分母与 what-if 共用 types::logical_core_count，两处口径不漂移。
+        let ctx_cores = crate::types::logical_core_count(sample) as f32;
+        let ctx_per_core = sample.context_switches_per_sec / ctx_cores;
+        let ctx_over_entry = ctx_per_core > self.config.context_switch_threshold_per_core;
+        let ctx_want_active = sys_signal_hysteresis(
             self.ctx_switch_active,
-            sample.context_switches_per_sec,
-            self.config.context_switch_threshold_per_sec,
+            ctx_per_core,
+            self.config.context_switch_threshold_per_core,
             self.config.sys_signal_hysteresis_ratio,
         );
+        // 未激活 → 激活的跳变必须同时有压力证据；保持/退出交给滞回
+        self.ctx_switch_active = ctx_want_active
+            && (self.ctx_switch_active
+                || (ctx_over_entry && self.config.ctx_switch_has_pressure_evidence(sample)));
         band_hold_step(
             &mut self.ctx_switch_active,
             &mut self.ctx_band_since,
-            sample.context_switches_per_sec > self.config.context_switch_threshold_per_sec,
+            ctx_over_entry,
             self.config.hysteresis_hold_max_secs,
         );
         if self.ctx_switch_active {
-            causes.push(format!(
-                "Context switches {:.0}/s > {:.0}/s",
-                sample.context_switches_per_sec, self.config.context_switch_threshold_per_sec
-            ));
+            if ctx_over_entry {
+                causes.push(format!(
+                    "Context switches {:.0}/s = {:.0}/core > {:.0}/core",
+                    sample.context_switches_per_sec,
+                    ctx_per_core,
+                    self.config.context_switch_threshold_per_core
+                ));
+            } else {
+                // 滞回带内维持激活：数值已回落但未到退出线，
+                // 文案标注「滞回保持」，避免矛盾文案（标准 §4）
+                causes.push(format!(
+                    "Context switches {:.0}/s（滞回保持，{:.0}/core，阈值 {:.0}/core）",
+                    sample.context_switches_per_sec,
+                    ctx_per_core,
+                    self.config.context_switch_threshold_per_core
+                ));
+            }
         }
 
         // ===== F-RC4 温度→降频根因 =====
@@ -1065,22 +1113,24 @@ mod tests {
         );
     }
 
-    /// F-RC2：`Context Switches/sec` 超阈值应触发 `ContextSwitchStorm` cause
-    /// 并落库 `CauseKind::ContextSwitchStorm`。
+    /// F-RC2：`Context Switches/sec` 按核越线 + CPU 侧压力证据 → 触发
+    /// `ContextSwitchStorm` cause 并落库 `CauseKind::ContextSwitchStorm`。
     #[test]
     fn analyze_context_switch_triggers() {
         let mut config = DetectionConfig::default();
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        let mut s = make_sample(30.0, 2000, 10.0);
-        s.context_switches_per_sec = 80_000.0;
+        // 14 核、150k/s ≈ 10.7k/core（> 10k/core 进入线）、CPU 85%（> 80% 证据线）
+        let mut s = make_sample(85.0, 2000, 10.0);
+        s.cpu_per_core = vec![85.0; 14];
+        s.context_switches_per_sec = 150_000.0;
         d.analyze(&s);
         assert!(
             d.current_causes
                 .iter()
                 .any(|c| c.contains("Context switches")),
-            "Context switches 超阈值应触发 ContextSwitchStorm，got: {:?}",
+            "Context switches 按核越线 + CPU 压力证据应触发 ContextSwitchStorm，got: {:?}",
             d.current_causes
         );
         for _ in 0..2 {
@@ -1093,6 +1143,99 @@ mod tests {
             "cause_kinds 应含 ContextSwitchStorm，got: {:?}",
             event.cause_kinds
         );
+    }
+
+    /// 回归（2026-08-17 误报治理）：多核机日常基线不得触发 ContextSwitchStorm。
+    /// 实测：14 核机凌晨基线 45k~70k/s（3~5k/core）、CPU 仅 20~50%——旧绝对阈值
+    /// 50000/s 下 33% 样本越线、25k/s 退出线不可达（连续低于它的最长段仅 2s），
+    /// 一次越线即滞回锁死数分钟，凌晨无人在场连环 major/critical 误报。
+    /// 按核归一（10k/s/核）后这些样本远离进入线，不得产生任何 cause/事件。
+    #[test]
+    fn analyze_ctx_switch_no_trigger_on_multicore_baseline() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(50.0, 2000, 10.0);
+        s.cpu_per_core = vec![50.0; 14];
+        s.context_switches_per_sec = 70_000.0; // ≈5k/core，仍 < 10k/core 进入线
+        for _ in 0..5 {
+            assert!(d.analyze(&s).is_none());
+            assert!(
+                d.current_causes
+                    .iter()
+                    .all(|c| !c.contains("Context switches")),
+                "多核日常基线不应触发 ContextSwitchStorm，got: {:?}",
+                d.current_causes
+            );
+        }
+        assert!(d.analyze(&make_sample(20.0, 2000, 10.0)).is_none());
+    }
+
+    /// 回归（2026-08-17 误报治理）：切换速率按核越线但无 CPU 侧压力证据
+    /// （低 CPU 且 DPC/中断正常）——后台异步活动的孤立高切换，不得首次激活。
+    #[test]
+    fn analyze_ctx_switch_no_trigger_without_cpu_pressure_evidence() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(50.0, 2000, 10.0); // CPU 50% < 80% 证据线
+        s.cpu_per_core = vec![50.0; 14];
+        s.context_switches_per_sec = 180_000.0; // ≈12.9k/core，已越进入线
+        for _ in 0..3 {
+            d.analyze(&s);
+            assert!(
+                d.current_causes
+                    .iter()
+                    .all(|c| !c.contains("Context switches")),
+                "无 CPU 压力证据的高切换不应触发，got: {:?}",
+                d.current_causes
+            );
+        }
+    }
+
+    /// 激活后按核速率回落到滞回带内（退出线 5k/core 之上）→ cause 保持、文案标注
+    /// 「滞回保持」；降到退出线以下才解除并落库事件（滞回语义不因证据门改变）。
+    #[test]
+    fn analyze_ctx_switch_hysteresis_hold_then_release() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 进入：150k/s ≈ 10.7k/core，CPU 85%（证据成立）
+        let mut storm = make_sample(85.0, 2000, 10.0);
+        storm.cpu_per_core = vec![85.0; 14];
+        storm.context_switches_per_sec = 150_000.0;
+        d.analyze(&storm);
+        assert!(
+            d.current_causes
+                .iter()
+                .any(|c| c.contains("Context switches") && c.contains('>')),
+            "风暴样本应产出越线文案，got: {:?}",
+            d.current_causes
+        );
+
+        // 带内保持：100k/s ≈ 7.1k/core（低于进入线、高于退出线），CPU 回落也不解除
+        let mut band = make_sample(60.0, 2000, 10.0);
+        band.cpu_per_core = vec![60.0; 14];
+        band.context_switches_per_sec = 100_000.0;
+        d.analyze(&band);
+        assert!(
+            d.current_causes
+                .iter()
+                .any(|c| c.contains("Context switches") && c.contains("滞回保持")),
+            "带内样本应产出滞回保持文案，got: {:?}",
+            d.current_causes
+        );
+
+        // 退出：50k/s ≈ 3.6k/core < 退出线 5k/core → 解除并落库
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let mut release = make_sample(20.0, 2000, 10.0);
+        release.cpu_per_core = vec![20.0; 14];
+        release.context_switches_per_sec = 50_000.0;
+        let event = d.analyze(&release).unwrap();
+        assert!(event.cause_kinds.contains(&CauseKind::ContextSwitchStorm));
     }
 
     /// F-RC4 辅助：构造带温度/频率的样本（慢通道每 5 tick 才有读数，测试直接给定）。
