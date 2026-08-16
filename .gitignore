@@ -17,6 +17,8 @@ Thumbs.db
 # CSV data files
 *.csv
 
+.idea
+
 # Build documentation
 build.log
 test.log
@@ -32,3 +34,5 @@ stutter.db-wal
 *.diag.log
 target-svc-check/
 screenshot.png
+
+*.db*
