@@ -163,7 +163,7 @@ impl AnalysisWindow {
                 *drill_for_toggle.lock().unwrap() = None;
                 timer_for_toggle.lock().unwrap().stop();
                 log::info!("卡顿分析：基础模式，自动刷新已停");
-            } else if let Some(secs) = *auto_interval_for_toggle.lock().unwrap() {
+            } else { match *auto_interval_for_toggle.lock().unwrap() { Some(secs) => {
                 // 进入高级模式：按当前自动刷新间隔启动定时器（None 已在上面停刷）
                 start_auto_refresh(
                     &weak_toggle,
@@ -179,7 +179,7 @@ impl AnalysisWindow {
                     &rv_for_toggle,
                     secs,
                 );
-            }
+            } _ => {}}}
             if let Some(ui) = weak_toggle.upgrade() {
                 let range = range_for_toggle.lock().unwrap().clone();
                 // 自定义范围在有值时使用，否则回退默认
@@ -1271,7 +1271,7 @@ fn refresh_window(
         .spawn(move || {
             // 后台线程独立开连接查询 + 渲染（UI 线程不阻塞）
             if let Ok(c) = analytics::open_readonly(&db_path_cause) {
-                if let Ok(types) = analytics::load_cause_types(&c, &range_cause) {
+                match analytics::load_cause_types(&c, &range_cause) { Ok(types) => {
                     super::render_cause_pie(&types, 420, 280, move |image| {
                         slint::invoke_from_event_loop(move || {
                             if let Some(ui) = weak_cause.upgrade() {
@@ -1285,14 +1285,14 @@ fn refresh_window(
                         })
                         .ok();
                     });
-                } else {
+                } _ => {
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak_cause.upgrade() {
                             ui.set_has_cause(false);
                         }
                     })
                     .ok();
-                }
+                }}
             }
         })
         .ok();
@@ -1342,7 +1342,7 @@ fn refresh_window(
         .name("analysis-resource-chart".into())
         .spawn(move || {
             if let Ok(c) = analytics::open_readonly(&db_path_res) {
-                if let Ok(data) = analytics::load_resource_samples(&c, &range_res, 860) {
+                match analytics::load_resource_samples(&c, &range_res, 860) { Ok(data) => {
                     // F3 C1：加载与资源图卡顿竖线同序（按 timestamp 升序）的事件，
                     // 按同一公式折算桶序号，存入 hover_events/hover_buckets 供
                     // on_resource_hover 定位最近事件（与 ResourceData.event_x 同序 zip）。
@@ -1379,7 +1379,7 @@ fn refresh_window(
                         })
                         .ok();
                     });
-                } else {
+                } _ => {
                     *he_res.lock().unwrap() = Vec::new();
                     *hb_res.lock().unwrap() = Vec::new();
                     *hs_res.lock().unwrap() = Vec::new();
@@ -1389,7 +1389,7 @@ fn refresh_window(
                         }
                     })
                     .ok();
-                }
+                }}
             }
         })
         .ok();
@@ -1523,7 +1523,7 @@ fn refresh_resource(ui: &crate::Analysis, db_path: &PathBuf, range: TimeRange, v
         .name("analysis-resource-chart".into())
         .spawn(move || {
             if let Ok(c) = analytics::open_readonly(&db) {
-                if let Ok(data) = analytics::load_resource_samples(&c, &range, 860) {
+                match analytics::load_resource_samples(&c, &range, 860) { Ok(data) => {
                     super::render_resource_chart(&data, 860, 220, &view, move |image| {
                         slint::invoke_from_event_loop(move || {
                             if let Some(ui) = weak.upgrade() {
@@ -1537,14 +1537,14 @@ fn refresh_resource(ui: &crate::Analysis, db_path: &PathBuf, range: TimeRange, v
                         })
                         .ok();
                     });
-                } else {
+                } _ => {
                     slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             ui.set_has_resource(false);
                         }
                     })
                     .ok();
-                }
+                }}
             }
         })
         .ok();

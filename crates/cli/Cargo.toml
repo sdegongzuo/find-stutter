@@ -1,0 +1,32 @@
+[package]
+name = "find-stutter-cli"
+version = "0.1.0"
+edition = "2024"
+description = "find-stutter 的 agent 查询界面（ADR-0001 界面轴·agent）：JSON 输出的只读查询子命令"
+
+[lib]
+name = "find_stutter_cli"
+path = "src/lib.rs"
+
+[dependencies]
+# 分析聚合与采集/存储均来自 core（ADR-0001：analytics 下沉 core，UI 与 CLI 共用口径）
+find-stutter-core = { path = "../core" }
+
+# 子命令定义（clap help 全中文）
+clap = { version = "4", features = ["derive"] }
+
+# 错误类型
+anyhow = "1"
+
+# JSON 输出（单行紧凑，便于 jq）；serde 用于 derive 结构
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --from/--to 时间参数解析（本地时区 → UTC RFC3339 边界）
+chrono = "0.4"
+
+# 只读查询 stutter.db（events/samples 范围查询、心跳健康判定）
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# status 子命令：直接查询 SCM（Service Control Manager）服务状态，无需提权
+windows-service = "0.8"

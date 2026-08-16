@@ -498,21 +498,24 @@ mod tests {
     #[test]
     fn ensure_service_skipped_when_env_set() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("FIND_STUTTER_SKIP_SERVICE", "1");
+        // edition 2024：env 写入是 unsafe（进程级全局状态）；
+        // 此处已被 ENV_LOCK 串行化，无并发访问。
+        unsafe { std::env::set_var("FIND_STUTTER_SKIP_SERVICE", "1") };
         let r = ensure_service_running(Path::new("D:/__missing__/stutter.db"));
         assert_eq!(r, AutoStartResult::Skipped);
-        std::env::remove_var("FIND_STUTTER_SKIP_SERVICE");
+        unsafe { std::env::remove_var("FIND_STUTTER_SKIP_SERVICE") };
     }
 
     /// 验证：auto_start_disabled 读环境变量
     #[test]
     fn auto_start_disabled_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var("FIND_STUTTER_SKIP_SERVICE");
+        // 同上：env 访问已被 ENV_LOCK 串行化
+        unsafe { std::env::remove_var("FIND_STUTTER_SKIP_SERVICE") };
         assert!(!auto_start_disabled());
-        std::env::set_var("FIND_STUTTER_SKIP_SERVICE", "1");
+        unsafe { std::env::set_var("FIND_STUTTER_SKIP_SERVICE", "1") };
         assert!(auto_start_disabled());
-        std::env::remove_var("FIND_STUTTER_SKIP_SERVICE");
+        unsafe { std::env::remove_var("FIND_STUTTER_SKIP_SERVICE") };
     }
 
     /// 验证：Skipped 变体文案与 is_ok 语义

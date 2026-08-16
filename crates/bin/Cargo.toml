@@ -1,9 +1,9 @@
 [package]
 name = "find-stutter"
 version = "0.2.0"
-edition = "2021"
-description = "System stutter monitor CLI - Slint UI overlay"
-# 默认 cargo run / cargo install 跑这个（GUI 入口；export / stats 是子命令）
+edition = "2024"
+description = "系统卡顿监控：GUI 悬浮窗 + agent CLI 二合一入口（无参数 = GUI；子命令 = JSON 查询 / CSV 导出 / 升级）"
+# 默认 cargo run / cargo install 跑这个（GUI 入口；子命令见 find-stutter-cli）
 default-run = "find-stutter"
 
 [[bin]]
@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 find-stutter-core = { path = "../core" }
 find-stutter-ui = { path = "../ui" }
-clap = { version = "4", features = ["derive"] }
+find-stutter-cli = { path = "../cli" }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"

@@ -357,14 +357,14 @@ pub fn run() -> anyhow::Result<()> {
                         tb.apply(&s);
                     }
                 }
-            } else if let Some(ui) = weak_ui.upgrade() {
+            } else { match weak_ui.upgrade() { Some(ui) => {
                 // 暂停中：指标冻结，但服务状态行明确显示「已暂停」，
                 // 恢复后由 apply_metrics 恢复为真实服务状态
                 ui.set_service_status(slint::SharedString::from("⏸ 已暂停"));
                 ui.set_service_status_color(slint::Brush::SolidColor(
                     slint::Color::from_rgb_u8(0x8a, 0x8a, 0x92),
                 ));
-            }
+            } _ => {}}}
         },
     );
 

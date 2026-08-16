@@ -1499,11 +1499,25 @@ name = "find-stutter"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "clap",
  "env_logger",
+ "find-stutter-cli",
  "find-stutter-core",
  "find-stutter-ui",
  "log",
+]
+
+[[package]]
+name = "find-stutter-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "find-stutter-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "windows-service",
 ]
 
 [[package]]

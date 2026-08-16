@@ -1,3 +1,11 @@
 [workspace]
-members = ["crates/core", "crates/ui", "crates/bin", "crates/service"]
+# 成员顺序即依赖层次：core（基础库）→ ui（GUI 库）/ cli（agent 查询库）→ bin（入口）→ service（SCM 服务）。
+# ADR-0001：ui 给人、cli 给 agent，bin 只做分发。
+members = [
+    "crates/core",
+    "crates/ui",
+    "crates/cli",
+    "crates/bin",
+    "crates/service",
+]
 resolver = "2"

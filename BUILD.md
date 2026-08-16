@@ -30,12 +30,13 @@ cargo build --release
 
 | 文件 | 说明 |
 | --- | --- |
-| `find-stutter.exe` | **GUI 端**（由 `crates/bin` 入口编译，link `find-stutter-ui` 库；含 `export` / `stats` 子命令） |
+| `find-stutter.exe` | **唯一入口**（无参数 = GUI 悬浮窗；子命令 = agent CLI 查询 / CSV 导出 / 升级。由 `crates/bin` 编译，链接 `ui` + `cli` 库） |
 | `find-stutter-service.exe` | Windows 服务（`run` / `install` / `uninstall` / `start` / `stop` / `status` / `install-start`） |
 
 > **重要**：改完 `crates/ui` 的代码后，必须重新编译 GUI 入口
-> `rtk cargo build --release -p find-stutter`。只编 `-p find-stutter-ui` 只会更新
-> ui 库与 `find-stutter-ui.exe`，**不会更新用户实际运行的 `find-stutter.exe`**。
+> `rtk cargo build --release -p find-stutter`。只编 `-p find-stutter-ui` 只会编译
+> ui 库本身（ADR-0001 后 ui 不再产出独立的 `find-stutter-ui.exe`），
+> **不会更新用户实际运行的 `find-stutter.exe`**。
 >
 > 若编译报「拒绝访问 os error 5」，是 `find-stutter.exe` 正被运行中的 GUI 占用：
 > 先 `Stop-Process -Name "find-stutter" -Force` 再编译。
@@ -43,55 +44,56 @@ cargo build --release
 ### 3. 运行
 
 ```bash
-# 前台运行（带悬浮窗；stutter.db 创建在当前工作目录下）
-target/release/find-stutter.exe
-
-# 服务化运行（生产推荐）：先以管理员注册服务，再启动 GUI
-target/release/find-stutter-service.exe install   # 仅第一次需要（需管理员）
+# 一条命令启动（带悬浮窗；自动确保后台服务在跑，首次会弹 UAC）
 target/release/find-stutter.exe
 ```
 
 GUI 启动时自动检测并启动后台服务（`crates/ui/src/auto_start.rs`）；不想弹 UAC 时可设
 `FIND_STUTTER_SKIP_SERVICE=1` 或 `config.toml [ui] auto_start_service = false`。
 
-### 4. 查看数据
+### 4. 查看数据（agent CLI，单行 JSON 便于 jq）
 
 ```bash
-# 导出 CSV
-find-stutter.exe export --from 2026-07-25 --to 2026-07-26 -o report.csv
+target/release/find-stutter.exe events --limit 5      # 最近 5 次卡顿
+target/release/find-stutter.exe status                # 服务状态 + 心跳健康 + db 路径
 
-# 查看今日卡顿统计
-find-stutter.exe stats
+# 导出 CSV（中文表头）
+target/release/find-stutter.exe export --from 2026-07-25 --to 2026-07-26 -o report.csv
 ```
 
 ## 项目结构
 
 ```
 find-stutter/
-├── Cargo.toml                    # Workspace 根配置
+├── Cargo.toml                    # Workspace 根配置（core / ui / cli / bin / service 五成员）
 ├── config.toml                   # 运行时配置（热加载）
-├── PLAN.md / TODO.md / README.md # 方案 / 待办 / 说明
+├── README.md                     # 说明
 ├── stutter.db                    # 运行时生成的 SQLite 数据库（WAL 模式）
 ├── crates/
 │   ├── core/                     # 核心库：collector（sysinfo+PDH+WMI 采集）、
-│   │                             #   detector（阈值+突变检测+滞回）、logger（SQLite+CSV）、types
+│   │                             #   detector（阈值+突变检测+滞回）、logger（SQLite+CSV）、
+│   │                             #   types、analytics（分析聚合+根因纯函数，UI/CLI 共用）
+│   ├── cli/                      # find-stutter-cli：agent 查询界面（events/samples/
+│   │                             #   analysis/config/status/process JSON + export CSV +
+│   │                             #   upgrade 升级编排；含 clap 子命令定义）
 │   ├── service/                  # find-stutter-service：Windows 服务 + SCM 管理 CLI
 │   ├── ui/                       # find-stutter-ui 库：overlay.slint（悬浮窗 + 进程列表 UI）、
 │   │                             #   lib.rs（事件接线）、overlay.rs、skin.rs、reader.rs（1Hz 轮询）、
 │   │                             #   auto_start / elevate / hotreload / tray / notify / taskbar /
 │   │                             #   window / process_list（进程详情页）
-│   └── bin/                      # find-stutter：GUI 入口（main.rs 无子命令 → UI；export/stats → CLI）
+│   └── bin/                      # find-stutter：唯一入口（无参数 → GUI；子命令 → 转发 cli）
 └── skins/default/skin.toml       # 默认皮肤配置
 ```
 
 ## 运行测试
 
 ```bash
-# 运行全部测试（250 个）
+# 运行全部测试
 rtk cargo test --workspace
 
-# 各 crate：core 82 / ui 146 / service 17 / bin 5
+# 各 crate（core / cli / ui / service / bin）
 rtk cargo test -p find-stutter-core
+rtk cargo test -p find-stutter-cli
 rtk cargo test -p find-stutter-ui
 rtk cargo test -p find-stutter-service
 rtk cargo test -p find-stutter
@@ -157,8 +159,9 @@ label_color = "#BAC2DE"
 ## 已知问题 / 注意
 
 1. **服务更新需管理员重启**：服务/守护进程更新代码后必须重启进程才生效（重命名 exe
-   只是绕过文件占用，运行中进程仍跑旧映像）；`sc stop FindStutter && sc start FindStutter`
-   需管理员权限。
+   只是绕过文件占用，运行中进程仍跑旧映像）。推荐直接 `find-stutter.exe upgrade`
+   （停服 → rtk 构建 → 重装启动，自动 UAC 提权，见 `UPGRADE.md`）；
+   手动路径 `sc stop FindStutter && sc start FindStutter` 需管理员权限。
 2. **进程详情页内存双口径**：「内存」列为提交大小（Commit Size，任务管理器「详细信息」
    页口径），「物理内存」列为工作集（Working Set），两者并存展示。
 3. **进程详情页首次打开**：窗口立即出现，数据在 1~2 秒内由快速 tick 补齐（服务端

@@ -1,12 +1,12 @@
-//! find-stutter-ui 可执行入口
+//! （已废弃的重复入口，待手动删除）
 //!
-//! 主要的 `find-stutter` CLI 见 `crates/bin`；这个 bin 仅在直接 cargo run 该 crate 时使用。
+//! ADR-0001 后 GUI 唯一入口收敛为 `crates/bin` 的 `find-stutter`（链接
+//! `find_stutter_ui::run()`）；ui crate 的 Cargo.toml 已设 `autobins = false`，
+//! **本文件不再参与构建**、不会产出 `find-stutter-ui.exe`。
+//! 文件按「严禁删除」约定暂时保留，确认后可手动删除。
 //!
-//! ## 控制台窗口策略
-//!
-//! - **release**：Windows 子系统（`windows_subsystem = "windows"`），启动不弹黑框命令行窗口。
-//!   注意：无控制台时 `env_logger` 的 stderr 输出不可见，release 日志默认丢弃。
-//! - **debug**：默认控制台子系统，`cargo run` 可看日志。
+//! 历史用途：直接 `cargo run -p find-stutter-ui` 时的独立 bin 入口
+//! （release 用 windows_subsystem 隐藏控制台，debug 保留控制台看日志）。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 

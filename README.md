@@ -22,18 +22,20 @@ Windows 桌面悬浮窗，实时监控系统卡顿（CPU / 内存 / 磁盘 / 网
 
 ## 快速开始
 
-最短路径：先构建，再启动悬浮窗即可——首次运行会自动弹 UAC 注册并启动后台采集服务，之后开机自启。
+最短路径：构建后只记一条命令 `find-stutter`——启动悬浮窗并自动确保后台采集服务在跑
+（首次运行自动弹 UAC 注册并启动服务，之后开机自启）。
 
 ```bash
 # 1. 构建（需 Windows + MSVC target 的 Rust 工具链）
 rtk cargo build --release
 
-# 2. 启动悬浮窗（首次运行会自动弹 UAC 注册并启动后台采集服务，之后开机自启）
+# 2. 启动（唯一入口：GUI + 自动确保服务；CLI 子命令也走同一个 exe）
 target/release/find-stutter.exe
 ```
 
 之后每次只需双击 `find-stutter.exe`；若服务未运行，GUI 会自动尝试启动。
-需要手动停止 / 重启服务（例如升级二进制后），见[使用指南 → 服务管理与排障](#服务管理与排障)。
+升级二进制 / 改判定逻辑后，用 `find-stutter upgrade` 一条命令完成停服 → 重建 → 重装启动，
+见 [UPGRADE.md](./UPGRADE.md)。
 
 ## 功能特性
 
@@ -56,7 +58,8 @@ target/release/find-stutter.exe
   `[notifications]` 配置开关与最低等级。
 - **任务栏嵌入**：`config.toml [ui] taskbar = true` 启用横向窄条伪任务栏窗口
   （默认底部中央，可拖到任务栏位置）。
-- **CLI 导出**：将指定时间范围的采样数据导出为 CSV（`samples` 表的每秒指标），或查询当日卡顿次数。
+- **Agent CLI**：`find-stutter` 子命令输出单行 JSON（卡顿事件 / 样本区间 / 聚合分析 /
+  配置 / 服务状态 / 进程快照），供 coding agent 与脚本直接消费；采样数据可导出 CSV。
 - **进程详情页**：右键菜单「进程详情」打开任务管理器风格进程列表——同名进程按 PPID
   聚合分组（孙进程扁平化到所属 root），显示 PID / 名称 / CPU / 内存（提交大小）/
   物理内存（专用工作集）/ 磁盘 / 网络 / 累计网络；点击列头排序、聚合行点击展开/收起、
@@ -103,13 +106,16 @@ target/release/find-stutter.exe
 
 ### 构建产物
 
-- `target/release/find-stutter.exe`（GUI 端；由 `crates/bin` 入口编译，link `find-stutter-ui` 库）
+- `target/release/find-stutter.exe`（唯一入口：无参数 = GUI 悬浮窗；子命令 = agent CLI 查询）
 - `target/release/find-stutter-service.exe`（Windows 服务）
+
+> ADR-0001 后不再有独立的 `find-stutter-ui.exe`——GUI 库（`crates/ui`）只被
+> `find-stutter.exe` 链接，不再单独产出可执行文件。
 
 ### 开发者注意
 
 > 单独改 UI 代码后请用 `rtk cargo build --release -p find-stutter` 重新编译 GUI 入口
-> （不要只编 `-p find-stutter-ui`，那不会更新 `find-stutter.exe`）。
+> （`-p find-stutter-ui` 只编译 ui 库本身，不会更新用户实际运行的 `find-stutter.exe`）。
 
 ## 使用指南
 
@@ -144,9 +150,9 @@ find-stutter-service.exe status     # 查询；退出码 0=在跑，非 0=未运
 find-stutter-service.exe stop       # 或 sc stop FindStutter
 find-stutter-service.exe uninstall
 
-# 重启服务（service 端无单独的 restart 子命令，用 stop + start 两步）
-# 升级二进制后想让服务用上新 exe，也可直接 install-start（已注册则仅重启）
-sc stop FindStutter && sc start FindStutter
+# 重启服务（升级二进制推荐直接用 CLI 子命令，一条命令完成停服 → 重建 → 重装启动）
+find-stutter.exe upgrade               # 或 --no-build 跳过构建只重装
+# 也可手动：sc stop FindStutter && sc start FindStutter
 # 或：find-stutter-service.exe install-start
 ```
 
@@ -178,11 +184,34 @@ sc stop FindStutter && sc start FindStutter
 
 ## 命令行参考
 
-### `find-stutter.exe`（UI 端）
+### `find-stutter.exe`（唯一入口：无参数 = GUI；子命令 = agent CLI）
+
+无参数（或 `run`）启动悬浮窗监控（只读 stutter.db，自动确保服务在跑）。
+面向 coding agent 的子命令输出**单行紧凑 JSON**（英文键、ISO8601 时间，
+便于 jq 管道）；`--from/--to` 支持 RFC3339 / `YYYY-MM-DD HH:MM:SS` /
+`YYYY-MM-DD`（无时区后缀按本地时区解释），缺省为「本地今日零点 → 现在」。
 
 | 命令 | 说明 |
 | --- | --- |
-| （无参数） | 启动悬浮窗监控（只读 stutter.db） |
+| `events [--from][--to][--limit]` | 卡顿事件列表（最新 N 条，时间升序；字段含 `causes` / `cause_kinds` / `primary_cause` / `severity` / `duration_ms` / `culprits` / `onset_ts`；`--limit` 默认 100） |
+| `samples [--from][--to][--limit]` | 样本区间查询（最新 N 条，时间升序；样本量大（1Hz、保留 30 天），`--limit` 默认 1000，可调大） |
+| `analysis [--from][--to]` | 聚合分析一次输出全部：`kpi` / `trend` / `culprits`（元凶榜）/ `cause_types` / `root_cause`（最近事件根因报告） |
+| `config` | 当前生效配置（config.toml 加载结果，含默认值回退后的有效值） |
+| `status` | 服务状态：SCM 状态 + 心跳健康（Running/Stale/Stopped）+ db 路径 |
+| `process [--limit]` | 现场采集一次 top 进程快照（不写库；`--limit` 默认 10） |
+| `export --from <开始> --to <结束> [-o <文件>]` | 将时间范围采样数据导出为 CSV（中文表头；时间格式 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM:SS`） |
+| `upgrade [--no-build]` | 升级：停服（提权）→ `rtk cargo build --release` → 重装启动（提权）；`--no-build` 跳过构建。详见 [UPGRADE.md](./UPGRADE.md) |
+
+示例：
+
+```bash
+find-stutter.exe events --limit 5                 # 最近 5 次卡顿
+find-stutter.exe events --from 2026-08-16         # 今日卡顿（零点起）
+find-stutter.exe samples --from 2026-08-16 --limit 100
+find-stutter.exe analysis | jq .kpi
+find-stutter.exe status | jq .heartbeat.health
+find-stutter.exe export --from 2026-07-25 --to 2026-07-26 --output today.csv
+```
 
 ### `find-stutter-service.exe`（service 端）
 
@@ -197,20 +226,6 @@ sc stop FindStutter && sc start FindStutter
 | `install-start` | 一次完成 `install` + `start`（GUI 端 UAC 提权路径用，需管理员权限） |
 | `--config <path>` | 全局：指定配置文件路径（默认 `config.toml`） |
 
-### `export` / `stats`（CLI 工具）
-
-| 命令 | 说明 |
-| --- | --- |
-| `export --from <开始> --to <结束> --output <文件>` | 将指定时间范围的采样数据导出为 CSV（`samples` 表的每秒系统指标；时间格式 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM:SS`） |
-| `stats` | 打印今日卡顿次数 |
-
-示例：
-
-```bash
-find-stutter.exe export --from 2026-07-25 --to 2026-07-26 --output today.csv
-find-stutter.exe stats
-```
-
 ## 配置
 
 配置文件为 `config.toml`（与 exe 同级），各字段均有中文注释，详见文件内说明。
@@ -224,14 +239,18 @@ find-stutter.exe stats
 
 ```
 crates/
-  core/      采集器、检测引擎、SQLite 日志、类型定义（心跳表 + 只读接口）
+  core/      采集器、检测引擎、SQLite 日志、类型定义、analytics（分析聚合与
+             根因纯函数，ADR-0001 下沉：UI 与 CLI 共用同一分析口径）
+  cli/       find-stutter-cli：agent 查询界面（events / samples / analysis /
+             config / status / process 六件套 JSON 子命令 + export CSV +
+             upgrade 升级编排；clap 定义也在这里，bin 只做分发）
   service/   find-stutter-service: Windows 服务（run / install / uninstall / start / stop / status / install-start）
   ui/        悬浮窗 UI、皮肤、DbReader（1Hz SQLite 轮询）、服务健康角标、
              auto_start（GUI 启动时自动检测 + UAC 提权安装/启动）、
              elevate（ShellExecuteExW + runas）、hotreload（notify 配置/皮肤监听）、
              tray（系统托盘）、notify（卡顿气泡通知）、taskbar（伪任务栏窗口）、
              process_list（进程详情页：采样/聚合/排序/搜索/详情面板）
-  bin/       GUI 入口（package find-stutter，link ui 库；默认 UI / export / stats 子命令）
+  bin/       find-stutter 入口（只做分发：无参数 = GUI；子命令 = 转发 cli）
 config.toml  配置（含 [ui] taskbar、[notifications] 开关）
 stutter.db   运行时生成的数据库
 ```
@@ -242,8 +261,9 @@ stutter.db   运行时生成的数据库
 rtk cargo test --workspace
 ```
 
-各 crate 均包含单元测试：`core`（检测与日志）、`ui`（进程列表聚合/排序/搜索、皮肤、热加载、
-自动启动等）、`service`（服务生命周期）、`bin`（CLI）。运行后查看各 crate 实时测试计数。
+各 crate 均包含单元测试：`core`（检测、日志与分析聚合）、`cli`（时间解析 / JSON
+查询 / 升级编排 / 参数解析）、`ui`（进程列表聚合/排序/搜索、皮肤、热加载、自动启动等）、
+`service`（服务生命周期）、`bin`（分发行为）。运行后查看各 crate 实时测试计数。
 
 ## 已知限制
 

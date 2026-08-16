@@ -51,7 +51,7 @@ fn sink() -> Arc<Mutex<Vec<RawFrame>>> {
 }
 
 /// ETW 实时事件回调：只取 SampledProfile（Id 46）栈回溯事件，把指令地址压入 SINK。
-unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
+unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) { unsafe {
     if record.is_null() {
         return;
     }
@@ -91,7 +91,7 @@ unsafe extern "system" fn etw_event_callback(record: *mut EVENT_RECORD) {
             }
         }
     }
-}
+}}
 /// ETW 调用栈采样器。`enabled=false` 表示初始化失败，已静默降级（该层关闭）。
 pub struct StackSampler {
     enabled: bool,

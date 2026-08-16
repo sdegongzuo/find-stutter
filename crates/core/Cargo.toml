@@ -1,7 +1,7 @@
 [package]
 name = "find-stutter-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 description = "System stutter monitor - core library"
 
 [dependencies]
@@ -15,6 +15,8 @@ windows = { version = "0.62", features = [
     "Win32_System_EventLog",
     "Win32_System_Diagnostics_Etw",
     "Win32_System_Time",
+    # elevate.rs：UAC 提权（ShellExecuteExW + "runas"，ADR-0001 下沉公共实现）
+    "Win32_UI_Shell",
 ] }
 wmi = "0.18"
 rusqlite = { version = "0.40", features = ["bundled"] }
