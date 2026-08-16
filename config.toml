@@ -15,78 +15,66 @@ cpu_threshold = 90.0
 # CPU 滞回（百分点）：进入卡顿需 > cpu_threshold，退出需 < cpu_threshold - cpu_hysteresis。
 # 滞回带内维持当前状态，避免 CPU 在阈值附近震荡时反复记录
 cpu_hysteresis = 10.0
-# 内存使用率超过该百分比（%）即视为潜在卡顿（阶段 E 起带滞回 + 稳态抑制：
-# 进入 > 阈值，退出 ≤ 阈值 - mem_hysteresis_percent；连续活跃超 mem_chronic_seconds
-# 后停止发射 cause，直到回落到退出线以下——常年 90%+ 的机器不再反复记长事件）
+# 内存使用率进入线（%）：超过即进入内存水位激活；退出线 = 本值 − mem_hysteresis_percent，
+# 连续活跃超过 mem_chronic_seconds 后稳态抑制（停止发射 cause，回落到退出线以下才恢复）
 mem_threshold_percent = 90.0
-# 或：可用内存低于该值（MB）即视为潜在卡顿（退出线 = 本值 × mem_available_exit_ratio）
+# 可用内存进入线（MB）：低于即进入内存水位激活；退出线 = 本值 × mem_available_exit_ratio
 mem_threshold_mb = 500
 # 提交电荷阈值（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
-# 阶段 E 起提交电荷**降级为「压力证据」**，不再是独立卡顿 cause：commit 高只是
-# 记账上限逼近，本身对性能零影响（浏览器/IDE/模拟器大量 commit，开发机常年
-# 90%+ 而系统不卡）；真出问题时必然伴随可用内存低/分页信号，由那些信号触发。
-# 本阈值保留作分页（page_reads）压力证据的判定线。
+# 仅作分页（page_reads）压力证据的判定线，不作为独立卡顿 cause——commit 高只是
+# 记账上限逼近，本身不影响性能；真压力由可用内存低/分页信号触发
 commit_threshold_percent = 90.0
-# 内存使用率滞回（百分点）：退出线 = mem_threshold_percent - 本值（默认 90 进 / 85 出）
+# 内存使用率滞回（百分点）：退出线 = mem_threshold_percent − 本值（默认 90 进 / 85 出）
 mem_hysteresis_percent = 5.0
 # 可用内存退出线比例：退出线 = mem_threshold_mb × 本值（默认 500 进 / 600 出）
 mem_available_exit_ratio = 1.2
-# 内存水位稳态抑制秒数：使用率/可用内存连续活跃超过该时长（默认 60s）后
-# 停止发射内存 cause 并锁存，直到回落到退出线以下才解锁（水位是稳态，
-# 颠簸才是事件；真颠簸由分页 cause 独立触发，不受抑制）
+# 内存水位稳态抑制秒数：使用率/可用内存连续活跃超过该时长后停止发射内存 cause
+# 并锁存，直到回落到退出线以下才解锁（水位是稳态、颠簸才是事件；
+# 真颠簸由分页 cause 独立触发，不受抑制）
 mem_chronic_seconds = 60
-# 分页活动速率（Page Reads/sec）阈值（/s）：超过即记为换页抖动。这是「真正的 swap
-# 卡顿信号」——度量换页活动强度（流量）而非 swap 已用存量。正常负载通常 < 10/s，
-# 抖动（thrashing）时飙升到数百/数千 /s。详见 docs/memory-stutter-detection.md 阶段 C。
-# 修正（用户实测反馈）：Page Reads/sec 瞬时抖动极大，开发机/模拟器（Android Studio /
-# qemu / IDE 等）正常负载也频繁超 50/s，但磁盘空闲、提交电荷不高时系统并不卡顿。
-# 故：1) 默认阈值调高到 300/s；2) paging 不再单指标硬触发——必须同时存在内存/磁盘
-# 压力证据（commit 高 / 内存使用率高 / 可用内存不足 / 磁盘繁忙）才记为卡顿 cause。
+# 分页活动速率（Page Reads/sec）阈值（/s）：度量换页活动强度（流量）而非已用存量，
+# 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。瞬时抖动大，
+# 不单指标硬触发——须同时存在内存/磁盘压力证据（commit 高 / 内存使用率高 /
+# 可用内存不足 / 磁盘繁忙）才记为卡顿 cause
 page_reads_threshold = 300.0
-# 磁盘瞬时读写速率相对均值的突增倍数（超过即记为磁盘抖动）
+# 磁盘瞬时读写速率相对均值的突增倍数：不参与实时判定（吞吐 ≠ 饱和），仅供 what-if 参考
 disk_rate_spike_ratio = 10.0
 # 综合指标相对基线的突增倍数
 spike_ratio = 3.0
 # 网络/磁盘 spike 的绝对下限（B/s）：当前速率低于该值不判定 spike，
 # 避免空闲时几 B/s ~ 几十 KB/s 的零头波动按倍数误报
 spike_min_bps = 2000000
-# CPU spike 单样本绝对下限（%）：样本值低于该值不计入突增确认（阶段 E）。
-# 纯比率判定会让空闲机后台任务误报——基线 5% 涨到 16% 即 3 倍，但 16% CPU
-# 远不构成卡顿；≥50% 的持续突增才可能是真压力
+# CPU spike 单样本绝对下限（%）：样本值低于该值不计入突增确认——
+# 低使用率的纯比率突增（如基线 5% 涨到 16%）不构成卡顿；≥50% 的持续突增才算
 spike_min_cpu_percent = 50.0
 # 持续多少秒达到阈值才判定为一次卡顿（避免瞬时抖动误报）
 sustained_seconds = 3
-# 滞回带最长保持秒数（阶段 E，通用）：信号已低于进入线、仅靠滞回维持激活
-# 超过该时长即强制解除——滞回是防抖工具，不是延长卡顿的工具。适用于
-# CPU 带内保持、磁盘/DPC/中断/切换的 ×0.5 带及内存水位带；重新越过进入线
-# 即重置计时，持续真饱和（如 CPU 一直 >90%）不受影响
+# 滞回带最长保持秒数：信号已低于进入线、仅靠滞回维持激活超过该时长即强制解除
+# （滞回只防抖，不延长卡顿）；重新越过进入线即重置计时，持续真饱和不受影响
 hysteresis_hold_max_secs = 15
-# 采样最大 tick 间隔秒数（阶段 E）：与上一 tick 的墙钟间隔超过该值判定为
-# 采样中断（系统睡眠/挂起），清空跟踪不落库——避免睡眠时长被算进卡顿
-# duration（实测出现过 3.9 天的巨长事件）。需大于空闲慢速采样间隔
-# （interval_ms × slow_interval_factor = 5s）
+# 采样最大 tick 间隔秒数：与上一 tick 的墙钟间隔超过该值判定为采样中断
+# （系统睡眠/挂起），清空跟踪不落库，睡眠时长不计入卡顿 duration。
+# 须大于空闲慢速采样间隔（interval_ms × slow_interval_factor = 5s）
 max_tick_gap_secs = 15
-# Windows 事件日志回溯窗口秒数（阶段 E）：卡顿触发后只回溯
-# [onset - 本值, now] 的白名单事件（原固定 30s）。TDR/服务崩溃/磁盘错误
-# 都在卡顿当下记录，收窄窗口避免无关噪音事件注入软件级 cause 并抢主因
+# Windows 事件日志回溯窗口秒数：卡顿触发后只回溯 [onset − 本值, now] 的白名单事件。
+# TDR/服务崩溃/磁盘错误都在卡顿当下记录，窗口过大会让无关噪音事件抢主因归因
 win_event_backtrack_secs = 10
-# F-RC14-a：进程句柄泄漏判定阈值（句柄数超过即进入句柄趋势判定）
+# 进程句柄泄漏判定阈值（句柄数超过即进入句柄趋势判定）
 handle_leak_threshold = 10000
-# F-RC14-a 方案 B：句柄增长阈值——卡顿窗口内后半段句柄均值较前半段净增超过该值
-# 才算真泄漏（ProcessHandleLeak）；仅绝对值高但无增长只标 HandleHigh「句柄数偏高」
-# （中性提示，如 AI/数据库等稳定大句柄常驻服务，不误判为泄漏）
+# 句柄增长阈值：卡顿窗口内后半段句柄均值较前半段净增超过该值才算真泄漏
+# （ProcessHandleLeak）；仅绝对值高但无增长只标 HandleHigh「句柄数偏高」
+# （中性提示，不误判稳定大句柄常驻服务为泄漏）
 handle_leak_growth_threshold = 2000
-# F-RC14-a：进程 GDI 对象泄漏判定阈值（GDI 对象数超过即标记 GdiObjectLeak 候选）
+# 进程 GDI 对象泄漏判定阈值（GDI 对象数超过即标记 GdiObjectLeak 候选）
 gdi_leak_threshold = 10000
-# F-RC4：温度降频阈值（℃）：cpu_temp 超过且频率掉档（< 峰值×thermal_freq_drop_ratio）
+# 温度降频阈值（℃）：温度超过且频率掉档（< 峰值 × thermal_freq_drop_ratio）
 # 且负载 >50% 三条件同时成立才记 ThermalThrottle cause
 thermal_threshold_celsius = 85.0
 # 频率掉档比例（0~1）：当前频率低于近期峰值 × 本值即视为「疑似降频」
 thermal_freq_drop_ratio = 0.85
-# 频率峰值衰减系数（阶段 E）：每次频率读数时峰值更新为 max(当前读数, 峰值×本值)。
-# 原实现峰值只增不减——短时睿频建立的峰值会让全核负载频率全程被误判「掉档」；
-# 慢衰减（默认 0.995，读数约 5s 一次）让陈旧峰值逐渐让位于持续负载频率。
-# 设为 1.0 恢复旧行为
+# 频率峰值衰减系数：每次频率读数时峰值 = max(当前读数, 峰值 × 本值)，
+# 让短时睿频建立的峰值逐渐让位于持续负载频率（读数约 5s 一次）。
+# 1.0 = 不衰减
 thermal_freq_peak_decay = 0.995
 
 [ui]
