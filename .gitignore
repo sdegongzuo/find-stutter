@@ -36,3 +36,4 @@ target-svc-check/
 screenshot.png
 
 *.db*
+upgrade-transcript.log
