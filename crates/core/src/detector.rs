@@ -39,6 +39,27 @@ pub struct Detector {
     last_ui_probe: Option<Instant>,
     /// F-RC3 前台窗口冻结探测函数（依赖注入，便于单测；默认走真实 Win32 探测）。
     ui_probe: Box<dyn Fn(u32) -> bool + Send>,
+    // ===== 阶段 E（误报治理）新增状态 =====
+    /// 上一次 analyze 的墙钟时刻（SystemTime）：与本次间隔超过 `max_tick_gap_secs`
+    /// 判定采样中断（系统睡眠/挂起），清空全部跨 tick 状态——避免睡眠时长算进
+    /// 卡顿 duration。必须用墙钟而非 `Instant`：后者基于 QPC，Windows 传统
+    /// S3/S4 睡眠期间不推进，测不出「睡了一觉」（rust-lang/rust#85586）。
+    last_tick: Option<SystemTime>,
+    /// 内存水位信号（使用率 + 可用内存）是否活跃（滞回进入后、退出前）。
+    mem_level_active: bool,
+    /// 内存水位稳态抑制锁存：连续活跃超过 `mem_chronic_seconds` 后置位，
+    /// 停止发射内存 cause，直到水位回落到退出线以下才解锁。
+    mem_level_suppressed: bool,
+    /// 内存水位本次连续活跃的起点（chronic 计时用）。
+    mem_active_since: Option<SystemTime>,
+    /// 各信号「滞回带保持」计时起点（信号已低于进入线、仅靠滞回维持时计时，
+    /// 超过 `hysteresis_hold_max_secs` 强制解除；重新越过进入线即重置）。
+    cpu_band_since: Option<Instant>,
+    mem_band_since: Option<Instant>,
+    disk_band_since: Option<Instant>,
+    dpc_band_since: Option<Instant>,
+    interrupt_band_since: Option<Instant>,
+    ctx_band_since: Option<Instant>,
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
@@ -49,8 +70,9 @@ pub struct Detector {
     /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
     need_process_snapshot: bool,
     /// F-RC4 近期观测到的 CPU 频率峰值（MHz），作为「频率掉档」判定基线。
-    /// 仅当 sample.cpu_freq_mhz 为 Some 时取 max 更新，不衰减——
-    /// 反映该机在负载下观测到的最高频率，即降频判定的参照点。
+    /// 仅当 sample.cpu_freq_mhz 为 Some 时更新为 max(当前读数, 峰值×衰减系数)——
+    /// 阶段 E 起带慢衰减（`thermal_freq_peak_decay`），让陈旧的短时睿频峰值
+    /// 逐渐让位于持续负载频率，避免「峰值只在 turbo 中建立、此后全程误判降频」。
     freq_peak: Option<f32>,
 }
 
@@ -73,6 +95,16 @@ impl Detector {
             ui_freeze_active: false,
             last_ui_probe: None,
             ui_probe: Box::new(probe_foreground_window_frozen),
+            last_tick: None,
+            mem_level_active: false,
+            mem_level_suppressed: false,
+            mem_active_since: None,
+            cpu_band_since: None,
+            mem_band_since: None,
+            disk_band_since: None,
+            dpc_band_since: None,
+            interrupt_band_since: None,
+            ctx_band_since: None,
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
@@ -86,13 +118,37 @@ impl Detector {
     }
 
     pub fn analyze(&mut self, sample: &Sample) -> Option<StutterEvent> {
+        // ===== 阶段 E：采样中断防护 =====
+        // 与上一 tick 的墙钟间隔超过 `max_tick_gap_secs` 判定为采样中断
+        // （系统睡眠/挂起/采集卡死）。所有跨 tick 状态（卡顿跟踪、滞回、
+        // 滑动基线）全部失效：清空重评估、绝不落库——否则睡眠时长会被
+        // `start.elapsed()` 算进卡顿 duration（实测出现过 3.9 天的巨长事件）。
+        // 与 duration 同用 SystemTime 墙钟；时钟回拨（NTP）不算中断。
+        let tick_now = SystemTime::now();
+        if let Some(last) = self.last_tick {
+            if tick_now
+                .duration_since(last)
+                .map_or(false, |gap| {
+                    gap > Duration::from_secs(self.config.max_tick_gap_secs as u64)
+                })
+            {
+                self.reset_after_gap();
+            }
+        }
+        self.last_tick = Some(tick_now);
+
         self.history.push(sample.clone());
         if self.history.len() > 120 {
             self.history.remove(0);
         }
-        // F-RC4：更新近期 CPU 频率峰值（降频判定基线），仅在有读数时取 max。
+        // F-RC4：更新近期 CPU 频率峰值（降频判定基线）。阶段 E 起带慢衰减：
+        // peak = max(当前读数, peak × decay)，让短时睿频建立的陈旧峰值逐渐
+        // 让位于持续负载频率，避免「此后全程被误判降频」。
         if let Some(f) = sample.cpu_freq_mhz {
-            self.freq_peak = Some(self.freq_peak.map_or(f, |p| p.max(f)));
+            self.freq_peak = Some(
+                self.freq_peak
+                    .map_or(f, |p| (p * self.config.thermal_freq_peak_decay).max(f)),
+            );
         }
 
         let mut causes = Vec::new();
@@ -237,6 +293,36 @@ impl Detector {
         }
     }
 
+    /// 阶段 E：采样中断（睡眠/挂起）后的状态清空。滞回、spike 激活、内存水位
+    /// 状态、滑动基线历史全部作废——中断前后的样本不可比较，全部重新学习。
+    fn reset_after_gap(&mut self) {
+        self.stutter_start = None;
+        self.current_causes.clear();
+        self.current_culprits.clear();
+        self.current_cause_first_touch.clear();
+        self.need_process_snapshot = false;
+        self.cpu_active = false;
+        self.cpu_spike_active = false;
+        self.net_spike_active = false;
+        self.mem_spike_active = false;
+        self.disk_busy_active = false;
+        self.dpc_active = false;
+        self.interrupt_active = false;
+        self.ctx_switch_active = false;
+        self.thermal_active = false;
+        self.ui_freeze_active = false;
+        self.mem_level_active = false;
+        self.mem_level_suppressed = false;
+        self.mem_active_since = None;
+        self.cpu_band_since = None;
+        self.mem_band_since = None;
+        self.disk_band_since = None;
+        self.dpc_band_since = None;
+        self.interrupt_band_since = None;
+        self.ctx_band_since = None;
+        self.history.clear();
+    }
+
     fn check_hard_thresholds(&mut self, sample: &Sample) -> Vec<String> {
         let mut causes = Vec::new();
 
@@ -248,6 +334,15 @@ impl Detector {
         } else if sample.cpu_usage <= self.config.cpu_threshold - self.config.cpu_hysteresis {
             self.cpu_active = false;
         }
+        // 阶段 E：滞回带最长保持——带内（已低于进入线）仅靠滞回维持超过
+        // hysteresis_hold_max_secs 即强制解除。滞回是防抖工具，不是延长卡顿
+        // 的工具；CPU 持续 >90% 的真饱和不受影响（over_entry 恒真、计时重置）。
+        band_hold_step(
+            &mut self.cpu_active,
+            &mut self.cpu_band_since,
+            sample.cpu_usage > self.config.cpu_threshold,
+            self.config.hysteresis_hold_max_secs,
+        );
         if self.cpu_active {
             if sample.cpu_usage > self.config.cpu_threshold {
                 causes.push(format!(
@@ -264,28 +359,93 @@ impl Detector {
             }
         }
 
-        if sample.mem_available_mb < self.config.mem_threshold_mb {
-            causes.push(format!(
-                "Available memory {}MB < {}MB",
-                sample.mem_available_mb, self.config.mem_threshold_mb
-            ));
+        // ===== 阶段 E：内存水位信号（使用率 + 可用内存）滞回 + 稳态抑制 =====
+        // 水位信号是「稳态」而非「事件」：常年 90%+ 内存的机器不该反复记录
+        // 用户无感的长事件（>30s 直接 Critical）。三态状态机：
+        //   Inactive →（任一条件越过进入线）→ Active
+        //   Active   →（全部回落到退出线以下）→ Inactive
+        //   Active   →（连续活跃 > mem_chronic_seconds）→ Suppressed（锁存，
+        //              停止发射 cause；直到回落到退出线以下才解锁）
+        // Active 且未抑制时发射 cause，口径与旧实现一致：哪个条件瞬时成立发哪条
+        // （两个条件为「或」关系，config.toml 注释为「或」）。
+        // 分页（paging）不受抑制影响——真颠簸由 paging cause 独立触发（见下）。
+        let usage_over_entry = sample.mem_usage_percent > self.config.mem_threshold_percent;
+        let avail_under_entry =
+            (sample.mem_available_mb as f32) < self.config.mem_threshold_mb as f32;
+        let any_entry = usage_over_entry || avail_under_entry;
+        // 退出线：使用率 ≤ 阈值 − mem_hysteresis_percent 且 可用 ≥ 阈值 × mem_available_exit_ratio
+        // （默认 90 进 / 85 出、500 进 / 600 出），水位在进入线附近抖动不再反复开关。
+        let all_exit = sample.mem_usage_percent
+            <= self.config.mem_threshold_percent - self.config.mem_hysteresis_percent
+            && (sample.mem_available_mb as f32)
+                >= self.config.mem_threshold_mb as f32 * self.config.mem_available_exit_ratio;
+
+        if self.mem_level_suppressed {
+            if all_exit {
+                self.mem_level_suppressed = false;
+            }
+        } else if !self.mem_level_active {
+            if any_entry {
+                self.mem_level_active = true;
+                self.mem_active_since = Some(SystemTime::now());
+            }
+        } else if all_exit {
+            self.mem_level_active = false;
+            self.mem_active_since = None;
+        } else {
+            // 稳态抑制：连续活跃超过 mem_chronic_seconds → 锁存抑制，
+            // 停止发射内存 cause（本次越线只产生一条有界事件）。
+            let chronic = self
+                .mem_active_since
+                .and_then(|t| t.elapsed().ok())
+                .map_or(false, |d| {
+                    d >= Duration::from_secs(self.config.mem_chronic_seconds as u64)
+                });
+            if chronic {
+                self.mem_level_active = false;
+                self.mem_level_suppressed = true;
+                self.mem_active_since = None;
+            }
+        }
+        // 滞回带最长保持（阶段 E 通用规则）：带内（未越过进入线、未到退出线）
+        // 仅靠滞回维持超过 hysteresis_hold_max_secs → 强制解除（不锁存抑制，
+        // 重新越过进入线即恢复）。
+        band_hold_step(
+            &mut self.mem_level_active,
+            &mut self.mem_band_since,
+            any_entry,
+            self.config.hysteresis_hold_max_secs,
+        );
+        // band_hold_step 强制解除（带保持超时）路径不经过上方状态机，
+        // 需同步清掉 chronic 计时起点，避免残留到下次激活。
+        if !self.mem_level_active {
+            self.mem_active_since = None;
+        }
+        if self.mem_level_active {
+            if avail_under_entry {
+                causes.push(format!(
+                    "Available memory {}MB < {}MB",
+                    sample.mem_available_mb, self.config.mem_threshold_mb
+                ));
+            }
+            // 内存使用率过高（百分比口径）：与 `mem_threshold_mb`（绝对可用下限）
+            // 互补，覆盖「大内存机器上可用内存绝对值仍高、但使用率已爆表」的漏报
+            // （例如 32G 机器用到 95% 时可用仍 >500MB，仅看绝对下限会漏报）。
+            if usage_over_entry {
+                causes.push(format!(
+                    "Memory usage {:.1}% > {}%",
+                    sample.mem_usage_percent, self.config.mem_threshold_percent
+                ));
+            }
         }
 
-        // 内存使用率过高（百分比口径）：与 `mem_threshold_mb`（绝对可用下限）互补，
-        // 覆盖「大内存机器上可用内存绝对值仍高、但使用率已爆表」的场景
-        // （例如 32G 机器用到 95% 时可用仍 >500MB，仅看绝对下限会漏报）。
-        // 两个条件为「或」关系：任一成立即记为内存压力（config.toml 注释为「或」）。
-        if sample.mem_usage_percent > self.config.mem_threshold_percent {
-            causes.push(format!(
-                "Memory usage {:.1}% > {}%",
-                sample.mem_usage_percent, self.config.mem_threshold_percent
-            ));
-        }
-
-        // 提交电荷压力（commit charge）：已提交虚拟内存 / 提交上限
-        // （= 物理内存 + 页面文件）。接近上限时系统弹「内存不足」并强制分页，
-        // 往往比「可用物理内存归零」更早预警。与 mem 两个口径互补
-        // （任一成立即记内存压力）。无滞回（与 mem 硬阈值一致，瞬时判断）。
+        // 提交电荷（commit charge）：已提交虚拟内存 / 提交上限（= 物理内存 +
+        // 页面文件）。阶段 E（误报治理）起**降级为「压力证据」**，不再作为独立
+        // cause 发射：commit 高只是记账上限逼近，本身对性能零影响（浏览器/IDE/
+        // 模拟器大量 commit，开发机常年 90%+ 而系统不卡）；真出问题（分配失败、
+        // 强制分页）时必然伴随可用内存低/分页信号，由那些信号触发。对齐阶段 A
+        // （swap 存量降为仅展示）/ 阶段 B（paging 降为放大器）的治理先例。
+        // commit_ratio 保留计算：仍作为 paging 压力证据之一（见下方判定）。
         let commit_ratio = if sample.commit_limit > 0 {
             // 用 f64 计算：大内存机 commit_limit 达数十 GB，超出 f32 的 24 位精确整数范围，
             // 在 90% 边界附近会因精度丢失而误判。
@@ -293,12 +453,6 @@ impl Detector {
         } else {
             0.0
         };
-        if commit_ratio > self.config.commit_threshold_percent as f64 {
-            causes.push(format!(
-                "Commit charge {:.1}% > {}%",
-                commit_ratio, self.config.commit_threshold_percent
-            ));
-        }
 
         // 分页活动速率（阶段 C）：\Memory\Page Reads/sec 是「真正的 swap 卡顿信号」。
         // 物理内存耗尽时 OS 被迫把页从 pagefile 换入，每次换页注入一次磁盘 I/O 延迟 → 卡顿。
@@ -309,11 +463,8 @@ impl Detector {
         // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「内存/磁盘压力
         // 证据」（commit 高 / 内存使用率高 / 可用内存不足 / 磁盘繁忙）才记为卡顿 cause——
         // paging 退化为真卡顿的「放大器」，避免孤立分页尖峰连环误报。
-        let paging_has_pressure_evidence = commit_ratio > self.config.commit_threshold_percent as f64
-            || sample.mem_usage_percent > self.config.mem_threshold_percent
-            || sample.mem_available_mb < self.config.mem_threshold_mb
-            || sample.disk_busy_percent > self.config.disk_busy_threshold_percent
-            || sample.disk_avg_io_ms > self.config.disk_io_threshold_ms;
+        let paging_has_pressure_evidence =
+            self.config.paging_has_pressure_evidence(commit_ratio, sample);
         if sample.page_reads_per_sec > self.config.page_reads_threshold
             && paging_has_pressure_evidence
         {
@@ -341,6 +492,14 @@ impl Detector {
         {
             self.disk_busy_active = false;
         }
+        // 阶段 E：×0.5 滞回带内（如繁忙度 50~95%）仅靠滞回维持超过上限即解除，
+        // 不把一次磁盘饱和拖成几分钟的长事件。
+        band_hold_step(
+            &mut self.disk_busy_active,
+            &mut self.disk_band_since,
+            disk_busy,
+            self.config.hysteresis_hold_max_secs,
+        );
         if self.disk_busy_active {
             causes.push(format!(
                 "Disk busy {:.1}% (IO {:.1}ms)",
@@ -354,6 +513,12 @@ impl Detector {
             sample.dpc_percent,
             self.config.dpc_threshold_percent,
             self.config.sys_signal_hysteresis_ratio,
+        );
+        band_hold_step(
+            &mut self.dpc_active,
+            &mut self.dpc_band_since,
+            sample.dpc_percent > self.config.dpc_threshold_percent,
+            self.config.hysteresis_hold_max_secs,
         );
         if self.dpc_active {
             causes.push(format!(
@@ -369,6 +534,12 @@ impl Detector {
             self.config.interrupt_threshold_percent,
             self.config.sys_signal_hysteresis_ratio,
         );
+        band_hold_step(
+            &mut self.interrupt_active,
+            &mut self.interrupt_band_since,
+            sample.interrupt_percent > self.config.interrupt_threshold_percent,
+            self.config.hysteresis_hold_max_secs,
+        );
         if self.interrupt_active {
             causes.push(format!(
                 "Interrupt time {:.1}% > {}%",
@@ -382,6 +553,12 @@ impl Detector {
             sample.context_switches_per_sec,
             self.config.context_switch_threshold_per_sec,
             self.config.sys_signal_hysteresis_ratio,
+        );
+        band_hold_step(
+            &mut self.ctx_switch_active,
+            &mut self.ctx_band_since,
+            sample.context_switches_per_sec > self.config.context_switch_threshold_per_sec,
+            self.config.hysteresis_hold_max_secs,
         );
         if self.ctx_switch_active {
             causes.push(format!(
@@ -466,7 +643,10 @@ impl Detector {
             &cpu_r,
             &cpu_b,
             self.config.spike_ratio,
-            0.0, // CPU 为百分比，无绝对下限
+            // 阶段 E：CPU spike 绝对下限（%）。纯比率判定会让空闲机的后台任务
+            // 误报——基线 5% 涨到 16% 即 3 倍，但 16% CPU 远不构成卡顿。
+            // 与网络 spike 的 spike_min_bps 同构：单样本 ≥ 下限才计入确认。
+            self.config.spike_min_cpu_percent,
             &mut self.cpu_spike_active,
         );
 
@@ -554,7 +734,13 @@ impl Detector {
     }
 
     fn determine_severity(causes: &[String], duration_ms: u64) -> Severity {
-        let count = causes.len();
+        // 阶段 E：只计压力类 cause——非压力类（NetSpike 等纯吞吐信号）不虚增
+        // 严重度（否则 CpuHigh + 网络 spike 凑 2 因即 Major）。无法映射到
+        // CauseKind 的文本按压力类计（防御：宁可虚高也不漏）。
+        let count = causes
+            .iter()
+            .filter(|c| CauseKind::from_cause(c).map_or(true, |k| k.is_pressure()))
+            .count();
         if count >= 3 || duration_ms > 30_000 {
             Severity::Critical
         } else if count >= 2 || duration_ms > 10_000 {
@@ -596,6 +782,37 @@ fn sys_signal_hysteresis(active: bool, value: f32, threshold: f32, ratio: f32) -
         false
     } else {
         active
+    }
+}
+
+/// 滞回带最长保持步进（阶段 E 通用规则）。
+///
+/// 滞回的目的是防抖（阈值附近反复横跳时不再反复开始/结束记录），**不是**
+/// 延长卡顿：信号当前值已低于进入线（`over_entry == false`）、仅靠滞回维持
+/// 激活时开始计时，超过 `max_hold_secs` 强制解除；重新越过进入线（真信号
+/// 在场）即重置计时。CPU 带内保持、磁盘/DPC/中断/切换的 ×0.5 带以及内存
+/// 水位带统一走本函数——持续真饱和（over_entry 恒真）不受任何影响。
+fn band_hold_step(
+    active: &mut bool,
+    band_since: &mut Option<Instant>,
+    over_entry: bool,
+    max_hold_secs: u32,
+) {
+    if !*active {
+        *band_since = None;
+        return;
+    }
+    if over_entry {
+        // 真信号在场：滞回带计时重置
+        *band_since = None;
+    } else if band_since
+        .get_or_insert_with(Instant::now)
+        .elapsed()
+        >= Duration::from_secs(max_hold_secs as u64)
+    {
+        // 带内仅靠滞回维持超过上限：强制解除
+        *active = false;
+        *band_since = None;
     }
 }
 
@@ -1124,6 +1341,14 @@ mod tests {
             "应保留 NetSpike 附加 cause，got: {:?}",
             event.cause_kinds
         );
+        // 阶段 E6：severity 只计压力类 cause——CpuHigh（压力）+ NetSpike（非压力）
+        // 旧算法按 2 因记 Major，现在只计 1 个压力因、时长 ~1.2s → Minor。
+        assert_eq!(
+            event.severity,
+            Severity::Minor,
+            "非压力类（网络 spike）不应虚增严重度，got: {:?}",
+            event.causes
+        );
     }
 
     /// F-RC1：事件应携带结构化根因（cause_kinds / primary_cause / onset_ts /
@@ -1343,6 +1568,285 @@ mod tests {
 
         d.analyze(&make_sample(75.0, 2000, 10.0)); // <80 退出
         assert!(d.current_causes.is_empty());
+    }
+
+    // ===== 阶段 E（误报治理）回归 =====
+
+    /// 阶段 E1：CPU spike 绝对下限。空闲机后台任务（基线 10% → 40%，比率 4 倍
+    /// 达标）但绝对值 40% < spike_min_cpu_percent(50%) → 不得触发 CPU spike。
+    /// 绝对值足够（15% → 60%）时正常触发。
+    #[test]
+    fn spike_min_cpu_floor_ignores_low_absolute() {
+        let mut config = DetectionConfig::default(); // ratio=3.0, min_cpu=50%
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 60 基线 10% + 10 recent 40%：比率 4 > 3 但 40% < 50% 下限 → 不触发
+        for _ in 0..60 {
+            d.analyze(&make_sample(10.0, 2000, 10.0));
+        }
+        for _ in 0..10 {
+            d.analyze(&make_sample(40.0, 2000, 10.0));
+        }
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("CPU spike")),
+            "低绝对值 CPU 突增不应触发 spike，got: {:?}",
+            d.current_causes
+        );
+
+        // 对照：基线 15% + recent 65%（比率 3.33 > 3 且 ≥ 50%）→ 正常触发
+        let mut d2 = Detector::new(&config);
+        for _ in 0..60 {
+            d2.analyze(&make_sample(15.0, 2000, 10.0));
+        }
+        for _ in 0..10 {
+            d2.analyze(&make_sample(65.0, 2000, 10.0));
+        }
+        assert!(
+            d2.current_causes.iter().any(|c| c.contains("CPU spike")),
+            "高绝对值 CPU 突增应触发 spike，got: {:?}",
+            d2.current_causes
+        );
+    }
+
+    /// 阶段 E2a：提交电荷（commit charge）降级为「压力证据」，不再独立成 cause——
+    /// commit 高只是记账上限逼近，本身对性能零影响（开发机常年 90%+ 而不卡）。
+    #[test]
+    fn commit_charge_alone_no_longer_triggers() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // commit 95% > 90%，其余全部健康 → 不得产生任何 cause / 事件
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.commit_limit = 1_000_000;
+        s.commit_bytes = 950_000;
+        d.analyze(&s);
+        assert!(
+            d.current_causes.is_empty(),
+            "提交电荷单独偏高不应触发卡顿，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 阶段 E2a（证据角色保留）：commit 高 + 分页速率高（真实换页场景）→
+    /// 经「Memory paging」cause 触发（commit 作为压力证据），且不再出现
+    /// 「Commit charge」独立 cause。
+    #[test]
+    fn commit_charge_still_serves_as_paging_evidence() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // commit 95%（唯一压力证据）+ paging 400/s > 300 → 触发 Memory paging
+        let mut s = make_sample(30.0, 2000, 10.0);
+        s.commit_limit = 1_000_000;
+        s.commit_bytes = 950_000;
+        s.page_reads_per_sec = 400.0;
+        d.analyze(&s);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory paging")),
+            "commit 作为证据应放行 paging cause，got: {:?}",
+            d.current_causes
+        );
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("Commit charge")),
+            "提交电荷不应再作为独立 cause，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 阶段 E2b：内存水位滞回——使用率 92% 进入后回落 87%（带内 85~90）状态保持
+    /// （防抖），但瞬时未越过进入线不发射 cause；回落 84%（低于退出线 85）才解除。
+    #[test]
+    fn mem_level_hysteresis_band_and_exit() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 5; // 避免会话因不足持续时长而提前结束干扰断言
+        let mut d = Detector::new(&config);
+
+        let mut high = make_sample(30.0, 2000, 10.0);
+        high.mem_usage_percent = 92.0;
+        d.analyze(&high);
+        assert!(d.mem_level_active, "92% 应进入内存水位激活");
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory usage")),
+            "越过进入线应发射 cause，got: {:?}",
+            d.current_causes
+        );
+
+        // 带内 87%：状态保持（滞回防抖），但不再发射 cause（未越过进入线）
+        let mut band = make_sample(30.0, 2000, 10.0);
+        band.mem_usage_percent = 87.0;
+        d.analyze(&band);
+        assert!(d.mem_level_active, "带内应保持激活（滞回防抖）");
+        assert!(
+            d.current_causes.is_empty(),
+            "带内（未越过进入线）不应发射内存 cause，got: {:?}",
+            d.current_causes
+        );
+
+        // 重新越过进入线：状态本就活跃，cause 恢复发射
+        d.analyze(&high);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory usage")),
+            "重新越过进入线应恢复发射，got: {:?}",
+            d.current_causes
+        );
+
+        // 84% ≤ 85（退出线）→ 解除
+        let mut exit_s = make_sample(30.0, 2000, 10.0);
+        exit_s.mem_usage_percent = 84.0;
+        d.analyze(&exit_s);
+        assert!(!d.mem_level_active, "低于退出线应解除内存水位激活");
+        assert!(d.current_causes.is_empty());
+    }
+
+    /// 阶段 E2b：稳态抑制——水位连续活跃超过 mem_chronic_seconds 后停止发射
+    /// cause 并锁存；锁存期内重新越过进入线**不得**开新会话（每次越线只产生
+    /// 一条有界事件）；回落到退出线以下才解锁、恢复触发。
+    #[test]
+    fn mem_level_chronic_suppression() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.mem_chronic_seconds = 1; // 测试用：1s 即判定稳态
+        let mut d = Detector::new(&config);
+
+        let mut high = make_sample(30.0, 2000, 10.0);
+        high.mem_usage_percent = 92.0;
+
+        // 会话开始
+        d.analyze(&high);
+        assert!(d.stutter_start.is_some());
+
+        // 持续高位 >1s：稳态抑制触发 → cause 停发 → 会话结束并落库（有界事件）
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d
+            .analyze(&high)
+            .expect("稳态抑制结束时应有界落库一次事件");
+        assert!(
+            event.causes.iter().any(|c| c.contains("Memory usage")),
+            "事件应携带抑制前的内存 cause，got: {:?}",
+            event.causes
+        );
+
+        // 锁存期：仍高位 → 不再开新会话
+        d.analyze(&high);
+        assert!(
+            d.stutter_start.is_none(),
+            "锁存期内重新越过进入线不得开新会话（防反复误报）"
+        );
+        assert!(d.current_causes.is_empty());
+
+        // 回落到退出线以下（84% 且可用充足）→ 解锁
+        let mut recover = make_sample(30.0, 2000, 10.0);
+        recover.mem_usage_percent = 84.0;
+        d.analyze(&recover);
+        assert!(!d.mem_level_suppressed, "回落到退出线以下应解锁");
+
+        // 解锁后再次越线 → 正常恢复触发
+        d.analyze(&high);
+        assert!(d.mem_level_active, "解锁后再次越线应恢复激活");
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory usage")),
+            "解锁后再次越线应恢复发射 cause，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 阶段 E3：滞回带最长保持——CPU 进入后在带内（80~90）仅靠滞回维持超过
+    /// hysteresis_hold_max_secs 即强制解除；重新越过进入线恢复。
+    #[test]
+    fn cpu_band_hold_expires_after_max_hold() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 5;
+        config.hysteresis_hold_max_secs = 1; // 测试用：1s 即超时
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(95.0, 2000, 10.0)); // >90 进入
+        d.analyze(&make_sample(85.0, 2000, 10.0)); // 带内 → 开始计时
+        assert!(d.cpu_active, "带内应先保持激活");
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&make_sample(85.0, 2000, 10.0)); // 带内超时 → 强制解除
+        assert!(!d.cpu_active, "滞回带保持超过上限应强制解除");
+        assert!(
+            d.current_causes.iter().all(|c| !c.contains("CPU usage")),
+            "解除后不应再发射 CPU cause，got: {:?}",
+            d.current_causes
+        );
+
+        // 重新越过进入线 → 恢复
+        d.analyze(&make_sample(95.0, 2000, 10.0));
+        assert!(d.cpu_active, "重新越过进入线应恢复激活");
+    }
+
+    /// 阶段 E5：采样中断防护——与上一 tick 间隔超过 max_tick_gap_secs（睡眠/
+    /// 挂起）时清空跟踪重评估，睡眠时长不得计入卡顿 duration（回归：实测出现
+    /// 过 3.9 天的巨长事件）。
+    #[test]
+    fn analyze_resets_session_after_sampling_gap() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.max_tick_gap_secs = 1; // 测试用：1s 即判定中断
+        let mut d = Detector::new(&config);
+
+        d.analyze(&make_sample(95.0, 2000, 10.0)); // 会话开始
+        assert!(d.stutter_start.is_some());
+
+        // 模拟睡眠/挂起：间隔 > 1s
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        // 恢复后首 tick：若未重置，旧会话时长 1.5s ≥ sustained 会落库巨长事件
+        let r = d.analyze(&make_sample(20.0, 2000, 10.0));
+        assert!(r.is_none(), "采样中断后不得把睡眠时长算进卡顿落库");
+        // 旧会话被清空（若未清空，此处会话应已「结束」并可能已产出事件）
+        assert!(
+            d.current_causes.is_empty(),
+            "中断后状态应已清空，got: {:?}",
+            d.current_causes
+        );
+
+        // 中断后正常重评估：新会话立即满足条件 → 高压样本开新跟踪，
+        // 随即正常样本结束：新会话时长 ~0 < sustained → 不落库
+        d.analyze(&make_sample(95.0, 2000, 10.0));
+        assert!(d.stutter_start.is_some(), "中断后应重新开始跟踪");
+        assert!(
+            d.analyze(&make_sample(20.0, 2000, 10.0)).is_none(),
+            "新会话不足持续时长不应落库"
+        );
+    }
+
+    /// 阶段 E4：频率峰值慢衰减——短时睿频建立的陈旧峰值逐渐让位于持续负载
+    /// 频率，不再长期误判降频（旧行为：峰值只增不减，全核负载全程「掉档」）。
+    #[test]
+    fn thermal_peak_decay_clears_stale_turbo_peak() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 5;
+        config.thermal_freq_peak_decay = 0.95; // 测试用：快速收敛
+        let mut d = Detector::new(&config);
+
+        // 短时睿频建立峰值 5000MHz
+        d.analyze(&make_sample_thermal(80.0, 2000, Some(70.0), Some(5000.0)));
+        // 高温 + 负载 + 持续负载频率 3900（< 0.85×5000=4250）→ 陈旧峰值下误判降频
+        let load = make_sample_thermal(80.0, 2000, Some(95.0), Some(3900.0));
+        d.analyze(&load);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Thermal throttle")),
+            "陈旧峰值未衰减时会误判降频（旧行为基线），got: {:?}",
+            d.current_causes
+        );
+
+        // 持续负载下峰值逐读数衰减（5000 → 4750 → 4512 → …收敛到 3900），
+        // 掉档判定失效 → 不再误判
+        for _ in 0..4 {
+            d.analyze(&load);
+        }
+        assert!(
+            d.current_causes
+                .iter()
+                .all(|c| !c.contains("Thermal throttle")),
+            "峰值衰减收敛后不应再误判降频，got: {:?}",
+            d.current_causes
+        );
     }
 
     // --- spike 绝对下限 ---

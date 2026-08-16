@@ -1249,20 +1249,19 @@ pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
             sample.mem_usage_percent, cfg.mem_threshold_percent
         ));
     }
-    // 提交电荷压力（commit charge）：已提交 / 提交上限
+    // 提交电荷（commit charge）：阶段 E 起降级为「压力证据」，不再作为独立
+    // cause（与实时判定 detector.rs 保持一致）——commit 高只是记账上限逼近，
+    // 本身对性能零影响；真出问题时由可用内存低/分页信号触发。
     let commit_ratio = if sample.commit_limit > 0 {
         sample.commit_bytes as f64 / sample.commit_limit as f64 * 100.0
     } else {
         0.0
     };
-    if commit_ratio > cfg.commit_threshold_percent as f64 {
-        causes.push(format!(
-            "Commit charge {:.1}% > {}%",
-            commit_ratio, cfg.commit_threshold_percent
-        ));
-    }
-    // 分页活动速率（真正的 swap 卡顿信号）
-    if sample.page_reads_per_sec > cfg.page_reads_threshold {
+    // 分页活动速率（真正的 swap 卡顿信号）；与实时判定共用同一证据方法，
+    // 需存在内存/磁盘压力证据（阶段 B 起为放大器口径，两处不漂移）。
+    if sample.page_reads_per_sec > cfg.page_reads_threshold
+        && cfg.paging_has_pressure_evidence(commit_ratio, sample)
+    {
         causes.push(format!(
             "Memory paging {:.1}/s > {}/s",
             sample.page_reads_per_sec, cfg.page_reads_threshold
@@ -2812,6 +2811,31 @@ mod tests {
             out2.iter().any(|c| c.contains("Thermal throttle")),
             "温度降频应包含 Thermal throttle: {:?}",
             out2
+        );
+
+        // 阶段 E2a 回归：提交电荷单独偏高（95% > 90%）→ 不再产出独立 cause
+        // （commit 高只是记账上限逼近，降级为「压力证据」；与实时判定一致）
+        let mut commit_only = Sample::default();
+        commit_only.cpu_usage = 30.0;
+        commit_only.mem_available_mb = 8000;
+        commit_only.mem_usage_percent = 30.0;
+        commit_only.commit_limit = 1_000_000;
+        commit_only.commit_bytes = 950_000;
+        let out3 = detect_core(&commit_only, &cfg);
+        assert!(
+            out3.is_empty(),
+            "提交电荷单独偏高不应触发 what-if cause: {:?}",
+            out3
+        );
+
+        // 阶段 E2a 证据角色：commit 高 + 分页速率高 → 经 "Memory paging" 触发
+        let mut thrash = commit_only.clone();
+        thrash.page_reads_per_sec = 400.0;
+        let out4 = detect_core(&thrash, &cfg);
+        assert!(
+            out4.iter().any(|c| c.contains("Memory paging")),
+            "commit 作为证据应放行 paging: {:?}",
+            out4
         );
     }
 

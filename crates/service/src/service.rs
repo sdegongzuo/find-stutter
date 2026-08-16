@@ -172,9 +172,12 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
             let onset_secs = event.onset_ts.map(|ms| ms / 1000).unwrap_or_else(|| {
                 event.timestamp.timestamp()
             });
-            // F-RC14-b/c/d：卡顿触发后（限频）回溯事件日志 / 模块 / 调用栈
+            // F-RC14-b/c/d：卡顿触发后（限频）回溯事件日志 / 模块 / 调用栈。
+            // 阶段 E：回溯窗口可配置（win_event_backtrack_secs，默认 10s，原固定
+            // 30s）——TDR/崩溃/磁盘错误都在卡顿当下记录，收窄窗口避免无关噪音
+            // 事件注入软件级 cause 并抢走主因归因。
             let now_secs = chrono::Utc::now().timestamp();
-            let since = onset_secs - 30;
+            let since = onset_secs - config.detection.win_event_backtrack_secs as i64;
             let win_events: Vec<WindowsEventRecord> = read_windows_events(since, now_secs)
                 .into_iter()
                 .filter(is_whitelisted_win_event)

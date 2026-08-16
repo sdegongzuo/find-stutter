@@ -398,9 +398,11 @@ pub struct DetectionConfig {
     pub cpu_hysteresis: f32,
     pub mem_threshold_percent: f32,
     pub mem_threshold_mb: u64,
-    /// 提交电荷压力阈值（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
-    /// 接近上限时系统弹「内存不足」并强制分页，往往比「可用物理内存归零」更早预警。
-    /// 与 mem 两个口径互补（任一成立即记内存压力）。
+    /// 提交电荷阈值（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
+    /// 阶段 E（误报治理）起**不再是独立卡顿 cause**：commit 高只是记账上限逼近，
+    /// 本身对性能零影响（开发机常年 90%+ 而系统不卡）；真出问题时必然伴随
+    /// 可用内存低 / 分页信号，由那些信号触发。本阈值保留作「分页压力证据」
+    /// 的判定线（见 detector.rs paging_has_pressure_evidence）。
     pub commit_threshold_percent: f32,
     /// 分页活动速率阈值（/s）：\Memory\Page Reads/sec 超过该值即记为换页抖动
     /// （真正的 swap 卡顿信号，度量换页活动强度而非 swap 已用存量）。
@@ -415,7 +417,45 @@ pub struct DetectionConfig {
     /// 避免空闲时几 B/s ~ 几十 KB/s 的零头波动按倍数误报。
     #[serde(default = "default_spike_min_bps")]
     pub spike_min_bps: u64,
+    /// CPU spike 单样本绝对下限（%）：样本值低于该值不计入「超阈值确认」
+    /// （阶段 E）。纯比率判定会让空闲机的后台任务误报——基线 5% 涨到 16%
+    /// 即 3 倍，但 16% CPU 远不构成卡顿。与网络 spike 的 `spike_min_bps` 同构。
+    #[serde(default = "default_spike_min_cpu_percent")]
+    pub spike_min_cpu_percent: f32,
     pub sustained_seconds: u32,
+    // ===== 阶段 E：内存水位信号滞回 + 稳态抑制 =====
+    /// 内存使用率滞回（百分点）：进入线 > `mem_threshold_percent`；
+    /// 退出线 ≤ `mem_threshold_percent - mem_hysteresis_percent`（默认 90 进 / 85 出）。
+    /// 水位信号在阈值附近抖动时不再反复开/关内存 cause。
+    #[serde(default = "default_mem_hysteresis_percent")]
+    pub mem_hysteresis_percent: f32,
+    /// 可用内存退出线比例：进入线 < `mem_threshold_mb`；退出线 ≥ `mem_threshold_mb ×
+    /// mem_available_exit_ratio`（默认 500 进 / 600 出）。
+    #[serde(default = "default_mem_available_exit_ratio")]
+    pub mem_available_exit_ratio: f32,
+    /// 内存稳态抑制秒数：使用率/可用内存水位连续活跃超过该时长（默认 60s）后，
+    /// 停止发射内存 cause 并锁存，直到水位回落到退出线以下才解锁——
+    /// 常年 90%+ 内存占用的机器不再反复记录用户无感的长事件
+    /// （水位是稳态，颠簸才是事件；真颠簸由 paging cause 独立触发，不受抑制）。
+    #[serde(default = "default_mem_chronic_seconds")]
+    pub mem_chronic_seconds: u32,
+    /// 滞回带最长保持秒数（阶段 E，通用）：信号当前值已低于进入线、仅靠滞回
+    /// 维持激活超过该时长（默认 15s）即强制解除——滞回是防抖工具，不是延长
+    /// 卡顿的工具。适用于 CPU 带内保持、磁盘/DPC/中断/切换的 ×0.5 带及内存水位带。
+    /// 重新越过进入线会重置计时。CPU 持续 >90% 的真饱和不受影响。
+    #[serde(default = "default_hysteresis_hold_max_secs")]
+    pub hysteresis_hold_max_secs: u32,
+    /// 采样最大 tick 间隔秒数（阶段 E）：与上一 tick 的墙钟间隔超过该值
+    /// （默认 15s，覆盖空闲慢速采样 5s 间隔）判定为采样中断（系统睡眠/挂起），
+    /// 清空卡顿跟踪不落库——避免睡眠时长被算进卡顿 duration（实测出现过 3.9 天事件）。
+    #[serde(default = "default_max_tick_gap_secs")]
+    pub max_tick_gap_secs: u32,
+    /// Windows 事件日志回溯窗口秒数（阶段 E）：卡顿触发后只回溯
+    /// `[onset - 本值, now]` 的白名单事件（默认 10s，原固定 30s）。
+    /// TDR/服务崩溃/磁盘错误都在卡顿当下记录，收窄窗口避免无关噪音事件
+    /// 注入软件级 cause 并抢走主因归因。
+    #[serde(default = "default_win_event_backtrack_secs")]
+    pub win_event_backtrack_secs: u32,
     // ===== F-RC2 系统级信号阈值（带滞回）=====
     /// 磁盘繁忙度阈值（% Disk Time）：超过即记为 `DiskBusy` cause。
     /// 替代原来的磁盘 B/s spike——繁忙度才是磁盘真正饱和的真信号。
@@ -453,6 +493,13 @@ pub struct DetectionConfig {
     /// `ThermalThrottle` cause（单一高温但频率正常不算降频）。
     #[serde(default = "default_thermal_freq_drop_ratio")]
     pub thermal_freq_drop_ratio: f32,
+    /// 频率峰值衰减系数（阶段 E）：每次有频率读数时峰值更新为
+    /// `max(当前读数, 峰值 × 本值)`（默认 0.995，读数约 5s 一次）。
+    /// 原实现只增不减——若峰值在短时睿频中建立（如 4.8GHz），此后全核负载的
+    /// 持续频率（3.8GHz < 0.85×4.8）会在整个编译期间被误判降频。
+    /// 慢衰减让陈旧 turbo 峰值逐渐让位于持续负载频率。设为 1.0 恢复旧行为。
+    #[serde(default = "default_thermal_freq_peak_decay")]
+    pub thermal_freq_peak_decay: f32,
     // ===== F-RC14-a 软件根因：句柄 / GDI 泄漏阈值 =====
     /// 句柄泄漏阈值：单进程 handle_count 超过即进入句柄趋势判定（F-RC14-a 方案 B）。
     /// 仅绝对值超过还不够——必须窗口内句柄数持续增长（后半段均值较前半段净增
@@ -482,7 +529,14 @@ impl Default for DetectionConfig {
             disk_rate_spike_ratio: 10.0,
             spike_ratio: 3.0,
             spike_min_bps: 2_000_000,
+            spike_min_cpu_percent: default_spike_min_cpu_percent(),
             sustained_seconds: 3,
+            mem_hysteresis_percent: default_mem_hysteresis_percent(),
+            mem_available_exit_ratio: default_mem_available_exit_ratio(),
+            mem_chronic_seconds: default_mem_chronic_seconds(),
+            hysteresis_hold_max_secs: default_hysteresis_hold_max_secs(),
+            max_tick_gap_secs: default_max_tick_gap_secs(),
+            win_event_backtrack_secs: default_win_event_backtrack_secs(),
             disk_busy_threshold_percent: 95.0,
             disk_io_threshold_ms: 50.0,
             dpc_threshold_percent: 10.0,
@@ -492,10 +546,26 @@ impl Default for DetectionConfig {
             ui_freeze_timeout_ms: 200,
             thermal_threshold_celsius: 85.0,
             thermal_freq_drop_ratio: 0.85,
+            thermal_freq_peak_decay: default_thermal_freq_peak_decay(),
             handle_leak_threshold: default_handle_leak_threshold(),
             handle_leak_growth_threshold: default_handle_leak_growth_threshold(),
             gdi_leak_threshold: default_gdi_leak_threshold(),
         }
+    }
+}
+
+impl DetectionConfig {
+    /// 分页（paging）的压力证据判定：任一成立即视为存在真实内存/磁盘压力。
+    /// 阶段 B 起 paging 是「放大器」，须与压力证据共存才记 cause；阶段 E 起
+    /// 提交电荷也降级为证据之一（不再独立成 cause）。
+    /// 实时判定（detector.rs）与 what-if 单帧重算（analytics.rs detect_core）
+    /// **共用本方法**，保证两处口径一致、不随阈值调整漂移。
+    pub fn paging_has_pressure_evidence(&self, commit_ratio: f64, sample: &Sample) -> bool {
+        commit_ratio > self.commit_threshold_percent as f64
+            || sample.mem_usage_percent > self.mem_threshold_percent
+            || sample.mem_available_mb < self.mem_threshold_mb
+            || sample.disk_busy_percent > self.disk_busy_threshold_percent
+            || sample.disk_avg_io_ms > self.disk_io_threshold_ms
     }
 }
 
@@ -505,6 +575,32 @@ fn default_cpu_hysteresis() -> f32 {
 
 fn default_spike_min_bps() -> u64 {
     2_000_000
+}
+
+// ===== 阶段 E（误报治理）新增默认值 =====
+fn default_spike_min_cpu_percent() -> f32 {
+    50.0
+}
+fn default_mem_hysteresis_percent() -> f32 {
+    5.0
+}
+fn default_mem_available_exit_ratio() -> f32 {
+    1.2
+}
+fn default_mem_chronic_seconds() -> u32 {
+    60
+}
+fn default_hysteresis_hold_max_secs() -> u32 {
+    15
+}
+fn default_max_tick_gap_secs() -> u32 {
+    15
+}
+fn default_win_event_backtrack_secs() -> u32 {
+    10
+}
+fn default_thermal_freq_peak_decay() -> f32 {
+    0.995
 }
 
 // F-RC2 系统级信号阈值默认值
