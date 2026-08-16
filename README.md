@@ -196,6 +196,7 @@ find-stutter.exe upgrade               # 或 --no-build 跳过构建只重装
 | `events [--from][--to][--limit]` | 卡顿事件列表（最新 N 条，时间升序；字段含 `causes` / `cause_kinds` / `primary_cause` / `severity` / `duration_ms` / `culprits` / `onset_ts`；`--limit` 默认 100） |
 | `samples [--from][--to][--limit]` | 样本区间查询（最新 N 条，时间升序；样本量大（1Hz、保留 30 天），`--limit` 默认 1000，可调大） |
 | `analysis [--from][--to]` | 聚合分析一次输出全部：`kpi` / `trend` / `culprits`（元凶榜）/ `cause_types` / `root_cause`（最近事件根因报告） |
+| `query "<SQL>" [--db <路径>]` | 只读 SQL 直查（JSON 行数组，列名→值）。诊断期的灵活聚合逃生口：按天计数 / 分布统计 / 连续段分析等一次性查询；固定口径查询优先用 events / samples / analysis。仅放行单条 SELECT / WITH / PRAGMA（写语句、多语句拼接被拒，连接本身只读，双层防护）；`--db` 默认取 config 的 `storage.db_path`，可指向 verify.db 等 |
 | `config` | 当前生效配置（config.toml 加载结果，含默认值回退后的有效值） |
 | `status` | 服务状态：SCM 状态 + 心跳健康（Running/Stale/Stopped）+ db 路径 |
 | `process [--limit]` | 现场采集一次 top 进程快照（不写库；`--limit` 默认 10） |
@@ -211,6 +212,12 @@ find-stutter.exe samples --from 2026-08-16 --limit 100
 find-stutter.exe analysis | jq .kpi
 find-stutter.exe status | jq .heartbeat.health
 find-stutter.exe export --from 2026-07-25 --to 2026-07-26 --output today.csv
+
+# query：灵活聚合（诊断误报/分布时不再需要 python 直连 db）
+find-stutter.exe query "PRAGMA table_info(stutter_events)"          # 探查表结构
+find-stutter.exe query "SELECT date(timestamp,'localtime') AS day, COUNT(*) AS events, SUM(duration_ms) AS total_ms FROM stutter_events GROUP BY 1 ORDER BY 1"
+find-stutter.exe query "SELECT COUNT(*) AS n, MIN(context_switches_per_sec) AS mn, MAX(context_switches_per_sec) AS mx, ROUND(AVG(context_switches_per_sec)) AS avg FROM samples"
+find-stutter.exe query "SELECT context_switches_per_sec, cpu_usage FROM samples WHERE context_switches_per_sec > 150000 ORDER BY 1 DESC LIMIT 5"
 ```
 
 ### `find-stutter-service.exe`（service 端）

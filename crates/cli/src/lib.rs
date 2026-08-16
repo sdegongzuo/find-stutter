@@ -1,7 +1,8 @@
 //! find-stutter CLI（ADR-0001 界面轴·agent）。
 //!
 //! 一等查询库：`events` / `samples` / `analysis` / `config` / `status` / `process`
-//! 六件套子命令 + `export`（CSV，行为与旧版一致）+ `upgrade`（决策 6 的提权例外）。
+//! 六件套子命令 + `query`（只读 SQL 逃生口，诊断期灵活聚合）+ `export`（CSV，
+//! 行为与旧版一致）+ `upgrade`（决策 6 的提权例外）。
 //! `crates/bin` 只做分发：无参数 = 启动 GUI；子命令 = 调这里的 [`dispatch`]。
 //!
 //! ## 契约（决策 1/3）
@@ -79,6 +80,17 @@ pub enum Commands {
         /// 结束时间（默认：现在）
         #[arg(long)]
         to: Option<String>,
+    },
+
+    /// 只读 SQL 直查（JSON 行数组）：诊断期的灵活聚合逃生口——按天计数 /
+    /// 分布统计 / 连续段分析等；固定口径查询优先用 events / samples / analysis
+    Query {
+        /// 单条只读 SQL（SELECT / WITH / PRAGMA；写语句与多语句拼接会被拒绝）
+        sql: String,
+
+        /// 数据库路径（默认：config.toml 的 storage.db_path；可指向 verify.db 等）
+        #[arg(long)]
+        db: Option<String>,
     },
 
     /// 当前生效配置（JSON：config.toml 加载结果，含默认值回退后的有效值）
@@ -172,6 +184,15 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<DispatchOutcome> {
         Some(Commands::Analysis { from, to }) => dispatch_db_query(|conn| {
             query::analysis_json(conn, from.as_deref(), to.as_deref())
         }),
+
+        // query 需要 --db 覆盖能力，不走 dispatch_db_query 的固定路径
+        Some(Commands::Query { sql, db }) => {
+            let db_path = db.clone().unwrap_or_else(query::db_path_from_config);
+            let conn = query::open_db(std::path::Path::new(&db_path))?;
+            let v = query::sql_json(&conn, sql)?;
+            println_json(&v);
+            Ok(DispatchOutcome::Done)
+        }
 
         Some(Commands::Config) => {
             println_json(&query::config_json());
@@ -299,6 +320,33 @@ mod tests {
                 assert_eq!(to.as_deref(), Some("2026-08-16"));
             }
             other => panic!("应解析为 Analysis，实际 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_query_positional_sql_and_db_flag() {
+        let cli = Cli::try_parse_from([
+            "find-stutter", "query",
+            "SELECT COUNT(*) AS n FROM stutter_events",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Query { sql, db }) => {
+                assert_eq!(sql, "SELECT COUNT(*) AS n FROM stutter_events");
+                assert!(db.is_none(), "未指定 --db 时应为 None（回退 config 路径）");
+            }
+            other => panic!("应解析为 Query，实际 {:?}", other),
+        }
+
+        let cli =
+            Cli::try_parse_from(["find-stutter", "query", "--db", "verify.db", "SELECT 1"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Query { sql, db }) => {
+                assert_eq!(sql, "SELECT 1");
+                assert_eq!(db.as_deref(), Some("verify.db"));
+            }
+            other => panic!("应解析为 Query，实际 {:?}", other),
         }
     }
 

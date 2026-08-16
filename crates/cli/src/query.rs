@@ -5,8 +5,9 @@
 //! - 键英文、值保留原文（severity 用 minor/major/critical 原词、cause 文案原样）；
 //! - 时间一律 ISO8601（RFC3339，UTC）；
 //! - `--from/--to/--limit` 过滤；events / samples 顶层输出 JSON 数组，便于 jq 管道；
-//! - 查询全部走 `find_stutter_core::analytics` 的既有函数（口径与 GUI 分析页一致，
-//!   不另写 SQL 聚合，避免漂移）。
+//! - 固定口径查询全部走 `find_stutter_core::analytics` 的既有函数（口径与 GUI
+//!   分析页一致，不另写 SQL 聚合，避免漂移）；[`sql_json`]（`query` 子命令）是
+//!   刻意保留的例外——诊断期的灵活聚合逃生口，不承载任何固定口径。
 
 use std::path::Path;
 
@@ -52,6 +53,47 @@ pub fn db_path_from_config() -> String {
         Ok(c) => c.storage.db_path,
         Err(_) => Config::default().storage.db_path,
     }
+}
+
+/// `query` 子命令：只读 SQL 直查，行数组 JSON（列名 → 值）。
+///
+/// 定位：`events` / `samples` / `analysis` 是**固定口径**查询（走 analytics，
+/// 与 GUI 一致不漂移）；`query` 是诊断期的**灵活逃生口**——按天分组计数、
+/// 分布统计、最长连续段这类一次性聚合不适合各建子命令，交给 SQL 表达。
+/// 安全边界（双层）：
+/// 1. 连接只读（[`open_db`] → `analytics::open_readonly`，SQLite 层拒绝任何写）；
+/// 2. 语句级 `Statement::readonly()` 校验，仅放行 SELECT / WITH / PRAGMA 等读
+///    语句（写语句在执行前即被拒，错误信息更友好）；`prepare` 拒绝多语句拼接，
+///    防止「第一条读语句掩护后续写语句」。
+/// 值映射：TEXT→字符串、INTEGER→整数、REAL→浮点、NULL→null、BLOB→hex 字符串。
+/// 同名列（如自联结 SELECT 同名列）后者覆盖前者，与 SQLite 行为一致由调用方规避。
+pub fn sql_json(conn: &Connection, sql: &str) -> anyhow::Result<Value> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| anyhow::anyhow!("SQL 解析失败: {}", e))?;
+    if !stmt.readonly() {
+        anyhow::bail!("只允许只读语句（SELECT / WITH / PRAGMA），写操作被拒绝");
+    }
+    let names: Vec<String> = stmt.column_names().iter().map(|s| s.to_string()).collect();
+    let mut rows = stmt.query([])?;
+    let mut arr = Vec::new();
+    while let Some(row) = rows.next()? {
+        let mut m = Map::new();
+        for (i, name) in names.iter().enumerate() {
+            let v = match row.get_ref(i)? {
+                rusqlite::types::ValueRef::Null => Value::Null,
+                rusqlite::types::ValueRef::Integer(n) => json!(n),
+                rusqlite::types::ValueRef::Real(f) => json!(f),
+                rusqlite::types::ValueRef::Text(t) => json!(String::from_utf8_lossy(t)),
+                rusqlite::types::ValueRef::Blob(b) => json!(
+                    b.iter().map(|x| format!("{:02x}", x)).collect::<String>()
+                ),
+            };
+            m.insert(name.clone(), v);
+        }
+        arr.push(Value::Object(m));
+    }
+    Ok(Value::Array(arr))
 }
 
 /// `events` 子命令：时间范围内最近的 `limit` 条卡顿事件（时间升序输出）。
@@ -332,6 +374,91 @@ mod tests {
     use find_stutter_core::logger::local_today_bounds_utc;
     use find_stutter_core::{Logger, ProcessBrief, Sample, Severity, StorageConfig};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// `query` 子命令：聚合查询（GROUP BY / COUNT / AVG）返回行数组 JSON，
+    /// NULL 列映射为 JSON null。
+    #[test]
+    fn sql_json_aggregates_rows() {
+        let db = unique_db("sqlq");
+        seed(&db, 3, 5);
+        let conn = open_db(Path::new(&db)).unwrap();
+
+        let v = sql_json(
+            &conn,
+            "SELECT severity, COUNT(*) AS n FROM stutter_events GROUP BY severity",
+        )
+        .unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["severity"].as_str().unwrap(), "major");
+        assert_eq!(arr[0]["n"].as_i64().unwrap(), 3);
+
+        // 无匹配行的聚合：COUNT=0（整数），MAX=NULL（JSON null）
+        let v = sql_json(
+            &conn,
+            "SELECT COUNT(*) AS c, MAX(cpu_usage) AS m FROM samples WHERE cpu_usage > 100",
+        )
+        .unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr[0]["c"].as_i64().unwrap(), 0);
+        assert!(arr[0]["m"].is_null(), "MAX 无匹配应为 null");
+
+        // 浮点与文本列映射
+        let v = sql_json(
+            &conn,
+            "SELECT ROUND(AVG(cpu_usage), 1) AS avg_cpu FROM samples",
+        )
+        .unwrap();
+        let avg = v.as_array().unwrap()[0]["avg_cpu"].as_f64().unwrap();
+        assert!((avg - 30.0).abs() < 0.5, "seed 样本 cpu=30，got {}", avg);
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// `query` 子命令：写语句在执行前即被语句级 readonly 校验拒绝
+    /// （连接本身也只读，双层防护中的第一层先行给出友好错误）。
+    #[test]
+    fn sql_json_rejects_write_statements() {
+        let db = unique_db("sqlw");
+        seed(&db, 1, 1);
+        let conn = open_db(Path::new(&db)).unwrap();
+        for sql in [
+            "INSERT INTO stutter_events (timestamp) VALUES ('x')",
+            "DELETE FROM samples",
+            "UPDATE samples SET cpu_usage = 0",
+            "DROP TABLE samples",
+            "CREATE TABLE t (x)",
+        ] {
+            let err = sql_json(&conn, sql);
+            assert!(err.is_err(), "写语句应被拒绝: {}", sql);
+        }
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// `query` 子命令：多语句拼接被拒（防止第一条读语句掩护后续写语句）。
+    #[test]
+    fn sql_json_rejects_multiple_statements() {
+        let db = unique_db("sqlm");
+        seed(&db, 1, 1);
+        let conn = open_db(Path::new(&db)).unwrap();
+        assert!(sql_json(&conn, "SELECT 1; DELETE FROM samples").is_err());
+        std::fs::remove_file(&db).ok();
+    }
+
+    /// `query` 子命令：PRAGMA 只读语句可用（agent 探查 schema 的入口）。
+    #[test]
+    fn sql_json_allows_pragma_table_info() {
+        let db = unique_db("sqlp");
+        seed(&db, 1, 1);
+        let conn = open_db(Path::new(&db)).unwrap();
+        let v = sql_json(&conn, "PRAGMA table_info(stutter_events)").unwrap();
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty(), "stutter_events 应有列定义");
+        assert!(
+            arr.iter().any(|r| r["name"].as_str() == Some("timestamp")),
+            "应包含 timestamp 列"
+        );
+        std::fs::remove_file(&db).ok();
+    }
 
     fn unique_db(name: &str) -> String {
         let nanos = SystemTime::now()
