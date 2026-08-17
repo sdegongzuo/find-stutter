@@ -2614,9 +2614,11 @@ impl ProcessListWindow {
             }
         });
 
-        // 自动刷新：首帧用 1s 快速间隔。采样线程首轮 sysinfo 初始化可能
-        // 耗时数秒，快速 tick 保证窗口一打开、数据一就绪就立即渲染；
-        // 一旦渲染到非空数据，切换回用户配置的刷新间隔（标题栏下拉可调）。
+        // 自动刷新：首帧用 150ms 快速间隔。采样线程首轮 sysinfo 初始化 +
+        // 友好名版本资源读取可能耗时数秒，快速 tick 保证窗口一打开、数据
+        // 一就绪就立即渲染（间隔即白屏下限，不能太大；空 cache 的 render
+        // 是毫秒级，密集 tick 无代价）；一旦渲染到非空数据，切换回用户
+        // 配置的刷新间隔（标题栏下拉可调）。
         let weak_tick = ui.as_weak();
         let sort_tick = sort.clone();
         let search_tick = search.clone();
@@ -2630,7 +2632,7 @@ impl ProcessListWindow {
         let first_done_cb = first_done.clone();
         tick_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_millis(1000),
+            Duration::from_millis(150),
             move || {
                 if let Some(ui) = weak_tick.upgrade() {
                     render(
