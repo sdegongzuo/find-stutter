@@ -20,7 +20,9 @@ pub fn snapshot_json(limit: usize) -> anyhow::Result<Value> {
 /// （只要系统摘要，不列进程）。
 pub fn sample_to_json(s: &Sample, limit: usize) -> Value {
     let mut procs: Vec<find_stutter_core::ProcessBrief> = s.top_processes.clone();
-    // top_processes 已是采集器合并后的次序（CPU 维度优先）；按 CPU 再截 limit 个
+    // top_processes 次序（采集器 merge_top(8,8,12)）：CPU 维度 top 8 在前、
+    // 内存维度去重补充在后；limit ≤ 8 时等价于「按 CPU 截取」，
+    // 超过 8 后混入内存维度进程（help 语义只承诺「最多返回进程数」）
     procs.truncate(limit);
     let top: Vec<Value> = procs
         .iter()

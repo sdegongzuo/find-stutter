@@ -497,6 +497,10 @@ export component ProcessList inherits Window {
     // 右下角 resize 手柄：传 dx/dy（逻辑像素）
     callback resize-requested(length, length);
 
+    // 列表滚动偏移（viewport-y，未滚动=0，向下滚动为负；Rust 端命中测试用：
+    // 连续右键切换时把鼠标 y 换算成列表行号需扣除滚动量）
+    out property <length> list-scroll-y: process-list-view.viewport-y;
+
     // 标题栏拖动（仅标题栏区域接收拖动事件）
     callback drag-moved(length, length);
 
@@ -714,7 +718,7 @@ export component ProcessList inherits Window {
             }
 
             // 进程列表（自绘多列，超出截断 + Tooltip；聚合行点击展开/收起，右键弹菜单）
-            ListView {
+            process-list-view := ListView {
                 for row in root.process-model : ProcessRow {
                     data: row;
                     group-toggle(key) => { root.group-toggle(key); }

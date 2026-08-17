@@ -84,8 +84,10 @@ pub struct ProcessSampler {
     /// 用于进程行的「端口」列展示；缓存避免每帧重复 GetExtendedTcpTable）
     port_cache: HashMap<u32, Vec<u16>>,
     /// pid → 展示名（友好名）缓存：避免每 tick 对每个进程重复读 exe 版本信息。
-    /// 每次 sample 后按当前存在的 pid 裁剪，防止内存无限增长 / pid 复用串味。
-    name_cache: HashMap<u32, String>,
+    /// 值同时记录来源 exe 名：每次 sample 后按当前存在的 pid 裁剪，且 exe 名
+    /// 不匹配（同周期内 pid 被其他进程复用）时视为失效重查——单独裁剪防不住
+    /// 「旧进程退出、新进程立刻复用同一 pid」的串味。
+    name_cache: HashMap<u32, (String, String)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -235,14 +237,15 @@ fn annotate_chromium_rows(rows: &mut [ProcessRow], roles: &HashMap<u32, Chromium
 /// 沿父链向上找 WebView2 进程的宿主 PID：
 /// 一直走到第一个不在 wv_pids 集合中的父进程（即宿主应用）。
 /// 父链断裂 / 环 / 找不到时返回 None。
+/// `idx`：pid → 行索引（调用方预建；逐层线性 find 会放大成 O(组内进程×链长×总进程数)）。
 fn webview2_host_pid(
     pid: u32,
-    rows: &[ProcessRow],
+    idx: &std::collections::HashMap<u32, &ProcessRow>,
     wv_pids: &std::collections::HashSet<u32>,
 ) -> Option<u32> {
     let mut cur = pid;
     for _ in 0..16 {
-        let row = rows.iter().find(|r| r.pid == cur)?;
+        let row = idx.get(&cur).copied()?;
         let parent = row.parent_pid;
         if parent == 0 || parent == cur {
             return None;
@@ -269,11 +272,14 @@ fn push_webview2_groups(
         .filter(|r| r.name.eq_ignore_ascii_case("msedgewebview2.exe"))
         .map(|r| r.pid)
         .collect();
+    // pid → 行索引：宿主查找沿父链逐级跳转，预建索引避免逐层线性扫描
+    let idx: std::collections::HashMap<u32, &ProcessRow> =
+        all_rows.iter().map(|r| (r.pid, r)).collect();
 
     let mut by_host: std::collections::BTreeMap<u32, Vec<&ProcessRow>> = Default::default();
     let mut no_host: Vec<&ProcessRow> = Vec::new();
     for r in group_rows {
-        match webview2_host_pid(r.pid, all_rows, &wv_pids) {
+        match webview2_host_pid(r.pid, &idx, &wv_pids) {
             Some(host) => by_host.entry(host).or_default().push(r),
             None => no_host.push(r),
         }
@@ -309,9 +315,15 @@ fn push_webview2_groups(
 
 impl ProcessSampler {
     /// 创建采样器并预热（第一次 refresh 建立 CPU 基线）。
+    ///
+    /// 只刷新本页所需（进程 + CPU + 内存）：`new_all`/`refresh_all` 还会枚举
+    /// 磁盘 / 网络接口 / 硬件组件，而 new() 在 UI 线程（右键菜单回调）执行，
+    /// 全量枚举会让窗口打开瞬间冻结数百毫秒。
     pub fn new() -> Self {
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all(); // 预热：只建立基线
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
         Self {
             total_mem: sys.total_memory().max(1),
             sys,
@@ -328,7 +340,11 @@ impl ProcessSampler {
     /// 显示阶段再按聚合后的行数限制，避免「同组部分实例被截掉、
     /// 剩下的看起来像独立进程」。
     pub fn sample(&mut self) -> Vec<ProcessRow> {
-        self.sys.refresh_all();
+        // 精确刷新（进程 + CPU + 内存）：refresh_all 每轮还会枚举磁盘 /
+        // 网络接口 / 组件，本页不用，纯浪费（每 tick 都付一次）
+        self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        self.sys.refresh_cpu_all();
+        self.sys.refresh_memory();
 
         let now = Instant::now();
         let dt = self.prev_time.map(|t| now.duration_since(t).as_secs_f64());
@@ -348,12 +364,8 @@ impl ProcessSampler {
 
         for (pid, p) in self.sys.processes() {
             let pid_u32 = pid.as_u32();
-            let io = process_io_counters(pid_u32);
-            let cur = IoSnapshot {
-                read: io.map(|c| c.ReadTransferCount).unwrap_or(0),
-                write: io.map(|c| c.WriteTransferCount).unwrap_or(0),
-                other: io.map(|c| c.OtherTransferCount).unwrap_or(0),
-            };
+            // 一次句柄取 IO 计数器 + 内存明细（热路径合并，见函数注释）
+            let (cur, detail) = process_io_and_memory(pid_u32);
 
             // 差分速率：需要上次基线 + 时间间隔
             let (read_bps, write_bps, net_bps) = match (self.prev_io.get(&pid_u32), dt) {
@@ -378,7 +390,6 @@ impl ProcessSampler {
             // - 专用工作集（Private Working Set = PrivateWorkingSetSize）→「进程」页「内存」列
             // 取不到（权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
             let ws = p.memory();
-            let detail = process_memory_detail(pid_u32);
             let mem = detail.map_or(ws, |d| d.0); // 提交大小
             let pws = detail.map_or(ws, |d| d.1); // 专用工作集
             // 监听/UDP 端口：port_map 里有就取，没有就是空（绝大多数进程无端口）
@@ -425,15 +436,19 @@ impl ProcessSampler {
         rows
     }
 
-    /// 取进程展示名（友好名），按 pid 缓存。
+    /// 取进程展示名（友好名），按 pid 缓存（带 exe 名校验防 pid 复用串味）。
     /// 优先用 exe 的 `FileDescription`（如 "Google Chrome"）；取不到回退 exe 名。
     /// 与自由函数 `friendly_name_for`（真正读版本信息）区分：本方法只负责缓存。
     fn cached_display_name(&mut self, pid: u32, exe_name: &str) -> String {
-        if let Some(cached) = self.name_cache.get(&pid) {
-            return cached.clone();
+        if let Some((cached_exe, cached)) = self.name_cache.get(&pid) {
+            if cached_exe == exe_name {
+                return cached.clone();
+            }
+            // pid 被不同 exe 的进程复用 → 缓存失效，落入下方重查
         }
         let display = friendly_name_for(pid).unwrap_or_else(|| exe_name.to_string());
-        self.name_cache.insert(pid, display.clone());
+        self.name_cache
+            .insert(pid, (exe_name.to_string(), display.clone()));
         display
     }
 
@@ -464,65 +479,6 @@ fn mem_pct(bytes: u64, total_bytes: u64) -> f32 {
     (bytes as f64 / total_bytes.max(1) as f64 * 100.0) as f32
 }
 
-/// 按 CPU 降序排序并截断（纯函数，可单测）。
-pub fn rank_processes(rows: &mut [ProcessRow], limit: usize) -> Vec<ProcessRow> {
-    rows.sort_by(|a, b| {
-        b.cpu_usage
-            .partial_cmp(&a.cpu_usage)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    rows.iter().take(limit).cloned().collect()
-}
-
-/// 按指定列排序（任务管理器风格；纯函数，可单测）。
-/// `column`：pid / name / cpu / mem / disk / net / port；`ascending`：升序。
-pub fn sort_processes(rows: &mut [ProcessRow], column: &str, ascending: bool) {
-    let cmp = |a: &ProcessRow, b: &ProcessRow| -> std::cmp::Ordering {
-        let o = match column {
-            "pid" => a.pid.cmp(&b.pid),
-            "name" => a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()),
-            "cpu" => a.cpu_usage.partial_cmp(&b.cpu_usage).unwrap_or(std::cmp::Ordering::Equal),
-            "mem" => a.memory_bytes.cmp(&b.memory_bytes),
-            "disk" => (a.disk_read_bps + a.disk_write_bps).cmp(&(b.disk_read_bps + b.disk_write_bps)),
-            "net" => a.net_bps.cmp(&b.net_bps),
-            // 端口：按端口数量排序（无端口的沉底升序 / 顶端降序）；
-            // 同数量时按最小端口号排序，结果稳定。
-            "port" => {
-                let an = a.ports.len();
-                let bn = b.ports.len();
-                let by_count = an.cmp(&bn);
-                if by_count != std::cmp::Ordering::Equal {
-                    by_count
-                } else {
-                    let a_min = a.ports.first().copied().unwrap_or(u16::MAX);
-                    let b_min = b.ports.first().copied().unwrap_or(u16::MAX);
-                    a_min.cmp(&b_min)
-                }
-            }
-            _ => a.pid.cmp(&b.pid),
-        };
-        if ascending { o } else { o.reverse() }
-    };
-    rows.sort_by(cmp);
-}
-
-/// 按关键字过滤进程（名称 / PID 子串匹配，大小写不敏感；纯函数，可单测）。
-/// 空关键字返回全部。
-pub fn filter_processes(rows: &[ProcessRow], keyword: &str) -> Vec<ProcessRow> {
-    let kw = keyword.trim().to_ascii_lowercase();
-    if kw.is_empty() {
-        return rows.to_vec();
-    }
-    rows.iter()
-        .filter(|r| {
-            r.name.to_ascii_lowercase().contains(&kw)
-                || r.pid.to_string().contains(&kw)
-                || r.display_name.to_ascii_lowercase().contains(&kw)
-        })
-        .cloned()
-        .collect()
-}
-
 /// 一个聚合组：树状两级结构（主进程 → 子进程）。
 ///
 /// 任务管理器折叠效果的聚合规则：
@@ -550,6 +506,15 @@ impl GroupedProcess {
     pub fn total_count(&self) -> usize {
         1 + self.children.len()
     }
+}
+
+/// 聚合组的展开键（小写 exe 名 + root pid，如 `chrome.exe:100`）。
+///
+/// 只用 exe 名会导致**同名多组联动展开**（同名多 root 组、WebView2 按宿主
+/// 分组都会产生同名组）；带上 root pid 后每组独立。代价是组内 root 进程
+/// 重启（pid 变化）后展开状态丢失——与任务管理器行为一致，可接受。
+fn group_key(g: &GroupedProcess) -> String {
+    format!("{}:{}", g.name.to_ascii_lowercase(), g.root.pid)
 }
 
 /// 按「同名 + PPID 父子关系」聚合（纯函数，可单测）。
@@ -662,6 +627,10 @@ fn find_root_pid(
 }
 
 /// 聚合组 → 汇总行（主进程 + 子进程求和的聚合值）。
+///
+/// 注意 `pid` 保持 root 的 pid（不取组内最小值）：组行的右键「结束进程树」
+/// 沿 parent_pid 枚举 root 的子树，若被 pid 回绕后更小的子进程顶替，
+/// 枚举出的就不是该组的主树了。
 pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
     let mut acc = g.root.clone();
     for r in &g.children {
@@ -672,7 +641,6 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
         acc.disk_write_bps = acc.disk_write_bps.saturating_add(r.disk_write_bps);
         acc.net_bps = acc.net_bps.saturating_add(r.net_bps);
         acc.net_total_bytes = acc.net_total_bytes.saturating_add(r.net_total_bytes);
-        acc.pid = acc.pid.min(r.pid);
     }
     acc
 }
@@ -802,12 +770,21 @@ pub fn kill_process(pid: u32) -> Result<(), KillError> {
             }
         };
         let ok = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
         if ok.is_ok() {
-            Ok(())
-        } else {
-            // TerminateProcess 失败通常是权限不足（进程被保护 / 需要更高权限）
+            let _ = CloseHandle(handle);
+            return Ok(());
+        }
+        // 细分失败原因（与 OpenProcess 分支同一套映射）：进程在 Open 与
+        // Terminate 之间退出时这里会报 ERROR_ACCESS_DENIED/INVALID_PARAMETER，
+        // 不应一律归为权限不足（会误弹 UAC 提权重试框）
+        let code = ok.err().map(|e| e.code().0 as u32).unwrap_or(0);
+        let _ = CloseHandle(handle);
+        if code == ERROR_INVALID_PARAMETER.0 || code == ERROR_NOT_FOUND.0 {
+            Err(KillError::NotFound)
+        } else if code == ERROR_ACCESS_DENIED.0 {
             Err(KillError::Permission)
+        } else {
+            Err(KillError::Other)
         }
     }
 }
@@ -839,7 +816,8 @@ pub fn collect_process_tree(root: u32, rows: &[ProcessRow]) -> Vec<u32> {
     for r in rows {
         children_of.entry(r.parent_pid).or_default().push(r.pid);
     }
-    // 2) BFS 收集全部后代（不含 root）并记录深度（距 root 的层数），用集合去重防环
+    // 2) 栈式遍历（DFS）收集全部后代（不含 root）并记录深度（距 root 的层数），
+    //    用集合去重防环（结果最终按深度重排，遍历顺序不影响正确性）
     let mut order: Vec<(u32, u32)> = Vec::new(); // (pid, depth)
     let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
     let mut queue: Vec<(u32, u32)> = vec![(root, 0)];
@@ -1018,7 +996,9 @@ fn set_clipboard_text(text: &str) {
     use windows::Win32::System::DataExchange::{
         CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
     };
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
     // CF_UNICODETEXT = 13（windows crate 把它放 Win32_System_Ole 下且是 newtype，
     // 为不引入整个 OLE feature，直接用标准值）
     const CF_UNICODETEXT: u32 = 13;
@@ -1035,7 +1015,12 @@ fn set_clipboard_text(text: &str) {
                 if !ptr.is_null() {
                     std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr as *mut u16, wide.len());
                     let _ = GlobalUnlock(h);
-                    let _ = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0)));
+                    // SetClipboardData 成功后系统接管内存；失败时调用方负责释放
+                    if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(h.0))).is_err() {
+                        let _ = windows::Win32::Foundation::GlobalFree(Some(h));
+                    }
+                } else {
+                    let _ = windows::Win32::Foundation::GlobalFree(Some(h));
                 }
             }
         }
@@ -1251,7 +1236,7 @@ fn wide_static(s: &str) -> Vec<u16> {
 /// 用于「连续右键切换」：菜单被右键关闭后，在鼠标新位置重新定位行。
 /// 命中条件：鼠标在本窗口内 + y 落在列表行区域（布局硬编码：
 /// padding 6 + 标题栏 30 + spacing 6 + 列头 22 + spacing 6 = 列表起始 y=70，
-/// 行高 26，均逻辑像素，需按 scale 换算）。
+/// 行高 29，均逻辑像素，需按 scale 换算；列表已滚动时再扣除 viewport-y）。
 fn hit_test_row(ui: &crate::ProcessList, sx: i32, sy: i32) -> Option<(i32, String)> {
     use slint::Model;
     use windows::Win32::Foundation::POINT;
@@ -1271,7 +1256,8 @@ fn hit_test_row(ui: &crate::ProcessList, sx: i32, sy: i32) -> Option<(i32, Strin
     let y_logical = client_pt.y as f32 / scale;
 
     // 列表布局：常量见模块级 LIST_TOP / ROW_HEIGHT（与 overlay.slint 双源同步）
-    let rel = y_logical - LIST_TOP;
+    // 列表可滚动：鼠标 y 还需扣除 viewport-y 偏移（未滚动=0，向下滚动为负）
+    let rel = y_logical - LIST_TOP - ui.get_list_scroll_y();
     if rel < 0.0 {
         return None;
     }
@@ -1809,21 +1795,58 @@ fn ip4_text(addr: u32) -> String {
     )
 }
 
-/// 读进程 I/O 计数器（`GetProcessIoCounters`）。
+/// 读进程 I/O 计数器 + 内存明细（一次 `OpenProcess`，同句柄取两类信息）。
+///
+/// 采样热路径专用：原来 IO 计数器与内存明细各开一次句柄，每 tick 每进程
+/// 两对 Open/Close；合并后减半。打开失败时返回 `(全 0, None)`——两个 API
+/// 的权限要求相同（PROCESS_QUERY_LIMITED_INFORMATION），失败高度相关，
+/// 独立退路的收益可以忽略。
 #[cfg(windows)]
-fn process_io_counters(pid: u32) -> Option<windows::Win32::System::Threading::IO_COUNTERS> {
+fn process_io_and_memory(pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX2,
+    };
     use windows::Win32::System::Threading::{
         GetProcessIoCounters, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-        let mut counters: windows::Win32::System::Threading::IO_COUNTERS = std::mem::zeroed();
-        let result = GetProcessIoCounters(handle, &mut counters);
+        let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(h) => h,
+            Err(_) => return (IoSnapshot { read: 0, write: 0, other: 0 }, None),
+        };
+        let mut counters: windows::Win32::System::Threading::IO_COUNTERS =
+            std::mem::zeroed();
+        let io = if GetProcessIoCounters(handle, &mut counters).is_ok() {
+            IoSnapshot {
+                read: counters.ReadTransferCount,
+                write: counters.WriteTransferCount,
+                other: counters.OtherTransferCount,
+            }
+        } else {
+            IoSnapshot { read: 0, write: 0, other: 0 }
+        };
+        // EX2 结构传基结构指针（Win32 惯例，与 process_memory_detail 一致）
+        let mut mc: PROCESS_MEMORY_COUNTERS_EX2 = std::mem::zeroed();
+        mc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        let p = &mut mc as *mut PROCESS_MEMORY_COUNTERS_EX2 as *mut PROCESS_MEMORY_COUNTERS;
+        let mem = if GetProcessMemoryInfo(handle, p, mc.cb).is_ok() {
+            Some((
+                mc.PagefileUsage as u64,
+                mc.PrivateWorkingSetSize as u64,
+                mc.WorkingSetSize as u64,
+            ))
+        } else {
+            None
+        };
         let _ = CloseHandle(handle);
-        result.ok()?;
-        Some(counters)
+        (io, mem)
     }
+}
+
+#[cfg(not(windows))]
+fn process_io_and_memory(_pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
+    (IoSnapshot { read: 0, write: 0, other: 0 }, None)
 }
 
 /// 枚举当前运行的 Windows 服务 → pid → 服务显示名列表。
@@ -2080,12 +2103,14 @@ fn group_display(
     let cpu_high = cpu_pct > highlight_pct;
     let mem_high = mem_pct > highlight_pct;
     let count = g.total_count() as i32;
+    // 展开键唯一化（exe:root_pid）：见 group_key 注释
+    let gkey = group_key(g);
     let (title, full_name, group_key) = if g.name.eq_ignore_ascii_case("svchost.exe") {
         if g.services.is_empty() {
             (
                 format!("服务宿主: svchost ({})", count),
                 format!("服务宿主: svchost.exe（{} 个实例）", count),
-                "svchost.exe".to_string(),
+                gkey,
             )
         } else {
             let shown: Vec<String> = g.services.iter().take(2).cloned().collect();
@@ -2103,12 +2128,12 @@ fn group_display(
                     count,
                     g.services.join(", ")
                 ),
-                "svchost.exe".to_string(),
+                gkey,
             )
         }
     } else {
         // 非 svchost：展示名优先用友好名（组内同 exe，取 root 的 display_name）；
-        // 原始 exe 名作为悬浮/备用，group_key 仍用 exe 名（保证展开匹配不变）
+        // 原始 exe 名作为悬浮/备用，展开键用 group_key（exe:root_pid 唯一）
         if g.root.display_name != g.name {
             (
                 format!("{} ({})", g.root.display_name, count),
@@ -2116,13 +2141,13 @@ fn group_display(
                     "{}（{}，{} 个实例，PID {}）",
                     g.root.display_name, g.name, count, agg.pid
                 ),
-                g.name.clone(),
+                gkey,
             )
         } else {
             (
                 format!("{} ({})", g.name, count),
                 format!("{}（{} 个实例，PID {}）", g.name, count, agg.pid),
-                g.name.clone(),
+                gkey,
             )
         }
     };
@@ -2233,12 +2258,16 @@ impl ProcessListWindow {
         let nb_cpus: Arc<Mutex<usize>> = Arc::new(Mutex::new(
             sampler.lock().unwrap().cpu_count().max(1),
         ));
+        // 服务映射缓存（svchost 聚合用；采样线程 30s TTL 刷新，render 只读）
+        let services_cache: Arc<Mutex<std::collections::HashMap<u32, Vec<String>>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         // 渲染共享状态（各回调 clone 一份 Arc，避免每个闭包 clone 4 个 Arc）
         let shared: Arc<RenderShared> = Arc::new(RenderShared {
             nb_cpus: nb_cpus.clone(),
             highlight_pct: highlight_pct.clone(),
             total_mem: total_mem.clone(),
             model_arc: model_arc.clone(),
+            services: services_cache.clone(),
         });
         // 最近一次打开的详情文本（详情面板「复制」按钮用）
         let detail_text: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -2255,10 +2284,12 @@ impl ProcessListWindow {
         let total_thread = total_mem.clone();
         let sample_now_thread = sample_now.clone();
         let version_thread = cache_version.clone();
+        let services_thread = services_cache.clone();
         let sampler_handle = std::thread::Builder::new()
             .name("process-sampler".into())
             .spawn(move || {
                 let mut deadline = Instant::now(); // 首轮立即采样
+                let mut svc_deadline = Instant::now(); // 首轮立即枚举服务
                 loop {
                     if stop_thread.load(Ordering::SeqCst) {
                         break;
@@ -2277,6 +2308,12 @@ impl ProcessListWindow {
                             + Duration::from_millis(
                                 (*refresh_thread.lock().unwrap()).clamp(200, 60_000),
                             );
+                    }
+                    // 服务映射（SCM 枚举）独立于采样节奏：30s 刷一次足够
+                    //（服务启停罕见；首轮回填保证窗口打开即有 svchost 服务名）
+                    if Instant::now() >= svc_deadline {
+                        *services_thread.lock().unwrap() = service_map();
+                        svc_deadline = Instant::now() + Duration::from_secs(30);
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -2355,20 +2392,28 @@ impl ProcessListWindow {
         let expanded_refresh = expanded.clone();
         let shared_refresh = shared.clone();
         let sample_now_btn = sample_now.clone();
-        let version_btn = cache_version.clone();
         ui.on_refresh_requested(move || {
+            // 非阻塞（与 refresh() 一致）：立即用当前缓存重绘 + 通知采样线程
+            // 尽快采样；不在 UI 线程死等采样完成（旧实现轮询等 3s，首轮
+            // sysinfo 初始化慢时窗口整个冻结）。
             if let Some(ui) = weak_refresh.upgrade() {
-                // 通知采样线程立即采样，等它完成一次再重绘（不直接 sample，
-                // 避免与后台线程共享 ProcessSampler 交错污染速率差分基线）
-                let before = *version_btn.lock().unwrap();
-                sample_now_btn.store(true, Ordering::SeqCst);
-                for _ in 0..300 {
-                    if *version_btn.lock().unwrap() != before {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
                 render(&ui, &cache_refresh, &sort_refresh, &search_refresh, &expanded_refresh, &shared_refresh);
+                sample_now_btn.store(true, Ordering::SeqCst);
+                // 采样线程 50ms 轮询 + 采样耗时：延迟几次重绘把新数据补上
+                // （常规采样 <500ms；首轮初始化慢时由 tick timer 兜底）
+                for delay_ms in [300u64, 1000, 2000] {
+                    let weak_late = weak_refresh.clone();
+                    let cache_late = cache_refresh.clone();
+                    let sort_late = sort_refresh.clone();
+                    let search_late = search_refresh.clone();
+                    let expanded_late = expanded_refresh.clone();
+                    let shared_late = shared_refresh.clone();
+                    slint::Timer::single_shot(Duration::from_millis(delay_ms), move || {
+                        if let Some(ui) = weak_late.upgrade() {
+                            render(&ui, &cache_late, &sort_late, &search_late, &expanded_late, &shared_late);
+                        }
+                    });
+                }
             }
         });
 
@@ -2741,6 +2786,10 @@ struct RenderShared {
     highlight_pct: Arc<Mutex<f32>>,
     total_mem: Arc<Mutex<u64>>,
     model_arc: Arc<Mutex<Option<std::rc::Rc<slint::VecModel<crate::ProcessRowData>>>>>,
+    /// 服务映射缓存（pid → 服务名列表，svchost 聚合用）。
+    /// 由采样线程按 30s TTL 刷新（SCM 枚举 10~100ms，不能每 render 都查——
+    /// 搜索框每敲一个字符都会触发 render）。
+    services: Arc<Mutex<std::collections::HashMap<u32, Vec<String>>>>,
 }
 
 /// 用缓存渲染列表（不采样）：过滤 + 分组 + 排序 + 展开 + 填充。
@@ -2763,8 +2812,9 @@ fn render(
     let total_mem = *shared.total_mem.lock().unwrap();
     let rows = cache.lock().unwrap().clone();
 
-    // 服务映射（svchost 特殊聚合用）
-    let services = service_map();
+    // 服务映射（svchost 特殊聚合用）：读采样线程维护的缓存（SCM 枚举
+    // 10~100ms 且服务列表变化极慢，不应每 render/每按键都查一次）
+    let services = shared.services.lock().unwrap().clone();
 
     // 分组 + 组排序
     let (column, ascending) = {
@@ -2806,7 +2856,7 @@ fn render(
             // 多实例 / 服务宿主：父节点
             let agg = group_aggregate(g);
             items.push(group_display(g, &agg, nb_cpus, highlight_pct, total_mem));
-            if expanded_set.contains(&g.name.to_ascii_lowercase()) {
+            if expanded_set.contains(&group_key(g)) {
                 // svchost：先展开服务列表
                 if !g.services.is_empty() {
                     for svc in &g.services {
@@ -2931,95 +2981,6 @@ mod tests {
             ports: Vec::new(),
             status: "运行中".into(),
         }
-    }
-
-    #[test]
-    fn rank_sorts_by_cpu_desc() {
-        let mut rows = vec![
-            row(1, "a", 10.0, 100),
-            row(2, "b", 50.0, 200),
-            row(3, "c", 30.0, 300),
-        ];
-        let ranked = rank_processes(&mut rows, 10);
-        assert_eq!(ranked[0].pid, 2);
-        assert_eq!(ranked[1].pid, 3);
-        assert_eq!(ranked[2].pid, 1);
-    }
-
-    #[test]
-    fn rank_truncates_to_limit() {
-        let mut rows = vec![row(1, "a", 10.0, 100), row(2, "b", 50.0, 200)];
-        let ranked = rank_processes(&mut rows, 1);
-        assert_eq!(ranked.len(), 1);
-        assert_eq!(ranked[0].pid, 2);
-    }
-
-    #[test]
-    fn sort_by_pid_asc() {
-        let mut rows = vec![row(3, "c", 10.0, 100), row(1, "a", 50.0, 200), row(2, "b", 30.0, 300)];
-        sort_processes(&mut rows, "pid", true);
-        assert_eq!(rows[0].pid, 1);
-        assert_eq!(rows[2].pid, 3);
-    }
-
-    #[test]
-    fn sort_by_pid_desc() {
-        let mut rows = vec![row(3, "c", 10.0, 100), row(1, "a", 50.0, 200)];
-        sort_processes(&mut rows, "pid", false);
-        assert_eq!(rows[0].pid, 3);
-    }
-
-    #[test]
-    fn sort_by_cpu_asc() {
-        let mut rows = vec![row(1, "a", 50.0, 100), row(2, "b", 10.0, 200)];
-        sort_processes(&mut rows, "cpu", true);
-        assert_eq!(rows[0].pid, 2);
-        assert_eq!(rows[1].pid, 1);
-    }
-
-    #[test]
-    fn sort_by_name_case_insensitive() {
-        let mut rows = vec![row(1, "Bob", 10.0, 100), row(2, "alice", 50.0, 200)];
-        sort_processes(&mut rows, "name", true);
-        assert_eq!(rows[0].name, "alice");
-        assert_eq!(rows[1].name, "Bob");
-    }
-
-    #[test]
-    fn sort_by_net_uses_net_bps() {
-        let mut a = row(1, "a", 10.0, 100);
-        a.net_bps = 1000;
-        let mut b = row(2, "b", 10.0, 100);
-        b.net_bps = 500;
-        let mut rows = vec![a, b];
-        sort_processes(&mut rows, "net", false);
-        assert_eq!(rows[0].pid, 1); // 网络大 → 降序在前
-    }
-
-    #[test]
-    fn filter_by_name_case_insensitive() {
-        let rows = vec![
-            row(1, "explorer.exe", 10.0, 100),
-            row(2, "Code.exe", 50.0, 200),
-            row(3, "chrome.exe", 30.0, 300),
-        ];
-        let f = filter_processes(&rows, "CODE");
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].pid, 2);
-    }
-
-    #[test]
-    fn filter_by_pid() {
-        let rows = vec![row(1234, "a", 10.0, 100), row(5678, "b", 50.0, 200)];
-        let f = filter_processes(&rows, "567");
-        assert_eq!(f.len(), 1);
-        assert_eq!(f[0].pid, 5678);
-    }
-
-    #[test]
-    fn filter_empty_keyword_returns_all() {
-        let rows = vec![row(1, "a", 10.0, 100), row(2, "b", 50.0, 200)];
-        assert_eq!(filter_processes(&rows, "").len(), 2);
     }
 
     #[test]
@@ -3192,7 +3153,20 @@ mod tests {
         assert_eq!(agg.cpu_usage, 40.0);
         assert_eq!(agg.memory_bytes, 400 * 1024 * 1024);
         assert_eq!(agg.physical_mem_bytes, 400 * 1024 * 1024);
-        assert_eq!(agg.pid, 1); // 取最小 PID
+        assert_eq!(agg.pid, 1); // 保持 root pid（组行右键「结束进程树」沿 root 枚举）
+    }
+
+    #[test]
+    fn group_aggregate_keeps_root_pid_even_if_child_smaller() {
+        // pid 回绕后子进程 pid 可能比 root 小：聚合行仍必须是 root pid，
+        // 否则组行右键「结束进程树」会枚举错子树
+        let rows = vec![
+            row_p(500, 0, "a.exe", 10.0, 100), // root
+            row_p(50, 500, "a.exe", 30.0, 300), // 子进程 pid 更小
+        ];
+        let groups = group_processes(&rows, &no_services());
+        let g = groups.iter().find(|g| g.root.pid == 500).unwrap();
+        assert_eq!(group_aggregate(g).pid, 500);
     }
 
     #[test]
@@ -3461,36 +3435,6 @@ mod tests {
     }
 
     #[test]
-    fn sort_processes_by_port_count_then_min() {
-        // 排序键：(端口数量, 最小端口) — 数量优先，相同时按最小端口
-        // 数量主键：升序 = 少→多；降序 = 多→少
-        // tiebreak（最小端口）：升序 = 小→大；降序 = 大→小
-        let mut r1 = row(1, "no-port.exe", 0.0, 0); // 0 端口
-        r1.ports = vec![];
-        let mut r2 = row(2, "one.exe", 0.0, 0); // 1 端口(80)
-        r2.ports = vec![80];
-        let mut r3 = row(3, "two-high.exe", 0.0, 0); // 2 端口(8080, 9090)
-        r3.ports = vec![8080, 9090];
-        let mut r4 = row(4, "two-low.exe", 0.0, 0); // 2 端口(80, 443)
-        r4.ports = vec![80, 443];
-        let mut rows = vec![r1.clone(), r2, r3, r4];
-
-        // 降序：端口多 → 端口少；同数量按 min 端口大→小
-        sort_processes(&mut rows, "port", false);
-        assert_eq!(rows[0].name, "two-high.exe"); // 2 个，min=8080
-        assert_eq!(rows[1].name, "two-low.exe"); // 2 个，min=80
-        assert_eq!(rows[2].name, "one.exe"); // 1 个
-        assert_eq!(rows[3].name, "no-port.exe"); // 0 个
-
-        // 升序：端口少 → 端口多；同数量按 min 端口小→大
-        sort_processes(&mut rows, "port", true);
-        assert_eq!(rows[0].name, "no-port.exe");
-        assert_eq!(rows[1].name, "one.exe");
-        assert_eq!(rows[2].name, "two-low.exe"); // 2 个，min=80
-        assert_eq!(rows[3].name, "two-high.exe"); // 2 个，min=8080
-    }
-
-    #[test]
     fn sort_groups_by_port_merges_children() {
         // 聚合端口：root + children 合并去重升序 → 排序
         let mut r1 = row_p(1, 0, "svc.exe", 10.0, 100);
@@ -3611,7 +3555,7 @@ mod tests {
         let d = group_display(&g, &agg, 8, 30.0, 16 * 1024 * 1024 * 1024);
         assert!(d.name.contains("Google Chrome"));
         assert!(d.name_full.contains("chrome.exe"));
-        assert_eq!(d.group_key, "chrome.exe");
+        assert_eq!(d.group_key, "chrome.exe:100", "展开键应含 root pid（唯一化）");
     }
 
     // ===== Chromium 家族标注（WebView2 / Edge / Chrome 角色 + 宿主）=====
@@ -3850,6 +3794,6 @@ mod tests {
         let d = group_display(&groups[0], &agg, 8, 30.0, 16 * 1024 * 1024 * 1024);
         assert!(d.name.contains("WebView2: MarkFlowy"));
         assert!(d.name.contains("(2)"));
-        assert_eq!(d.group_key, "msedgewebview2.exe");
+        assert_eq!(d.group_key, "msedgewebview2.exe:200");
     }
 }
