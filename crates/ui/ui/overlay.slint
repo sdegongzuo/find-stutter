@@ -267,8 +267,11 @@ export component Taskbar inherits Window {
 // 白色背景 + 深色文字；拖动仅限标题栏（避免全窗口 TouchArea
 // 拦截按钮点击；也避免 TrackPopupMenu 模态后窗口被误拖）。
 // 多列自绘表格（ListView + 每行组件），列宽固定、超出截断 +
-// Tooltip 悬浮详情；右下角 resize 手柄可缩放窗口。
+// Tooltip 悬浮详情；窗口边缘 + 右下角 resize 手柄可缩放窗口。
 // ================================================================
+
+// 窗口 resize 边缘/角落方向（Rust 端据此决定改 size 还是同时改 position）
+enum ResizeEdge { NoEdge, Right, Bottom, Left, Top, TopLeft, TopRight, BottomLeft, BottomRight }
 
 // 进程表一行数据（Rust 端按此结构填充 model）
 struct ProcessRowData {
@@ -459,6 +462,29 @@ component ProcessRow inherits Rectangle {
     }
 }
 
+// 边缘/角落 resize 热区（TouchArea 参数化封装）：
+// - 按下（pointer-event down）→ request-start：通知 Rust 锁定基准
+// - 拖动（moved）→ request-resize：只回报边缘方向；位移由 Rust 端取
+//   原生光标差分。不要改回 TouchArea 坐标上报：热区随窗口缩放移动，
+//   元素相对差值混入已应用增量，会把拖拽变成半速跟随。
+// 子组件无法直接引用根 Window 的回调，经转发回调中转；8 处热区共用，
+// 避免每个 TouchArea 各写一份 pointer-event/moved 样板。
+component ResizeZone inherits TouchArea {
+    in property <ResizeEdge> edge;
+    in property <MouseCursor> zone-cursor;
+    mouse-cursor: self.zone-cursor;
+    callback request-start();
+    callback request-resize(ResizeEdge);
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down) {
+            root.request-start();
+        }
+    }
+    moved => {
+        root.request-resize(self.edge);
+    }
+}
+
 export component ProcessList inherits Window {
     width: 870px;
     height: 506px;
@@ -494,8 +520,14 @@ export component ProcessList inherits Window {
     callback detail-close();
     // 详情面板「复制」按钮（Rust 端全量复制 detail-text 到剪贴板）
     callback detail-copy();
-    // 右下角 resize 手柄：传 dx/dy（逻辑像素）
-    callback resize-requested(length, length);
+    // 窗口边缘 / 右下角 resize：只传边缘方向；位移由 Rust 端用原生
+    // GetCursorPos 相对「按下点」差分得出（热区元素随窗口缩放移动，
+    // TouchArea 的元素相对差值不可信——见 ResizeSession 注释）。
+    callback resize-requested(ResizeEdge);
+    // 任一 resize 热区被按下：Rust 端锁定当前窗口矩形 + 光标屏幕位置作为
+    // 本次拖拽基准。目标矩形 = 基准矩形 + 光标累计位移，与 moved 事件到达
+    // 次数、热区是否随动均无关。
+    callback resize-started();
 
     // 列表滚动偏移（viewport-y，未滚动=0，向下滚动为负；Rust 端命中测试用：
     // 连续右键切换时把鼠标 y 换算成列表行号需扣除滚动量）
@@ -729,6 +761,88 @@ export component ProcessList inherits Window {
         }
     }
 
+    // === 窗口边缘 resize 热区（覆盖在主内容之上，详情面板之下）===
+    // 按下 → resize-started 锁定基准矩形；拖动 → resize-requested 按基准 + 累计位移换算
+    property <length> resize-margin: 6px;
+
+    // 左边缘
+    ResizeZone {
+        x: 0;
+        y: root.resize-margin;
+        width: root.resize-margin;
+        height: parent.height - 2 * root.resize-margin;
+        edge: ResizeEdge.Left;
+        zone-cursor: ew-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 右边缘
+    ResizeZone {
+        x: parent.width - root.resize-margin;
+        y: root.resize-margin;
+        width: root.resize-margin;
+        height: parent.height - 2 * root.resize-margin;
+        edge: ResizeEdge.Right;
+        zone-cursor: ew-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 上边缘
+    ResizeZone {
+        x: root.resize-margin;
+        y: 0;
+        width: parent.width - 2 * root.resize-margin;
+        height: root.resize-margin;
+        edge: ResizeEdge.Top;
+        zone-cursor: ns-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 下边缘
+    ResizeZone {
+        x: root.resize-margin;
+        y: parent.height - root.resize-margin;
+        width: parent.width - 2 * root.resize-margin;
+        height: root.resize-margin;
+        edge: ResizeEdge.Bottom;
+        zone-cursor: ns-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 左上角
+    ResizeZone {
+        x: 0;
+        y: 0;
+        width: root.resize-margin;
+        height: root.resize-margin;
+        edge: ResizeEdge.TopLeft;
+        zone-cursor: nwse-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 右上角
+    ResizeZone {
+        x: parent.width - root.resize-margin;
+        y: 0;
+        width: root.resize-margin;
+        height: root.resize-margin;
+        edge: ResizeEdge.TopRight;
+        zone-cursor: nesw-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+    // 左下角
+    ResizeZone {
+        x: 0;
+        y: parent.height - root.resize-margin;
+        width: root.resize-margin;
+        height: root.resize-margin;
+        edge: ResizeEdge.BottomLeft;
+        zone-cursor: nesw-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+
     // === 进程详情面板（双击行弹出；覆盖层）===
     Rectangle {
         visible: root.detail-visible;
@@ -801,16 +915,19 @@ export component ProcessList inherits Window {
         }
     }
 
-    // 右下角 resize 手柄
+    // 右下角 resize 手柄（视觉指示 + 更大抓取热区；与边缘热区同一套基准机制）
     Rectangle {
         x: parent.width - 16px;
         y: parent.height - 16px;
         width: 16px;
         height: 16px;
-        TouchArea {
-            moved => {
-                root.resize-requested(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
-            }
+        ResizeZone {
+            width: 100%;
+            height: 100%;
+            edge: ResizeEdge.BottomRight;
+            zone-cursor: nwse-resize;
+            request-start => { root.resize-started(); }
+            request-resize(e) => { root.resize-requested(e); }
         }
         // 斜纹指示
         Text {

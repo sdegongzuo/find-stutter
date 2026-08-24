@@ -13,7 +13,8 @@
 //!   差分；首次采样无基线，速率显示 0
 //! - **搜索**：名称 / PID 过滤（大小写不敏感）
 //! - **停止按钮**：`Process::kill()`
-//! - **窗口缩放**：右下角 resize 手柄
+//! - **窗口缩放**：四边/四角热区 + 右下角手柄均可拖拽缩放（按下锁定
+//!   基准矩形，拖动按「基准 + 累计位移」换算，见 ResizeSession）
 //!
 //! ## 数据来源
 //!
@@ -1932,7 +1933,9 @@ pub fn service_map() -> std::collections::HashMap<u32, Vec<String>> {
     Default::default()
 }
 
-fn format_bytes(b: u64) -> String {
+/// 字节数 → 紧凑可读字符串（B/K/M/G/T 自适应升级）。
+/// 进程详情页累计列与悬浮窗「当日/当周流量」共用此口径，避免同屏两套量纲。
+pub(crate) fn format_bytes(b: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
     const GB: f64 = MB * 1024.0;
@@ -2580,18 +2583,58 @@ impl ProcessListWindow {
             log::info!("已复制进程详情到剪贴板（{} 字节）", text.len());
         });
 
-        // 右下角 resize 手柄 → set_size
+        // 窗口边缘 / 右下角 resize：
+        // - 按下（resize-started）→ 锁定当前窗口矩形 + 光标屏幕位置为基准；
+        // - 拖动（resize-requested）→ 目标矩形 = 基准 + 原生光标差分出的累计位移。
+        //   位移绝不能取自 TouchArea 元素相对坐标（热区随窗口移动会被污染，
+        //   见 ResizeSession 注释），也绝不能再叠加到「当前」几何上（增量重复累加）。
+        let resize_session =
+            std::rc::Rc::new(std::cell::RefCell::new(ResizeSession::default()));
+
+        let session_for_start = resize_session.clone();
+        let weak_start = ui.as_weak();
+        ui.on_resize_started(move || {
+            if let Some(ui) = weak_start.upgrade() {
+                let (x, y, w, h) = window_logical_rect(ui.window());
+                let cursor = cursor_screen_px();
+                session_for_start.borrow_mut().start(x, y, w, h, cursor);
+            }
+        });
+
+        let session_for_move = resize_session.clone();
         let weak_resize = ui.as_weak();
-        ui.on_resize_requested(move |dx: f32, dy: f32| {
+        ui.on_resize_requested(move |edge: crate::ResizeEdge| {
             if let Some(ui) = weak_resize.upgrade() {
+                use slint::{LogicalSize, PhysicalPosition};
                 let window = ui.window();
-                let scale = window.scale_factor();
-                let size = window.size(); // 物理像素 u32
-                let cur_w = size.width as f32 / scale;
-                let cur_h = size.height as f32 / scale;
-                let new_w = (cur_w + dx).clamp(500.0, 1200.0);
-                let new_h = (cur_h + dy).clamp(300.0, 900.0);
-                window.set_size(slint::LogicalSize::new(new_w, new_h));
+
+                // 基于按下瞬间的基准矩形换算；基准缺失时兜底用当前矩形
+                let (cur_x, cur_y, cur_w, cur_h) = window_logical_rect(window);
+                let (dx, dy) = {
+                    let session = session_for_move.borrow();
+                    session.displacement(cursor_screen_px(), window.scale_factor())
+                };
+                let (new_x, new_y, new_w, new_h) =
+                    session_for_move.borrow_mut().apply(edge, dx, dy, cur_x, cur_y, cur_w, cur_h);
+
+                // 仅涉及左/上的边缘才需要动位置（对边保持不动）；
+                // 纯右/下拖动只改尺寸，少一次 SetWindowPos，拖动更顺滑
+                if matches!(
+                    edge,
+                    crate::ResizeEdge::Left
+                        | crate::ResizeEdge::Top
+                        | crate::ResizeEdge::TopLeft
+                        | crate::ResizeEdge::TopRight
+                        | crate::ResizeEdge::BottomLeft
+                ) {
+                    // 目标矩形是逻辑坐标，写回时换回物理像素
+                    let scale = window.scale_factor();
+                    window.set_position(PhysicalPosition::new(
+                        (new_x * scale) as i32,
+                        (new_y * scale) as i32,
+                    ));
+                }
+                window.set_size(LogicalSize::new(new_w, new_h));
             }
         });
 
@@ -2738,6 +2781,185 @@ impl Drop for ProcessListWindow {
             let _ = h.join();
         }
     }
+}
+
+/// 进程详情窗口尺寸限制（逻辑像素）——resize 时夹取，UI 与测试共用。
+const RESIZE_MIN_W: f32 = 500.0;
+const RESIZE_MAX_W: f32 = 1200.0;
+const RESIZE_MIN_H: f32 = 300.0;
+const RESIZE_MAX_H: f32 = 900.0;
+
+/// 读取窗口当前矩形（逻辑像素 x, y, w, h）。
+/// Slint 的 position()/size() 返回物理像素；resize 全程用逻辑坐标换算，
+/// 统一在此除以 scale_factor，供 resize-started / resize-requested 两个回调共享。
+fn window_logical_rect(window: &slint::Window) -> (f32, f32, f32, f32) {
+    let scale = window.scale_factor();
+    let pos = window.position();
+    let size = window.size();
+    (
+        pos.x as f32 / scale,
+        pos.y as f32 / scale,
+        size.width as f32 / scale,
+        size.height as f32 / scale,
+    )
+}
+
+/// 取鼠标当前屏幕位置（物理像素）。失败（如锁屏/桌面切换）返回 None。
+#[cfg(windows)]
+fn cursor_screen_px() -> Option<(f32, f32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut pt = POINT::default();
+    // ok() 消费 Result：成功时保留坐标元组
+    // SAFETY：POINT 为合法输出指针，GetCursorPos 仅写入该结构
+    unsafe { GetCursorPos(&mut pt) }.ok().map(|_| (pt.x as f32, pt.y as f32))
+}
+
+#[cfg(not(windows))]
+fn cursor_screen_px() -> Option<(f32, f32)> {
+    None
+}
+
+/// 一次边缘拖拽缩放会话：pointer 按下瞬间锁定「基准矩形 + 基准光标位置」，
+/// 之后每个 moved 事件用原生光标当前位置差分出「自按下起的真实位移」，
+/// 一律基于基准矩形换算目标。
+///
+/// 为什么必须锁基准：窗口的「当前」尺寸/位置在拖拽过程中每帧都在变。若每次
+/// 都读当前几何再叠加位移（最初实现），同一段位移会被重复累加——向外拖几个
+/// 像素就冲到上限、向内拖瞬间贴死下限，表现为「窗口不跟手」。
+///
+/// 为什么位移必须来自原生光标而非 TouchArea 的 mouse-x - pressed-x：热区
+/// 元素锚定窗口边缘，会随缩放移动（右/下/角随 parent.width/height 动，左/
+/// 上随窗口 position 动），元素相对差值混入「已应用增量」这个反馈项，把
+/// 「目标 = 基准 + 累计位移」退化成二阶递推（匀速拖动稳态仅约半速跟随）。
+/// 屏幕绝对坐标差分对窗口/热区的任何运动都不敏感。
+#[derive(Debug, Default)]
+pub(crate) struct ResizeSession {
+    /// 按下瞬间的窗口矩形（逻辑像素 x, y, w, h）
+    base: Option<(f32, f32, f32, f32)>,
+    /// 按下瞬间的鼠标屏幕位置（物理像素）；取不到时为 None（位移按 0 处理）
+    press_cursor: Option<(f32, f32)>,
+}
+
+impl ResizeSession {
+    /// pointer 按下（slint resize-started 回调）：记录本次拖拽的基准矩形与光标位置。
+    fn start(&mut self, x: f32, y: f32, w: f32, h: f32, cursor_px: Option<(f32, f32)>) {
+        self.base = Some((x, y, w, h));
+        self.press_cursor = cursor_px;
+    }
+
+    /// 自按下起的鼠标位移（逻辑像素）。基准光标缺失 / 当前光标取不到 → (0, 0)
+    /// （该次事件视为无位移，窗口保持原地；下一次成功采样后自动恢复跟踪）。
+    fn displacement(&self, now_px: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
+        match (self.press_cursor, now_px) {
+            (Some((cx, cy)), Some((nx, ny))) => ((nx - cx) / scale, (ny - cy) / scale),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// 拖动中（slint resize-requested 回调）：返回「基准矩形 + 累计位移」的目标矩形。
+    /// cur_* 是当前窗口矩形，仅在基准缺失（异常路径漏发 start）时兜底使用，
+    /// 行为退化为旧实现但不 panic。
+    #[allow(clippy::too_many_arguments)]
+    fn apply(
+        &mut self,
+        edge: crate::ResizeEdge,
+        dx: f32,
+        dy: f32,
+        cur_x: f32,
+        cur_y: f32,
+        cur_w: f32,
+        cur_h: f32,
+    ) -> (f32, f32, f32, f32) {
+        let (bx, by, bw, bh) = self.base.unwrap_or((cur_x, cur_y, cur_w, cur_h));
+        compute_resized_rect(
+            edge,
+            dx,
+            dy,
+            bx,
+            by,
+            bw,
+            bh,
+            RESIZE_MIN_W,
+            RESIZE_MAX_W,
+            RESIZE_MIN_H,
+            RESIZE_MAX_H,
+        )
+    }
+}
+
+/// 根据拖动边缘/角落计算新的窗口位置与尺寸。
+///
+/// - 右/下/右下角只改 size；左/上/左上角同时改 position，保持对边不动。
+/// - 返回 `(new_x, new_y, new_w, new_h)`（逻辑像素）。
+#[allow(clippy::too_many_arguments)]
+fn compute_resized_rect(
+    edge: crate::ResizeEdge,
+    dx: f32,
+    dy: f32,
+    cur_x: f32,
+    cur_y: f32,
+    cur_w: f32,
+    cur_h: f32,
+    min_w: f32,
+    max_w: f32,
+    min_h: f32,
+    max_h: f32,
+) -> (f32, f32, f32, f32) {
+    let (mut new_x, mut new_y, mut new_w, mut new_h) = (cur_x, cur_y, cur_w, cur_h);
+
+    match edge {
+        crate::ResizeEdge::Right => new_w = cur_w + dx,
+        crate::ResizeEdge::Bottom => new_h = cur_h + dy,
+        crate::ResizeEdge::Left => {
+            new_w = cur_w - dx;
+            new_x = cur_x + dx;
+        }
+        crate::ResizeEdge::Top => {
+            new_h = cur_h - dy;
+            new_y = cur_y + dy;
+        }
+        crate::ResizeEdge::TopLeft => {
+            new_w = cur_w - dx;
+            new_h = cur_h - dy;
+            new_x = cur_x + dx;
+            new_y = cur_y + dy;
+        }
+        crate::ResizeEdge::TopRight => {
+            new_w = cur_w + dx;
+            new_h = cur_h - dy;
+            new_y = cur_y + dy;
+        }
+        crate::ResizeEdge::BottomLeft => {
+            new_w = cur_w - dx;
+            new_h = cur_h + dy;
+            new_x = cur_x + dx;
+        }
+        crate::ResizeEdge::BottomRight => {
+            new_w = cur_w + dx;
+            new_h = cur_h + dy;
+        }
+        _ => return (cur_x, cur_y, cur_w, cur_h),
+    }
+
+    new_w = new_w.clamp(min_w, max_w);
+    new_h = new_h.clamp(min_h, max_h);
+
+    // 左/上边缘缩放时，对边保持不动，因此需根据最终尺寸修正位置
+    if matches!(
+        edge,
+        crate::ResizeEdge::Left | crate::ResizeEdge::TopLeft | crate::ResizeEdge::BottomLeft
+    ) {
+        new_x = cur_x + (cur_w - new_w);
+    }
+    if matches!(
+        edge,
+        crate::ResizeEdge::Top | crate::ResizeEdge::TopLeft | crate::ResizeEdge::TopRight
+    ) {
+        new_y = cur_y + (cur_h - new_h);
+    }
+
+    (new_x, new_y, new_w, new_h)
 }
 
 /// 刷新间隔档位（毫秒 → 下拉显示文本）。
@@ -2983,6 +3205,219 @@ mod tests {
             ports: Vec::new(),
             status: "运行中".into(),
         }
+    }
+
+    // ===== 窗口边缘 resize 坐标计算 =====
+
+    #[test]
+    fn resize_right_changes_width_only() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::Right,
+            50.0,
+            0.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        assert_eq!((x, y, w, h), (100.0, 100.0, 850.0, 600.0));
+    }
+
+    #[test]
+    fn resize_bottom_changes_height_only() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::Bottom,
+            0.0,
+            100.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        assert_eq!((x, y, w, h), (100.0, 100.0, 800.0, 700.0));
+    }
+
+    #[test]
+    fn resize_left_changes_width_and_position() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::Left,
+            100.0,
+            0.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        // 左边缘向右拖 100：宽度减 100，x 右移 100，右边缘保持 900
+        assert_eq!((x, y, w, h), (200.0, 100.0, 700.0, 600.0));
+    }
+
+    #[test]
+    fn resize_top_changes_height_and_position() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::Top,
+            0.0,
+            -100.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        // 上边缘向上拖 dy=-100：高度加 100，y 上移 100，下边缘保持 700
+        assert_eq!((x, y, w, h), (100.0, 0.0, 800.0, 700.0));
+    }
+
+    #[test]
+    fn resize_top_left_changes_both_position_and_size() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::TopLeft,
+            100.0,
+            -50.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        // dx=100：宽减 100，x 加 100；dy=-50：高加 50，y 减 50
+        // 右边缘保持 900，下边缘保持 700
+        assert_eq!((x, y, w, h), (200.0, 50.0, 700.0, 650.0));
+    }
+
+    #[test]
+    fn resize_clamps_to_min_max() {
+        // 左边缘向右拖过量，应被限制在最小宽度，且位置修正保持右边缘不动
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::Left,
+            1000.0,
+            0.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        assert_eq!(w, 500.0);
+        // 右边缘原在 900，新 x = 900 - 500 = 400
+        assert_eq!(x, 400.0);
+        assert_eq!(y, 100.0);
+        assert_eq!(h, 600.0);
+    }
+
+    #[test]
+    fn resize_no_edge_is_noop() {
+        let (x, y, w, h) = compute_resized_rect(
+            crate::ResizeEdge::NoEdge,
+            50.0,
+            50.0,
+            100.0,
+            100.0,
+            800.0,
+            600.0,
+            500.0,
+            1200.0,
+            300.0,
+            900.0,
+        );
+        assert_eq!((x, y, w, h), (100.0, 100.0, 800.0, 600.0));
+    }
+
+    // ===== ResizeSession（基准矩形锁定：修复「窗口不跟手」）=====
+
+    /// 回归测试：右边缘分多步拖大时，目标宽必须始终 = 按下时基准宽 + 累计位移，
+    /// 而不是「当前宽 + 累计位移」（旧实现会把位移重复累加，宽度指数级发散）。
+    #[test]
+    fn resize_session_right_edge_uses_press_time_baseline() {
+        let mut s = ResizeSession::default();
+        s.start(100.0, 200.0, 800.0, 500.0, None);
+        // 模拟 moved 连续触发：dx 为相对按下点的累计位移，cur_* 为当时实际尺寸
+        let steps: [(f32, f32); 3] = [(10.0, 810.0), (20.0, 820.0), (30.0, 830.0)];
+        for (dx, want_w) in steps {
+            let (_, _, w, _) = s.apply(
+                crate::ResizeEdge::Right,
+                dx,
+                0.0,
+                100.0,
+                200.0,
+                want_w - 10.0, // 当前宽滞后一步，模拟上一事件已应用过增量
+                500.0,
+            );
+            assert_eq!(w, want_w, "dx={dx}");
+        }
+    }
+
+    /// 回归测试：左边缘分步拖小时同样基于基准换算，且位置修正保持右边缘不动
+    /// （旧实现每步都在已缩小的宽度上再减一遍累计位移，瞬间贴死最小宽 500）。
+    /// 方向语义：左边缘 dx>0（向右拖）为收窄；cx/cw 模拟真实回调传入的当前矩形，
+    /// 随每步应用结果推进。
+    #[test]
+    fn resize_session_left_edge_shrink_does_not_collapse() {
+        let mut s = ResizeSession::default();
+        s.start(100.0, 100.0, 900.0, 600.0, None);
+        let (mut cx, mut cw) = (100.0_f32, 900.0_f32);
+        for (i, want_w) in [890.0, 880.0, 870.0].iter().enumerate() {
+            let dx = 10.0 * (i as f32 + 1.0); // 相对按下点的累计位移
+            let (x, _, w, _) = s.apply(crate::ResizeEdge::Left, dx, 0.0, cx, 100.0, cw, 600.0);
+            assert_eq!(w, *want_w, "step {i}");
+            // 对边不动：新 x = 基准 x + (基准 w - 新 w)
+            assert_eq!(x, 100.0 + (900.0 - *want_w), "step {i}");
+            cx = x;
+            cw = w;
+        }
+    }
+
+    /// 未收到 resize-started（异常路径）时不 panic，退化为按当前矩形计算。
+    #[test]
+    fn resize_session_missing_start_falls_back_to_current_rect() {
+        let mut s = ResizeSession::default();
+        let (_, _, w, h) = s.apply(crate::ResizeEdge::BottomRight, 5.0, 15.0, 0.0, 0.0, 800.0, 500.0);
+        assert_eq!((w, h), (805.0, 515.0));
+    }
+
+    /// 基准换算结果仍受 min/max 夹取约束。
+    #[test]
+    fn resize_session_clamps_to_limits() {
+        let mut s = ResizeSession::default();
+        s.start(0.0, 0.0, 800.0, 500.0, None);
+        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 5000.0, 0.0, 0.0, 0.0, 800.0, 500.0);
+        assert_eq!(w, RESIZE_MAX_W);
+        let (_, y, _, h) = s.apply(crate::ResizeEdge::Top, 0.0, 5000.0, 0.0, 0.0, 800.0, 500.0);
+        assert_eq!(h, RESIZE_MIN_H);
+        assert_eq!(y, 500.0 - RESIZE_MIN_H); // 下边缘保持不动
+    }
+
+    /// 新一次按下会覆盖旧基准：两次独立拖拽互不串扰。
+    #[test]
+    fn resize_session_restart_overrides_baseline() {
+        let mut s = ResizeSession::default();
+        s.start(0.0, 0.0, 800.0, 500.0, None);
+        s.apply(crate::ResizeEdge::Right, 40.0, 0.0, 0.0, 0.0, 830.0, 500.0);
+        // 第二次按下：以当时的矩形为新基准
+        s.start(0.0, 0.0, 840.0, 500.0, None);
+        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 10.0, 0.0, 0.0, 0.0, 845.0, 500.0);
+        assert_eq!(w, 850.0);
     }
 
     #[test]
