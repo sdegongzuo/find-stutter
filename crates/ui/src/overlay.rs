@@ -21,6 +21,11 @@ pub struct OverlayState {
     pub today_event_count: u32,
     pub service_health: ServiceHealth,
     pub last_heartbeat: Option<String>,
+    /// 当日累计网络流量 `(发送字节, 接收字节)`——由 DbReader 轮询缓存
+    /// （悬浮窗原「磁盘读写速率」位改显此值；鼠标悬浮看当周明细）
+    pub today_net_bytes: (u64, u64),
+    /// 当周（本地周一零点起）累计网络流量 `(发送字节, 接收字节)`
+    pub week_net_bytes: (u64, u64),
     pub paused: bool,
     /// 点击穿透模式（右键菜单切换；窗口鼠标事件完全穿透）
     pub click_through: bool,
@@ -36,6 +41,8 @@ impl OverlayState {
             today_event_count: 0,
             service_health: ServiceHealth::NoDatabase,
             last_heartbeat: None,
+            today_net_bytes: (0, 0),
+            week_net_bytes: (0, 0),
             paused: false,
             click_through: false,
         }
@@ -48,6 +55,8 @@ impl OverlayState {
         self.today_event_count = poll.today_event_count;
         self.service_health = poll.health;
         self.last_heartbeat = poll.last_heartbeat.clone();
+        self.today_net_bytes = poll.today_net_bytes;
+        self.week_net_bytes = poll.week_net_bytes;
     }
 }
 
@@ -73,6 +82,25 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
         }
     };
     (text, color)
+}
+
+/// 「当日累计网络流量」短文本（悬浮窗网速右侧默认显示；总 = 发送 + 接收）。
+/// 字节量格式化复用进程详情页累计列的紧凑口径（`format_bytes`）。
+pub fn format_today_traffic(sent: u64, recv: u64) -> String {
+    format!(
+        "今日 {}",
+        crate::process_list::format_bytes(sent.saturating_add(recv))
+    )
+}
+
+/// 「当周累计网络流量」tooltip 明细（鼠标悬浮当日流量文本时显示；多行）。
+pub fn format_week_traffic_tip(sent: u64, recv: u64) -> String {
+    format!(
+        "**本周累计流量**（周一起）：{}\n上传 {} · 下载 {}",
+        crate::process_list::format_bytes(sent.saturating_add(recv)),
+        crate::process_list::format_bytes(sent),
+        crate::process_list::format_bytes(recv)
+    )
 }
 
 /// 把 bps 速率格式化为自适应单位的可读字符串：数字变大时自动升级
@@ -146,7 +174,6 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
     ui.set_event_color(event_red);
     ui.set_gpu_color(text_color);
     ui.set_net_color(text_color);
-    ui.set_disk_color(text_color);
     ui.set_hb_color(hb_gray);
 
     // 1) 服务健康条
@@ -168,13 +195,22 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
         )));
         ui.set_net_send(SharedString::from(format!("↑ {}", format_bps(s.net_sent_bps))));
         ui.set_net_recv(SharedString::from(format!("↓ {}", format_bps(s.net_recv_bps))));
-        ui.set_disk_read(SharedString::from(format!("R {}", format_bps(s.disk_read_bps))));
-        ui.set_disk_write(SharedString::from(format!("W {}", format_bps(s.disk_write_bps))));
         if let Some(g) = s.gpu_usage {
             ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
         }
         // 温度已从悬浮窗移除（采集/入库保留，仅不显示）
     }
+
+    // 3b) 当日累计网络流量（替代原「磁盘读写速率」位的默认展示）+
+    //     当周明细 tooltip 文本。不依赖 summary 存在，db 打不开时也显示缓存值。
+    ui.set_net_today_text(SharedString::from(format_today_traffic(
+        state.today_net_bytes.0,
+        state.today_net_bytes.1,
+    )));
+    ui.set_net_week_tip(SharedString::from(format_week_traffic_tip(
+        state.week_net_bytes.0,
+        state.week_net_bytes.1,
+    )));
 
     // 4) 今日事件数
     ui.set_event_count(SharedString::from(format!(
@@ -305,12 +341,38 @@ mod tests {
             health: ServiceHealth::Running,
             today_event_count: 7,
             last_heartbeat: Some("2026-01-01T00:00:00Z".to_string()),
+            today_net_bytes: (100, 200),
+            week_net_bytes: (1000, 2000),
         };
         s.update_from_poll(&poll);
         assert_eq!(s.service_health, ServiceHealth::Running);
         assert_eq!(s.today_event_count, 7);
+        assert_eq!(s.today_net_bytes, (100, 200));
+        assert_eq!(s.week_net_bytes, (1000, 2000));
         assert!(s.last_summary.is_some());
         assert!(s.last_heartbeat.is_some());
+    }
+
+    /// 当日流量短文本：上/下行求和 + 「今日」前缀（紧凑字节口径）。
+    #[test]
+    fn format_today_traffic_sums_send_recv() {
+        assert_eq!(format_today_traffic(0, 0), "今日 0B");
+        assert_eq!(format_today_traffic(1024, 2048), "今日 3.0K");
+        // GB 级别显示一位小数
+        let gb = 3 * 1024 * 1024 * 1024;
+        assert_eq!(format_today_traffic(gb, 0), "今日 3.0G");
+    }
+
+    /// 当周 tooltip：含总量、上传、下载三段，且换行分两行。
+    #[test]
+    fn format_week_traffic_tip_contains_parts() {
+        let tip = format_week_traffic_tip(1024 * 1024, 2 * 1024 * 1024);
+        assert!(tip.contains("本周累计流量"), "应含本周标题: {tip}");
+        assert!(tip.contains("周一起"), "应注明口径起点: {tip}");
+        assert!(tip.contains("1.0M"), "应含上传量: {tip}");
+        assert!(tip.contains("2.0M"), "应含下载量: {tip}");
+        assert!(tip.contains("3.0M"), "应含总量(1M+2M): {tip}");
+        assert_eq!(tip.lines().count(), 2, "应为两行: {tip}");
     }
 
     /// 验证：服务停止时暂停按钮应禁用

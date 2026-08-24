@@ -5,6 +5,7 @@
 //! - `latest_heartbeat`（服务健康检测）
 //! - `latest_event`（上次卡顿事件，用于「上次闪烁」提示）
 //! - `event_count_today`（今日卡顿计数）
+//! - 今日 / 本周累计网络流量（悬浮窗流量显示，节流见 `TRAFFIC_REFRESH_EVERY`）
 //!
 //! 在 WAL 模式下，服务写库不阻塞 GUI 读；GUI 也不需要与 Collector 共享线程。
 //!
@@ -47,6 +48,11 @@ pub struct PollResult {
     pub today_event_count: u32,
     /// 最近一次心跳时间戳（RFC3339），None 表示从未启动
     pub last_heartbeat: Option<String>,
+    /// 当日累计网络流量 `(发送字节, 接收字节)`——samples 每秒速率求和的近似值
+    /// （口径见 `find_stutter_core::logger::sum_network_traffic`）
+    pub today_net_bytes: (u64, u64),
+    /// 当周（本地周一零点起）累计网络流量 `(发送字节, 接收字节)`
+    pub week_net_bytes: (u64, u64),
 }
 
 /// SQLite reader + 服务健康检测器。
@@ -58,7 +64,18 @@ pub struct DbReader {
     conn: Mutex<Option<Connection>>,
     /// 心跳超过此间隔视为 Stale（默认 5s）
     pub stale_threshold: Duration,
+    /// 累计流量刷新节流：每 N 次 poll 才真正跑一次 SUM 查询。
+    /// 累计值变化慢，而 SUM 需扫过当日全部样本行（一天最多 ~8.6 万行），
+    /// 1Hz 全量重算纯属浪费；10s 刷新粒度对「累计流量」显示足够。
+    traffic_refresh_every: u32,
+    traffic_tick: std::cell::Cell<u32>,
+    /// 最近一次流量统计缓存：`(今日 (sent, recv), 本周 (sent, recv))`。
+    /// db 打不开时也返回缓存而非清零，避免界面数字闪烁。
+    traffic_cache: Mutex<((u64, u64), (u64, u64))>,
 }
+
+/// 累计流量查询节流周期（次）：每 N 次 poll 刷一次今日/本周 SUM。
+const TRAFFIC_REFRESH_EVERY: u32 = 10;
 
 impl DbReader {
     /// 用 config.toml 默认路径构造 reader（找不到 db 不会立即失败）
@@ -73,7 +90,15 @@ impl DbReader {
             db_path: db_path.into(),
             conn: Mutex::new(None),
             stale_threshold: Duration::from_secs(5),
+            traffic_refresh_every: TRAFFIC_REFRESH_EVERY,
+            traffic_tick: std::cell::Cell::new(0),
+            traffic_cache: Mutex::new(((0, 0), (0, 0))),
         }
+    }
+
+    /// 读缓存的流量统计（db 打不开 / 未刷新时返回最近一次结果）。
+    fn cached_traffic(&self) -> ((u64, u64), (u64, u64)) {
+        *self.traffic_cache.lock()
     }
 
     /// 完整轮询（含事件 snapshot/culprits 反序列化）——供测试与需要事件详情的调用方使用。
@@ -92,6 +117,8 @@ impl DbReader {
     /// `want_event_detail == false` 时事件段只 SELECT timestamp 一列，
     /// 不反序列化 snapshot/culprits 两个大 JSON 字段（overlay 只显示「上次卡顿时间」）。
     fn poll_impl(&self, want_event_detail: bool) -> PollResult {
+        // 流量统计缓存：db 打不开的早退分支也带上最近一次结果，避免悬浮窗闪 0
+        let cached = self.cached_traffic();
         // 1) 拿到（或建立）连接
         let mut guard = self.conn.lock();
         if guard.is_none() {
@@ -112,6 +139,8 @@ impl DbReader {
                         health: ServiceHealth::NoDatabase,
                         today_event_count: 0,
                         last_heartbeat: None,
+                        today_net_bytes: cached.0,
+                        week_net_bytes: cached.1,
                     };
                 }
             }
@@ -123,6 +152,8 @@ impl DbReader {
                 health: ServiceHealth::NoDatabase,
                 today_event_count: 0,
                 last_heartbeat: None,
+                today_net_bytes: cached.0,
+                week_net_bytes: cached.1,
             };
         };
 
@@ -181,6 +212,28 @@ impl DbReader {
             )
             .map(|n| n as u32)
             .unwrap_or(0)
+        };
+
+        // 4b) 今日 / 本周累计网络流量（悬浮窗原「磁盘读写速率」位改显累计流量）。
+        // 口径：samples 约 1Hz 落库，net_sent_bps / net_recv_bps 是该秒传输字节数
+        // （网卡计数差分），窗口内求和即近似累计字节量——跨重启成立，故不用
+        // net_*_total（开机累计、重启清零）。每 traffic_refresh_every 次 poll 才真正
+        // 查库一次，其余 tick 读缓存（SUM 需扫当日全部样本行，逐秒重算太浪费）。
+        let (today_net_bytes, week_net_bytes) = {
+            let refresh = self.traffic_tick.get() % self.traffic_refresh_every == 0;
+            self.traffic_tick.set(self.traffic_tick.get().wrapping_add(1));
+            let mut cache = self.traffic_cache.lock();
+            if refresh {
+                let (t0, t1) = find_stutter_core::logger::local_today_bounds();
+                if let Some(v) = find_stutter_core::logger::sum_network_traffic(conn, &t0, &t1).ok() {
+                    cache.0 = v;
+                }
+                let (w0, w1) = find_stutter_core::logger::local_this_week_bounds();
+                if let Some(v) = find_stutter_core::logger::sum_network_traffic(conn, &w0, &w1).ok() {
+                    cache.1 = v;
+                }
+            }
+            *cache
         };
 
         // 5) 读最近一次事件（用于「上次闪烁」提示）。
@@ -330,6 +383,8 @@ impl DbReader {
             health,
             today_event_count,
             last_heartbeat: heartbeat.map(|(ts, _)| ts),
+            today_net_bytes,
+            week_net_bytes,
         }
     }
 
@@ -364,7 +419,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -395,7 +450,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         // 只建表 + 写一条 sample，不写心跳
         let mut logger = Logger::new(&cfg).unwrap();
@@ -428,7 +483,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let logger = Logger::new(&cfg).unwrap();
         // 写一个 2 小时前的心跳
@@ -460,7 +515,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -488,6 +543,43 @@ mod tests {
         std::fs::remove_file(&db).ok();
     }
 
+    /// 验证：今日 / 本周累计网络流量按「速率求和」口径统计，
+    /// 且窗口外（10 天前，必在本 ISO 周之外）的样本不计入。
+    #[test]
+    fn poll_reads_network_traffic_windows() {
+        let db = unique_db("net");
+        let cfg = StorageConfig {
+            db_path: db.clone(),
+            retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+        // 直接插入带控制时间戳的样本：现在（必属今日 & 本周）与 10 天前
+        // （ISO 周最多回溯到本周一即至多 6 天前，故必在今日/本周窗口之外）
+        let conn = Connection::open(&db).unwrap();
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(10);
+        for (ts, sent, recv) in [
+            (now.to_rfc3339(), 1000_i64, 2000_i64),
+            (old.to_rfc3339(), 500_000_i64, 900_000_i64),
+        ] {
+            conn.execute(
+                "INSERT INTO samples (timestamp, net_sent_bps, net_recv_bps) VALUES (?1, ?2, ?3)",
+                rusqlite::params![ts, sent, recv],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let reader = DbReader::new(&db);
+        let r = reader.poll();
+        assert_eq!(r.today_net_bytes, (1000, 2000), "今日只应计入当前样本");
+        assert_eq!(r.week_net_bytes, (1000, 2000), "10 天前样本不应计入本周");
+
+        std::fs::remove_file(&db).ok();
+    }
+
     /// 验证 ServiceHealth::is_responsive
     #[test]
     fn service_health_is_responsive() {
@@ -504,7 +596,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -536,7 +628,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -577,7 +669,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -743,7 +835,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
