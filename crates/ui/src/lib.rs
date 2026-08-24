@@ -75,6 +75,17 @@ pub fn run() -> anyhow::Result<()> {
         config.storage.db_path
     );
 
+    // 低内存模式：软件渲染器经 SLINT_BACKEND 环境变量选择，必须发生在任何 Slint
+    // 窗口/平台层创建之前。（edition 2024 起 set_var 为 unsafe；此处处于 main 线程
+    // 启动早期、尚无并发读者，单次写入安全。）
+    if config.ui.software_render {
+        // SAFETY：见上——启动早期、无并发环境变量访问。
+        unsafe {
+            std::env::set_var("SLINT_BACKEND", "winit-software");
+        }
+        log::info!("软件渲染模式已启用 (SLINT_BACKEND=winit-software)");
+    }
+
     // 0) P3+：自动检测 + 启动后台服务（不影响 GUI 启动，失败只记日志）。
     //    自动测试环境可用 FIND_STUTTER_SKIP_SERVICE=1 或
     //    config.toml [ui] auto_start_service = false 完全跳过（避免弹 UAC）。

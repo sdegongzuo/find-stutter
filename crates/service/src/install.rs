@@ -29,6 +29,41 @@ pub enum ScmError {
 
 pub type ScmResult<T> = Result<T, ScmError>;
 
+/// 配置 SCM 失败恢复：服务进程异常退出（崩溃 / 未处理 panic）时自动重启。
+///
+/// 三段退避：5s → 10s → 30s，24h 无失败则重置计数。用 `sc.exe` 而非原生
+/// ChangeServiceConfig2：windows-service crate 未暴露失败动作 API，而 install
+/// 本就在已提权上下文中执行，sc.exe 等价可靠。失败仅告警不阻塞安装。
+fn ensure_failure_recovery() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new("sc")
+        .args([
+            "failure",
+            SERVICE_NAME,
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/5000/restart/10000/restart/30000",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            log::info!("service 失败恢复策略已配置（崩溃后 5s/10s/30s 自动重启）");
+        }
+        Ok(o) => {
+            log::warn!(
+                "sc failure 配置未成功（忽略，不影响安装）: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        Err(e) => {
+            log::warn!("sc failure 调用失败（忽略，不影响安装）: {}", e);
+        }
+    }
+}
+
 /// 注册服务：把当前 exe 注册为名为 `SERVICE_NAME` 的 Windows 服务。
 ///
 /// 启动类型：自动（开机自启）
@@ -81,6 +116,8 @@ pub fn install() -> ScmResult<()> {
                     SERVICE_NAME,
                     exe_path.display()
                 );
+                // 崩溃自恢复（幂等，可随时重设）；失败不影响安装主流程
+                ensure_failure_recovery();
                 // 首次注册后立即 start
                 let start_handle =
                     manager.open_service(SERVICE_NAME, ServiceAccess::START)?;

@@ -22,6 +22,18 @@ use windows::Win32::System::Performance::{
     PDH_HQUERY,
 };
 
+/// 进程表低频刷新节拍（tick 数）：sysinfo 全量枚举进程是采集热路径上最贵的单项
+/// （数百进程时每次数毫秒~十几毫秒）。平时每 5 tick（默认配置下约 5s）刷新一次，
+/// 保持 sysinfo 的 per-process cpu_usage 增量基线新鲜；卡顿帧额外强制刷新，
+/// 归因快照质量不劣化。process_count 允许 ≤5s 陈旧（仅落库展示，不参与判定）。
+const PROCESS_REFRESH_EVERY_TICKS: u32 = 5;
+
+/// 慢通道（CPU 频率 / 温度）节拍：单行 WMI 查询，开销小，保持约 5s 读一次。
+const SLOW_FREQ_TEMP_TICKS: u32 = 5;
+/// GPU 利用率慢通道节拍：GPU Engine 查询要枚举全部引擎实例（数百行），
+/// 是慢通道里最贵的一条——放宽到约 15s 读一次；悬浮窗数字刷新粒度仍可接受。
+const SLOW_GPU_TICKS: u32 = 15;
+
 /// Windows PDH-based disk I/O sampler.
 ///
 /// Holds the PDH query + counter handles for the `_Total` physical-disk
@@ -433,7 +445,7 @@ impl Default for SysSample {
 ///
 /// 单个 PDH query 同时挂载 5 个计数器，每 tick 采样一次：
 /// - `\PhysicalDisk(_Total)\% Disk Time`：磁盘繁忙度（%）
-/// - `\PhysicalDisk(_Total)\Avg Disk sec/Transfer`：单次 IO 延迟（秒，转 ms）
+/// - `\PhysicalDisk(_Total)\Avg. Disk sec/Transfer`：单次 IO 延迟（秒，转 ms）
 /// - `\Processor(_Total)\% DPC Time`：DPC 占用（%）
 /// - `\Processor(_Total)\% Interrupt Time`：中断处理占用（%）
 /// - `\System\Context Switches/sec`：上下文切换速率（/s）
@@ -442,7 +454,7 @@ impl Default for SysSample {
 /// 数值全部用 `PDH_FMT_DOUBLE` 格式化以保留精度；CStatus != 0 或负数一律钳为 0。
 ///
 /// **健壮性（修复前为「全有或全无」）**：任一计数器在本机不可用（如某些系统
-/// `\PhysicalDisk(_Total)\Avg Disk sec/Transfer` 找不到 `_Total` 实例）时，**仅禁用
+/// `\PhysicalDisk(_Total)\Avg. Disk sec/Transfer` 找不到 `_Total` 实例）时，**仅禁用
 /// 该字段**并打日志，其余计数器照常工作——避免单个计数器失败拖垮 DPC/中断/磁盘
 /// 繁忙/上下文切换全部静默失效（此前因此导致 detector 的 DiskBusy/Dpc/Interrupt/
 /// ContextSwitch 判定从未触发，属于假阴性）。
@@ -482,12 +494,12 @@ impl SysPdh {
                 warn!("SysPdh: 计数器不可用（已禁用该字段）: \\PhysicalDisk(_Total)\\% Disk Time");
             }
             c = PDH_HCOUNTER::default();
-            if PdhAddEnglishCounterW(query, w!(r"\PhysicalDisk(_Total)\Avg Disk sec/Transfer"), 0, &mut c)
+            if PdhAddEnglishCounterW(query, w!(r"\PhysicalDisk(_Total)\Avg. Disk sec/Transfer"), 0, &mut c)
                 == ERROR_SUCCESS.0
             {
                 disk_avg_io = Some(c);
             } else {
-                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\PhysicalDisk(_Total)\\Avg Disk sec/Transfer");
+                warn!("SysPdh: 计数器不可用（已禁用该字段）: \\PhysicalDisk(_Total)\\Avg. Disk sec/Transfer");
             }
             c = PDH_HCOUNTER::default();
             if PdhAddEnglishCounterW(query, w!(r"\Processor(_Total)\% DPC Time"), 0, &mut c)
@@ -571,7 +583,7 @@ impl SysPdh {
 
             SysSample {
                 disk_busy_percent: dt,
-                // Avg Disk sec/Transfer 是秒，×1000 转毫秒（该计数器本机不可用时恒为 0）
+                // Avg. Disk sec/Transfer 是秒，×1000 转毫秒（该计数器本机不可用时恒为 0）
                 disk_avg_io_ms: (dio * 1000.0),
                 dpc_percent: dpc,
                 interrupt_percent: intr,
@@ -640,6 +652,9 @@ pub struct Collector {
     sys_pdh: Option<SysPdh>,
     /// F-RC14-a/b：进程指纹采样器（句柄/GDI/USER/进程级 IO 速率）
     fingerprint: ProcessFingerprintSampler,
+    /// WMI 慢通道连接缓存：COM 初始化 + 名空间连接每次开销可观（毫秒级），
+    /// 复用同一连接；初始化/查询失败时置 None，下个慢通道 tick 自动重连。
+    wmi_con: Option<WMIConnection>,
 }
 
 impl Collector {
@@ -660,6 +675,15 @@ impl Collector {
         let paging_pdh = PagingPdh::new();
         let sys_pdh = SysPdh::new();
 
+        // WMI 连接缓存：服务循环单线程持有；失败静默降级（None），慢通道按 tick 重试
+        let wmi_con = match WMIConnection::new() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("WMI 连接初始化失败（慢通道降级，稍后自动重试）: {}", e);
+                None
+            }
+        };
+
         Self {
             sys,
             networks,
@@ -671,6 +695,7 @@ impl Collector {
             paging_pdh,
             sys_pdh,
             fingerprint: ProcessFingerprintSampler::new(),
+            wmi_con,
         }
     }
 
@@ -682,15 +707,28 @@ impl Collector {
 
     /// 采集一帧系统指标。
     ///
+    /// 资源优化：每 tick 只刷新本帧真正消费的轻量指标（CPU 使用率、内存、网卡速率），
+    /// 不再调用 `refresh_all()`——后者每秒全量枚举全部进程 / 磁盘卷 / 网卡列表，
+    /// 是常驻服务 CPU 占用的最大单项开销。
+    ///
+    /// 进程表按 [`PROCESS_REFRESH_EVERY_TICKS`] 低频节拍刷新，保持 per-process
+    /// cpu_usage 增量基线新鲜；卡顿帧强制刷新一次。
+    ///
     /// `need_processes == false` 时跳过全进程遍历构建 top_processes（空列表）——
     /// 平时（无卡顿）detector 不消费它，省掉每 tick 的进程排序开销；
     /// 卡顿进行中或刚结束一帧才需要快照（见 `Detector::needs_process_snapshot`）。
     pub fn collect_with(&mut self, need_processes: bool) -> Sample {
-        self.sys.refresh_all();
+        self.sys.refresh_cpu_usage();
+        self.sys.refresh_memory();
         self.networks.refresh(true);
 
         let tick = self.tick;
         self.tick = self.tick.wrapping_add(1);
+
+        // 进程表低频刷新（维持 cpu_usage 基线）；卡顿帧强制刷新，归因取最新读数。
+        if need_processes || tick % PROCESS_REFRESH_EVERY_TICKS == 0 {
+            self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        }
 
         let cpu_usage = self.sys.global_cpu_usage();
         let cpu_per_core: Vec<f32> = self.sys.cpus().iter().map(|c| c.cpu_usage()).collect();
@@ -726,6 +764,8 @@ impl Collector {
         self.prev_net_sent = net_sent_total;
         self.prev_net_recv = net_recv_total;
 
+        // 进程计数：读上次进程表刷新的缓存长度（≤ PROCESS_REFRESH_EVERY_TICKS 陈旧）。
+        // 该字段只落库展示 / 快照输出，不参与检测判定，陈旧无害。
         let process_count = self.sys.processes().len();
 
         // Disk I/O: sampled every tick via PDH (accurate, never 0 due to the
@@ -753,13 +793,17 @@ impl Collector {
             None => SysSample::default(),
         };
 
-        // Slow channel (every 5 ticks): CPU freq, GPU usage, temperature via WMI.
-        // These are expensive/rarely-changing, so leaving them on the slow
-        // channel is fine.
-        let (cpu_freq, gpu_usage, cpu_temp) = if tick % 5 == 0 {
-            self.collect_wmi_slow()
+        // 慢通道（WMI）：频率/温度每 SLOW_FREQ_TEMP_TICKS 一次；GPU 查询最贵，
+        // 单独放宽到 SLOW_GPU_TICKS。未到节拍的帧相应字段为 None（与既有行为一致）。
+        let (cpu_freq, cpu_temp) = if tick % SLOW_FREQ_TEMP_TICKS == 0 {
+            self.collect_wmi_freq_temp()
         } else {
-            (None, None, None)
+            (None, None)
+        };
+        let gpu_usage = if tick % SLOW_GPU_TICKS == 0 {
+            self.collect_wmi_gpu()
+        } else {
+            None
         };
 
         // 进程快照：取 top by CPU 与 top by 内存的并集（去重），最多 12 个，
@@ -838,13 +882,22 @@ impl Collector {
             .collect()
     }
 
-    fn collect_wmi_slow(&self) -> (Option<f32>, Option<f32>, Option<f32>) {
-        // wmi 0.18：WMIConnection::new() 自动初始化 COM，无需 COMLibrary
-        let wmi_con = match WMIConnection::new() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("WMI connection failed: {}", e);
-                return (None, None, None);
+    /// 取缓存的 WMI 连接；缺失/失效时现场重建一次。返回 None 表示不可用。
+    /// COM 初始化 + 名空间连接是毫秒级开销，复用同一连接是慢通道降耗的主体。
+    fn wmi_conn(&mut self) -> Option<&WMIConnection> {
+        if self.wmi_con.is_none() {
+            self.wmi_con = WMIConnection::new().ok();
+        }
+        self.wmi_con.as_ref()
+    }
+
+    /// CPU 频率 + 温度（单行查询，每 SLOW_FREQ_TEMP_TICKS 采样一次）。
+    fn collect_wmi_freq_temp(&mut self) -> (Option<f32>, Option<f32>) {
+        let wmi_con = match self.wmi_conn() {
+            Some(c) => c,
+            None => {
+                warn!("WMI connection unavailable (reconnect failed), freq/temp skipped");
+                return (None, None);
             }
         };
 
@@ -859,28 +912,6 @@ impl Collector {
                     None
                 }
             });
-
-        // Fixed: the correct class is Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine.
-        // It has multiple rows (one per GPU engine), so we sum UtilizationPercentage
-        // across all rows and cap at 100%.
-        let gpu_usage = wmi_con
-            .raw_query(
-                "SELECT UtilizationPercentage \
-                 FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine",
-            )
-            .ok()
-            .and_then(|r: Vec<HashMap<String, Variant>>| {
-                let per_engine: Vec<Option<u64>> = r
-                    .iter()
-                    .map(|row| match row.get("UtilizationPercentage") {
-                        Some(Variant::UI8(v)) => Some(*v),
-                        Some(Variant::UI4(v)) => Some(*v as u64),
-                        _ => None,
-                    })
-                    .collect();
-                aggregate_gpu_utilization(&per_engine)
-            });
-
         let cpu_temp = wmi_con
             .raw_query("SELECT CurrentTemperature FROM Win32_PerfFormattedData_ThermalZoneInformation")
             .ok()
@@ -899,7 +930,38 @@ impl Collector {
             warn!("WMI 温度查询无数据：cpu_temp 将保持 None（连接成功但热区/WMI 类可能不可用）");
         }
 
-        (cpu_freq, gpu_usage, cpu_temp)
+        (cpu_freq, cpu_temp)
+    }
+
+    /// GPU 利用率（GPU Engine 多行聚合，最贵的慢通道查询，每 SLOW_GPU_TICKS 一次）。
+    fn collect_wmi_gpu(&mut self) -> Option<f32> {
+        let wmi_con = match self.wmi_conn() {
+            Some(c) => c,
+            None => {
+                warn!("WMI connection unavailable (reconnect failed), gpu skipped");
+                return None;
+            }
+        };
+
+        // 正确的类是 Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine：
+        // 每个 GPU 引擎一行，把 UtilizationPercentage 全部求和后封顶 100%。
+        wmi_con
+            .raw_query(
+                "SELECT UtilizationPercentage \\
+                 FROM Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine",
+            )
+            .ok()
+            .and_then(|r: Vec<HashMap<String, Variant>>| {
+                let per_engine: Vec<Option<u64>> = r
+                    .iter()
+                    .map(|row| match row.get("UtilizationPercentage") {
+                        Some(Variant::UI8(v)) => Some(*v),
+                        Some(Variant::UI4(v)) => Some(*v as u64),
+                        _ => None,
+                    })
+                    .collect();
+                aggregate_gpu_utilization(&per_engine)
+            })
     }
 }
 

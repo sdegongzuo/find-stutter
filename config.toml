@@ -115,6 +115,9 @@ taskbar = false
 process_highlight_pct = 30.0
 # 进程详情页：自动刷新间隔（毫秒），标题栏下拉可选 500/1000/2000/5000/30000
 process_refresh_ms = 30000
+# 低内存模式：用 CPU 软件渲染替代 GPU(OpenGL) 渲染，省数十 MB 常驻内存
+#（悬浮窗 1Hz 刷新场景 CPU 开销可忽略）。需重启 GUI 生效。
+software_render = false
 
 [storage]
 # SQLite 数据库文件路径
@@ -123,6 +126,10 @@ db_path = "stutter.db"
 retention_days = 30
 # stutter_events（及软件根因子表）独立保留天数：与 samples 的 30 天不同周期（PRD §3.4.6）
 event_retention_days = 7
+# samples 原始分辨率（1Hz）热保留天数：超过后自动聚合为每分钟一行
+#（水位列取均值，速率/尖峰列取最大值保留卡顿证据）。稳态库体积从数百 MB 降到数十 MB。
+# 0 = 关闭降采样（全周期保持 1Hz）。改后需等服务下一轮清理任务生效。
+hot_retention_days = 3
 
 [notifications]
 # 检测到卡顿是否弹出提醒

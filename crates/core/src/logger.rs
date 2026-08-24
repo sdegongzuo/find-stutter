@@ -2,7 +2,8 @@ use crate::types::{
     ProcessModule, RootCauseReport, Sample, StackSample, StorageConfig, StutterEvent,
     WindowsEventRecord,
 };
-use chrono::{DateTime, Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Utc};
+use log::warn;
 use rusqlite::{params, Connection};
 use std::time::{Duration, Instant};
 
@@ -448,10 +449,87 @@ impl Logger {
     }
 
     pub fn cleanup(&self) -> anyhow::Result<()> {
+        // 冷数据降采样先于过期删除：把 [hot, retention) 区间的原始 1Hz 行
+        // 聚合成每分钟一行（分批限速），再删除超过 retention 的全部旧行。
+        if self.config.hot_retention_days > 0 {
+            if let Err(e) = self.downsample_cold_samples(self.config.hot_retention_days as i64) {
+                warn!("冷数据降采样失败（本轮跳过，不影响过期清理）: {}", e);
+            }
+        }
         self.cleanup_inner(
             self.config.retention_days as i64,
             self.config.event_retention_days as i64,
         )
+    }
+
+    /// 冷数据降采样：把超过 hot_days 天的原始 1Hz 样本聚合为每分钟一行。
+    ///
+    /// 聚合口径：水位类列取 AVG；速率 / 风暴 / 尖峰类列取 MAX（保留卡顿证据）；
+    /// cpu_per_core 置 NULL（当前无任何读取方消费该列）。整数列一律 CAST 回
+    /// INTEGER，保持列亲和性（读取方按 Option<i64> 取值，混入 REAL 会解析失败）。
+    ///
+    /// 幂等性：原始行的 timestamp 恒为 to_rfc3339()（带小数秒/时区后缀，长度 > 19），
+    /// 降采样行是分钟对齐的 YYYY-MM-DDTHH:MM:SS（长度恰 19）；谓词
+    /// length(timestamp) > 19 保证已聚合行不会被重复选中。
+    ///
+    /// 分批限速：单次最多聚合 6 小时的数据——首次部署时存量可达数百万行，
+    /// 一次吃完会长时间阻塞采集线程（心跳停摆 → GUI 误报 Stale）；
+    /// 分批后每小时清理任务各消化一批，几天内自然收敛到稳态。
+    fn downsample_cold_samples(&self, hot_days: i64) -> anyhow::Result<()> {
+        let cutoff = (Utc::now() - ChronoDuration::days(hot_days)).to_rfc3339();
+
+        // 本批起点 = 最老的原始冷行；无待处理行则直接返回
+        let oldest: Option<String> = self.conn.query_row(
+            "SELECT MIN(timestamp) FROM samples WHERE timestamp < ?1 AND length(timestamp) > 19",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+        let Some(oldest) = oldest else {
+            return Ok(());
+        };
+        // 批终点 = 起点 + 6h，但不越过热边界（新于 cutoff 的行不动）
+        let oldest_dt = DateTime::parse_from_rfc3339(&oldest)?.with_timezone(&Utc);
+        let batch_end = (oldest_dt + ChronoDuration::seconds(6 * 3600))
+            .min(Utc::now() - ChronoDuration::days(hot_days))
+            .to_rfc3339();
+
+        let tx = self.conn.unchecked_transaction()?;
+        // 聚合插入：每分钟一行（分钟键 = substr(timestamp,1,16)，RFC3339 前缀稳定对齐）
+        tx.execute(
+            "INSERT INTO samples (
+                timestamp, cpu_usage, cpu_per_core, cpu_freq_mhz,
+                mem_usage_percent, mem_used_mb, mem_total_mb, mem_available_mb,
+                swap_usage_percent, disk_read_bps, disk_write_bps,
+                net_sent_bps, net_recv_bps, net_sent_total, net_recv_total,
+                gpu_usage, cpu_temp, gpu_temp, process_count, thread_count,
+                commit_bytes, commit_limit, page_reads_per_sec,
+                disk_busy_percent, disk_avg_io_ms, dpc_percent, interrupt_percent,
+                context_switches_per_sec
+            )
+            SELECT substr(timestamp, 1, 16) || ':00',
+                AVG(cpu_usage), NULL, AVG(cpu_freq_mhz),
+                AVG(mem_usage_percent), CAST(AVG(mem_used_mb) AS INTEGER),
+                CAST(AVG(mem_total_mb) AS INTEGER), CAST(AVG(mem_available_mb) AS INTEGER),
+                AVG(swap_usage_percent), MAX(disk_read_bps), MAX(disk_write_bps),
+                MAX(net_sent_bps), MAX(net_recv_bps), MAX(net_sent_total), MAX(net_recv_total),
+                AVG(gpu_usage), AVG(cpu_temp), MAX(gpu_temp),
+                CAST(AVG(process_count) AS INTEGER), 0,
+                CAST(AVG(commit_bytes) AS INTEGER), CAST(MAX(commit_limit) AS INTEGER),
+                MAX(page_reads_per_sec),
+                MAX(disk_busy_percent), AVG(disk_avg_io_ms), MAX(dpc_percent),
+                MAX(interrupt_percent), CAST(MAX(context_switches_per_sec) AS INTEGER)
+            FROM samples
+            WHERE timestamp >= ?1 AND timestamp < ?2 AND length(timestamp) > 19
+            GROUP BY substr(timestamp, 1, 16)",
+            params![oldest, batch_end],
+        )?;
+        // 删除本批已聚合的原始行（同一事务，原子切换）
+        tx.execute(
+            "DELETE FROM samples WHERE timestamp >= ?1 AND timestamp < ?2 AND length(timestamp) > 19",
+            params![oldest, batch_end],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// 按指定保留天数清理过期数据（测试/运维用：samples 与事件同一天数）。
@@ -608,10 +686,129 @@ pub fn local_today_bounds() -> (String, String) {
     (start.to_rfc3339(), end.to_rfc3339())
 }
 
+/// 本地时区「当周」（ISO 周：周一为一周起点）的边界，
+/// 返回 `(当地周一 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
+///
+/// 口径与 [`local_today_bounds_utc`] 一致：库里 `timestamp` 统一存 UTC
+/// （`+00:00`），这里把本地周一零点换算成 UTC 后返回，调用方用 `BETWEEN`
+/// 比较。悬浮窗「本周流量」tooltip 与后续按周统计都应以它为准。
+pub fn local_this_week_bounds_utc() -> (DateTime<Utc>, DateTime<Utc>) {
+    let now_local = Local::now();
+    // weekday().num_days_from_monday()：周一=0 … 周日=6，回退相应天数即本周周一。
+    let monday = now_local.date_naive()
+        - ChronoDuration::days(now_local.weekday().num_days_from_monday() as i64);
+    let midnight_local = monday.and_hms_opt(0, 0, 0).unwrap();
+    let start = Local
+        .from_local_datetime(&midnight_local)
+        .single()
+        .unwrap_or(now_local)
+        .with_timezone(&Utc);
+    let end = Utc::now();
+    (start, end)
+}
+
+/// [`local_this_week_bounds_utc`] 的 RFC3339 便捷包装：
+/// `(当地周一 00:00 对应的 UTC 时刻, 当前 UTC 时刻)`。
+pub fn local_this_week_bounds() -> (String, String) {
+    let (start, end) = local_this_week_bounds_utc();
+    (start.to_rfc3339(), end.to_rfc3339())
+}
+
+/// 统计 `[start, end]` 时间窗内 samples 的累计网络流量 `(发送字节, 接收字节)`。
+///
+/// 口径说明：samples 以约 1 秒间隔落库，`net_sent_bps` / `net_recv_bps` 是该秒
+/// 的传输字节数（相邻两次网卡计数的差分），对窗口内样本求和即为该窗口累计流量
+/// 的近似值。相比 `net_sent_total` / `net_recv_total`（操作系统自开机累计、重启
+/// 清零，跨天/跨周无法直接取差），速率求和跨重启依然成立，故以它作为
+/// 「今日 / 本周累计流量」的统一口径。
+pub fn sum_network_traffic(
+    conn: &Connection,
+    start: &str,
+    end: &str,
+) -> anyhow::Result<(u64, u64)> {
+    let (sent, recv): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(net_sent_bps), 0), COALESCE(SUM(net_recv_bps), 0) \
+         FROM samples WHERE timestamp BETWEEN ?1 AND ?2",
+        params![start, end],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    Ok((sent.max(0) as u64, recv.max(0) as u64))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{ProcessBrief, Severity};
+
+    /// 冷数据降采样：超过 hot_days 的原始行按分钟聚合（AVG/MAX 口径、
+    /// cpu_per_core 置 NULL、整数列保持 INTEGER），原始行删除；
+    /// 热区内的行与分钟对齐的聚合行不被二次选中（幂等谓词）。
+    #[test]
+    fn downsample_aggregates_cold_samples_per_minute() {
+        use chrono::Timelike as _; // with_second
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("ds.db");
+        let cfg = StorageConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            retention_days: 30,
+            event_retention_days: 7,
+            hot_retention_days: 1,
+        };
+        {
+            let mut logger = Logger::new(&cfg).unwrap();
+            logger.flush().unwrap(); // 建表（空 buffer）
+        }
+        let seed = Connection::open(&db).unwrap();
+        let now = Utc::now();
+        // 冷区（2 天前）：同一分钟 2 行，值可区分 AVG 与 MAX；另一分钟 1 行
+        for (i, (sec, cpu, bps)) in [(0i32, 10.0f32, 100i64), (30, 20.0, 300)].iter().enumerate() {
+            seed.execute(
+                "INSERT INTO samples (timestamp, cpu_usage, cpu_per_core, mem_used_mb, disk_read_bps) VALUES (?1,?2,?3,?4,?5)",
+                params![
+                    (now - ChronoDuration::days(2)).with_second(*sec as u32).unwrap().format("%Y-%m-%dT%H:%M:%S%.9f+00:00").to_string(),
+                    cpu,
+                    format!("{}", i),
+                    1000_i64 + i as i64,
+                    bps,
+                ],
+            ).unwrap();
+        }
+        seed.execute(
+            "INSERT INTO samples (timestamp, cpu_usage) VALUES (?1, 5.0)",
+            params![(now - ChronoDuration::days(2) - ChronoDuration::minutes(1)).format("%Y-%m-%dT%H:%M:%S%.9f+00:00").to_string()],
+        ).unwrap();
+        // 热区（现在）：不应被动
+        seed.execute(
+            "INSERT INTO samples (timestamp, cpu_usage, cpu_per_core) VALUES (?1, 99.0, '7')",
+            params![now.format("%Y-%m-%dT%H:%M:%S%.9f+00:00").to_string()],
+        ).unwrap();
+        drop(seed);
+
+        let logger = Logger::new(&cfg).unwrap();
+        logger.downsample_cold_samples(1).unwrap();
+        logger.downsample_cold_samples(1).unwrap(); // 重跑验证幂等
+
+        let c = Connection::open(&db).unwrap();
+        // 聚合出 2 个冷分钟行；热区 1 行保留
+        let (n_total, n_cold): (i64, i64) = c.query_row(
+            "SELECT COUNT(*), SUM(length(timestamp) = 19) FROM samples",
+            [], |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        ).unwrap();
+        assert_eq!(n_total, 3, "2 分钟聚合行 + 1 热区行");
+        assert_eq!(n_cold, 2);
+        // 同一分钟两行：cpu=AVG(10,20)=15，disk_read_bps=MAX(100,300)=300，mem_used_mb=CAST(AVG)=INTEGER，cpu_per_core=NULL
+        let (cpu, bps, mem, cpc): (f64, i64, i64, Option<String>) = c.query_row(
+            "SELECT cpu_usage, disk_read_bps, mem_used_mb, cpu_per_core FROM samples WHERE length(timestamp)=19 AND timestamp < ?1 ORDER BY timestamp DESC LIMIT 1",
+            params![(now - ChronoDuration::hours(36)).to_rfc3339()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap();
+        assert!((cpu - 15.0).abs() < 1e-9);
+        assert_eq!(bps, 300);
+        assert_eq!(mem, 1000); // CAST(AVG(1000,1001)) 截断为 1000
+        assert!(cpc.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn temp_dir() -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -621,6 +818,60 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// 「当周」边界：起点必须是本地周一 00:00，且 start <= end。
+    #[test]
+    fn local_this_week_bounds_starts_monday_midnight() {
+        let (s, e) = local_this_week_bounds();
+        let start = chrono::DateTime::parse_from_rfc3339(&s).unwrap();
+        let start_local = start.with_timezone(&Local);
+        assert_eq!(start_local.weekday(), chrono::Weekday::Mon, "本周应从周一起算");
+        assert_eq!(
+            start_local.time(),
+            chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+            "起点应是本地周一零点"
+        );
+        let end = chrono::DateTime::parse_from_rfc3339(&e).unwrap();
+        assert!(start <= end, "周边界 start 应早于等于 end");
+    }
+
+    /// 流量求和口径：只累加时间窗内样本的 net_*_bps，窗口外/空窗返回 0。
+    #[test]
+    fn sum_network_traffic_only_counts_window() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("net_sum.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE samples (
+                timestamp TEXT NOT NULL,
+                net_sent_bps INTEGER,
+                net_recv_bps INTEGER
+            );",
+        )
+        .unwrap();
+        // 统一 RFC3339（+00:00）格式，与落库 timestamp 字符串比较口径一致
+        for (ts, sent, recv) in [
+            ("2026-01-05T10:00:00+00:00", 100_i64, 200_i64),
+            ("2026-01-05T11:00:00+00:00", 300, 400),
+            ("2026-02-01T00:00:00+00:00", 999_999, 888_888), // 窗口外
+        ] {
+            conn.execute(
+                "INSERT INTO samples (timestamp, net_sent_bps, net_recv_bps) VALUES (?1, ?2, ?3)",
+                params![ts, sent, recv],
+            )
+            .unwrap();
+        }
+
+        let (sent, recv) = sum_network_traffic(&conn, "2026-01-05T00:00:00+00:00", "2026-01-05T23:59:59+00:00").unwrap();
+        assert_eq!((sent, recv), (400, 600), "只应累加窗口内两条样本");
+
+        let (sent, recv) = sum_network_traffic(&conn, "2027-01-01T00:00:00+00:00", "2027-01-02T00:00:00+00:00").unwrap();
+        assert_eq!((sent, recv), (0, 0), "空窗口应为 0");
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn make_sample() -> Sample {
@@ -673,7 +924,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&config).unwrap();
 
@@ -724,7 +975,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let result = Logger::new(&config);
@@ -750,7 +1001,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         // Logger::new 建表 + 迁移 + 建索引后，sqlite_master 里应存在两个时间戳索引
@@ -798,7 +1049,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -830,7 +1081,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -857,7 +1108,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -885,7 +1136,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -909,7 +1160,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -949,7 +1200,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -977,7 +1228,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -1011,7 +1262,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let logger = Logger::new(&config).unwrap();
 
@@ -1053,7 +1304,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -1071,7 +1322,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -1096,7 +1347,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1124,7 +1375,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1158,7 +1409,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 0, // 0 days = everything is old
-            event_retention_days: 0,
+            event_retention_days: 0, hot_retention_days: 0,
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1191,7 +1442,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 30, // 30 days = recent data stays
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();
@@ -1221,7 +1472,7 @@ mod tests {
         let config = StorageConfig {
             db_path,
             retention_days: 0,
-            event_retention_days: 0,
+            event_retention_days: 0, hot_retention_days: 0,
         };
 
         let logger = Logger::new(&config).unwrap();

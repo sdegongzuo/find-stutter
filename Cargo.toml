@@ -9,3 +9,11 @@ members = [
     "crates/service",
 ]
 resolver = "2"
+
+[profile.release]
+# 资源占用优化：thin LTO + 单 codegen unit + 剥离符号表。
+# 显著缩小 exe 体积（此前 ~23MB），减少磁盘占用、加快启动，并略微降低
+# 常驻私有内存。构建耗时略增，仅影响 release（开发迭代走 debug 不受影响）。
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

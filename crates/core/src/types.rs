@@ -40,7 +40,7 @@ pub struct Sample {
     /// 比 B/s 吞吐更准确地反映磁盘是否真正饱和（队列里排队的 IO）。
     #[serde(default)]
     pub disk_busy_percent: f32,
-    /// 单次 IO 延迟：`\PhysicalDisk(_Total)\Avg Disk sec/Transfer` 换算成毫秒。
+    /// 单次 IO 延迟：`\PhysicalDisk(_Total)\Avg. Disk sec/Transfer` 换算成毫秒。
     /// 数值高说明磁盘每次 IO 都要等很久（机械盘寻道 / SSD 写放大等）。
     #[serde(default)]
     pub disk_avg_io_ms: f32,
@@ -461,7 +461,7 @@ pub struct DetectionConfig {
     /// 替代原来的磁盘 B/s spike——繁忙度才是磁盘真正饱和的真信号。
     #[serde(default = "default_disk_busy_threshold_percent")]
     pub disk_busy_threshold_percent: f32,
-    /// 单次 IO 延迟阈值（ms，来自 Avg Disk sec/Transfer）：超过即记为 `DiskBusy`。
+    /// 单次 IO 延迟阈值（ms，来自 Avg. Disk sec/Transfer）：超过即记为 `DiskBusy`。
     /// 与 `disk_busy_threshold_percent` 为「或」关系：任一成立即磁盘繁忙。
     #[serde(default = "default_disk_io_threshold_ms")]
     pub disk_io_threshold_ms: f32,
@@ -712,10 +712,20 @@ pub struct StorageConfig {
     /// 按 PRD §3.4.6 卡顿事件保留 7 天（同机制、不同周期）。缺省 7，旧配置无此项也可解析。
     #[serde(default = "default_event_retention_days")]
     pub event_retention_days: u32,
+    /// samples 原始分辨率（1Hz）热保留天数：超过后由清理任务聚合为**每分钟一行**
+    /// （数值列取均值，速率/风暴类列取 MAX 保留尖峰；cpu_per_core 置 NULL——
+    /// 该列当前无任何读取方消费）。稳态库体积可从数百 MB 降到数十 MB。
+    /// 0 = 关闭降采样（全周期保持 1Hz）。缺省 3，旧配置无此项也可解析。
+    #[serde(default = "default_hot_retention_days")]
+    pub hot_retention_days: u32,
 }
 
 fn default_event_retention_days() -> u32 {
     7
+}
+
+fn default_hot_retention_days() -> u32 {
+    3
 }
 
 impl Default for StorageConfig {
@@ -724,6 +734,7 @@ impl Default for StorageConfig {
             db_path: "stutter.db".to_string(),
             retention_days: 30,
             event_retention_days: 7,
+            hot_retention_days: default_hot_retention_days(),
         }
     }
 }
@@ -757,6 +768,11 @@ pub struct UiConfig {
     /// 进程详情页：自动刷新间隔（毫秒）。默认 30000 = 30 秒
     #[serde(default = "default_process_refresh_ms")]
     pub process_refresh_ms: u64,
+    /// 低内存模式：用 Slint 软件渲染器替代 FemtoVG(OpenGL)，省去 GPU 驱动侧
+    /// 常驻分配（实测可省数十 MB 常驻内存）；悬浮窗 1Hz 刷新场景 CPU 开销可忽略。
+    /// 默认 false 保持 GPU 渲染。需重启 GUI 生效。
+    #[serde(default)]
+    pub software_render: bool,
 }
 
 fn default_true() -> bool { true }
@@ -784,6 +800,7 @@ impl Default for UiConfig {
             taskbar: false,
             process_highlight_pct: default_highlight_pct(),
             process_refresh_ms: default_process_refresh_ms(),
+            software_render: false,
         }
     }
 }

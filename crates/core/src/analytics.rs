@@ -1941,7 +1941,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();        let base = local_midnight_utc();
@@ -1976,7 +1976,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2132,7 +2132,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2312,7 +2312,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2328,7 +2328,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2379,7 +2379,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -2420,7 +2420,7 @@ mod tests {
             let cfg = StorageConfig {
                 db_path: db.clone(),
                 retention_days: 30,
-                event_retention_days: 30,
+                event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
             };
             let logger = Logger::new(&cfg).unwrap();
             logger.write_event(&ev).unwrap();
@@ -2556,7 +2556,7 @@ mod tests {
         ];
         let db = unique_db("events_sort");
         {
-            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30 };
+            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30, hot_retention_days: 0 };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();
             let base = local_midnight_utc();
@@ -3104,7 +3104,7 @@ mod tests {
             ..Default::default()
         };
         {
-            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30 };
+            let cfg = StorageConfig { db_path: db.clone(), retention_days: 30, event_retention_days: 30, hot_retention_days: 0 };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();
             logger.write_event(&ev).unwrap();
@@ -3197,7 +3197,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
@@ -3270,7 +3270,7 @@ mod tests {
             let cfg = StorageConfig {
                 db_path: db.clone(),
                 retention_days: 30,
-                event_retention_days: 30,
+                event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
             };
             let mut logger = Logger::new(&cfg).unwrap();
             logger.touch_heartbeat().unwrap();

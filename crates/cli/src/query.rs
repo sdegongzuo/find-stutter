@@ -476,7 +476,7 @@ mod tests {
         let cfg = StorageConfig {
             db_path: db.to_string(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
         let mut logger = Logger::new(&cfg).unwrap();
         logger.touch_heartbeat().unwrap();
