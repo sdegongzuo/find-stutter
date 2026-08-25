@@ -5,7 +5,8 @@ use crate::types::{
 use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Utc};
 use log::warn;
 use rusqlite::{params, Connection};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 
 pub struct Logger {
@@ -13,7 +14,14 @@ pub struct Logger {
     buffer: Vec<Sample>,
     config: StorageConfig,
     last_flush: Instant,
+    /// 心跳节流锚点（SystemTime 毫秒）：调用方每 tick 调 touch_heartbeat，
+    /// 实际落库节流到 MIN_HEARTBEAT_INTERVAL_MS，降低单行表 WAL 写放大；
+    /// GUI Stale 阈值默认 5s，2s 节拍留有 2.5 倍裕度。
+    heartbeat_last_ms: AtomicU64,
 }
+
+/// 心跳最小落库间隔
+const MIN_HEARTBEAT_INTERVAL_MS: u64 = 2000;
 
 /// F-RC15 共享落库：幂等确保 root_cause_reports 表存在（兼容旧库首次写结论）。
 /// 由 logger（服务侧）与 analytics（GUI 侧窄写权连接）共同调用，避免 SQL 重复定义。
@@ -198,6 +206,7 @@ impl Logger {
             buffer: Vec::new(),
             config: config.clone(),
             last_flush: Instant::now(),
+            heartbeat_last_ms: AtomicU64::new(0),
         })
     }
 
@@ -455,7 +464,7 @@ impl Logger {
             if let Err(e) = self.downsample_cold_samples(self.config.hot_retention_days as i64) {
                 warn!("冷数据降采样失败（本轮跳过，不影响过期清理）: {}", e);
             }
-        }
+        } // 返回的本批插入数无需消费
         self.cleanup_inner(
             self.config.retention_days as i64,
             self.config.event_retention_days as i64,
@@ -475,7 +484,7 @@ impl Logger {
     /// 分批限速：单次最多聚合 6 小时的数据——首次部署时存量可达数百万行，
     /// 一次吃完会长时间阻塞采集线程（心跳停摆 → GUI 误报 Stale）；
     /// 分批后每小时清理任务各消化一批，几天内自然收敛到稳态。
-    fn downsample_cold_samples(&self, hot_days: i64) -> anyhow::Result<()> {
+    fn downsample_cold_samples(&self, hot_days: i64) -> anyhow::Result<usize> {
         let cutoff = (Utc::now() - ChronoDuration::days(hot_days)).to_rfc3339();
 
         // 本批起点 = 最老的原始冷行；无待处理行则直接返回
@@ -485,7 +494,7 @@ impl Logger {
             |row| row.get(0),
         )?;
         let Some(oldest) = oldest else {
-            return Ok(());
+            return Ok(0);
         };
         // 批终点 = 起点 + 6h，但不越过热边界（新于 cutoff 的行不动）
         let oldest_dt = DateTime::parse_from_rfc3339(&oldest)?.with_timezone(&Utc);
@@ -495,7 +504,7 @@ impl Logger {
 
         let tx = self.conn.unchecked_transaction()?;
         // 聚合插入：每分钟一行（分钟键 = substr(timestamp,1,16)，RFC3339 前缀稳定对齐）
-        tx.execute(
+        let inserted = tx.execute(
             "INSERT INTO samples (
                 timestamp, cpu_usage, cpu_per_core, cpu_freq_mhz,
                 mem_usage_percent, mem_used_mb, mem_total_mb, mem_available_mb,
@@ -529,6 +538,28 @@ impl Logger {
             params![oldest, batch_end],
         )?;
         tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// 循环执行分批降采样直至无待处理冷行（maintenance 命令用），
+    /// 返回累计聚合出的分钟行数。每批 6h、事务独立，可被服务并发写入打断后重试。
+    pub fn downsample_cold_samples_all(&self, hot_days: i64) -> anyhow::Result<u64> {
+        let mut total: u64 = 0;
+        // 防御性上限：30 天存量 × 1440 分钟/天 ≈ 4.3 万分钟行，批数远小于此
+        for _ in 0..50_000 {
+            let n = self.downsample_cold_samples(hot_days)?;
+            if n == 0 {
+                break;
+            }
+            total += n as u64;
+        }
+        Ok(total)
+    }
+
+    /// 收缩数据库文件：重写整库回收空闲页（DELETE 不缩文件，见 downsample 注释）。
+    /// WAL 模式下需要独占——服务并发写库时会报 busy，调用方应先停服或稍后重试。
+    pub fn vacuum(&self) -> anyhow::Result<()> {
+        self.conn.execute_batch("VACUUM")?;
         Ok(())
     }
 
@@ -570,9 +601,27 @@ impl Logger {
 
     // --- P3: 服务写心跳、GUI 读心跳 + 最近 sample ---
 
-    /// 服务调用：每 tick 写一次心跳（UPSERT 到 id=1 的单行）。
+    /// 服务调用：每 tick 调一次心跳（UPSERT 到 id=1 的单行）。
+    /// 实际落库节流到 [`MIN_HEARTBEAT_INTERVAL_MS`]（2s）：单行表高频 UPSERT 只产生
+    /// WAL 写放大，不增加信息量；GUI Stale 阈值默认 5s，节拍留有 2.5 倍裕度。
     /// GUI 用 [`Self::latest_heartbeat`] 探活：返回 None 即数据库从未被服务写入过。
     pub fn touch_heartbeat(&self) -> anyhow::Result<()> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.heartbeat_last_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < MIN_HEARTBEAT_INTERVAL_MS {
+            return Ok(()); // 节流窗口内跳过落库
+        }
+        // CAS 占位：并发调用时只放行一个写者（当前服务循环单线程，防御性保留）
+        if self
+            .heartbeat_last_ms
+            .compare_exchange(last, now_ms, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(());
+        }
         self.conn.execute(
             "INSERT INTO service_heartbeat (id, timestamp, pid) VALUES (1, ?1, ?2)
              ON CONFLICT(id) DO UPDATE SET timestamp = excluded.timestamp, pid = excluded.pid",
@@ -739,6 +788,70 @@ pub fn sum_network_traffic(
 mod tests {
     use super::*;
     use crate::types::{ProcessBrief, Severity};
+
+    /// 心跳节流：同实例 2s 内重复调用不产生第二次落库（时间戳不变）。
+    #[test]
+    fn touch_heartbeat_throttles_rapid_calls() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = StorageConfig {
+            db_path: dir.join("hb.db").to_string_lossy().into_owned(),
+            retention_days: 30,
+            event_retention_days: 0, hot_retention_days: 0,
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.touch_heartbeat().unwrap();
+        let ts1 = logger.latest_heartbeat().unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        logger.touch_heartbeat().unwrap(); // 节流窗口内：应跳过
+        let ts2 = logger.latest_heartbeat().unwrap().unwrap();
+        assert_eq!(ts1, ts2, "节流窗口内的第二次调用不应更新时间戳");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 全量降采样：多小时的冷存量一次性收敛，且无残留原始冷行。
+    #[test]
+    fn downsample_all_converges_multi_hour_backlog() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("all.db");
+        let cfg = StorageConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            retention_days: 30,
+            event_retention_days: 7,
+            hot_retention_days: 1,
+        };
+        {
+            let mut l = Logger::new(&cfg).unwrap();
+            l.flush().unwrap();
+        }
+        let seed = Connection::open(&db).unwrap();
+        let now = Utc::now();
+        use chrono::Timelike as _;
+        let base = (now - ChronoDuration::days(2)).with_minute(0).unwrap().with_second(0).unwrap();
+        // 连续 3 小时、每分钟 1 行 → 应聚合出 180 个分钟行
+        for m in 0..180 {
+            seed.execute(
+                "INSERT INTO samples (timestamp, cpu_usage) VALUES (?1, 1.0)",
+                params![(base + ChronoDuration::minutes(m)).format("%Y-%m-%dT%H:%M:%S%.9f+00:00").to_string()],
+            ).unwrap();
+        }
+        drop(seed);
+
+        let logger = Logger::new(&cfg).unwrap();
+        let total = logger.downsample_cold_samples_all(1).unwrap();
+        assert_eq!(total, 180);
+        // 幂等：再跑一遍应为 0
+        assert_eq!(logger.downsample_cold_samples_all(1).unwrap(), 0);
+        let c = Connection::open(&db).unwrap();
+        let (raw_cold, minutes): (i64, i64) = c.query_row(
+            "SELECT SUM(length(timestamp) > 19), SUM(length(timestamp) = 19) FROM samples",
+            [], |r| Ok((r.get::<_, Option<i64>>(0)?.unwrap_or(0), r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        ).unwrap();
+        assert_eq!(raw_cold, 0, "不应残留原始冷行");
+        assert!(minutes >= 180, "至少包含本次 180 个分钟行");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// 冷数据降采样：超过 hot_days 的原始行按分钟聚合（AVG/MAX 口径、
     /// cpu_per_core 置 NULL、整数列保持 INTEGER），原始行删除；

@@ -13,6 +13,7 @@
 //! - clap help 全中文。
 
 pub mod elevate;
+pub mod maintenance;
 pub mod process_snapshot;
 pub mod query;
 pub mod service_status;
@@ -121,6 +122,14 @@ pub enum Commands {
         output: String,
     },
 
+    /// 维护：立即完成存量冷数据降采样，并在空闲页占比达标时收缩数据库文件。
+    /// 服务运行中降采样可并发；VACUUM 需独占——建议先停服以获得最大收缩。
+    Maintenance {
+        /// 跳过 VACUUM 收缩步骤（仅做存量降采样）
+        #[arg(long)]
+        skip_vacuum: bool,
+    },
+
     /// 升级：停服（提权）→ rtk 构建 release → 重装启动（提权）。
     /// ADR-0001 决策 6：替代本地 upgrade-service.ps1；决策 4「CLI 不做提权控制」的唯一例外
     Upgrade {
@@ -227,6 +236,11 @@ pub fn dispatch(cli: &Cli) -> anyhow::Result<DispatchOutcome> {
                     std::process::exit(1);
                 }
             }
+            Ok(DispatchOutcome::Done)
+        }
+
+        Some(Commands::Maintenance { skip_vacuum }) => {
+            maintenance::run(*skip_vacuum)?;
             Ok(DispatchOutcome::Done)
         }
 

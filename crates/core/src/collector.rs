@@ -850,36 +850,47 @@ impl Collector {
 
     /// 从 `sysinfo::System` 取 top 进程快照（CPU / 内存维度各取前 8，去重合并最多 12）。
     ///
+    /// 资源优化：先用轻量 `(pid, cpu, mem)` 三元组完成双维度选取，只为入选的 ≤12 个
+    /// 进程物化 [`ProcessBrief`]（名字字符串分配是大头），不再为全部进程（数百个）
+    /// 各建一份完整结构——消除卡顿帧的分配毛刺。
+    ///
     /// sysinfo 0.39：`process.memory()` 返回字节，`/ (1024*1024)` 转 MB；
     /// `process.cpu_usage()` 为全局 CPU 百分比；`pid.as_u32()` 取进程 ID。
     fn collect_top_processes(&mut self) -> Vec<ProcessBrief> {
-        let all: Vec<ProcessBrief> = self
+        let picks: Vec<(u32, f32, u64)> = self
             .sys
             .processes()
             .iter()
-            .map(|(pid, p)| ProcessBrief {
-                pid: pid.as_u32(),
-                name: p.name().to_string_lossy().into_owned(),
-                cpu_usage: p.cpu_usage(),
-                mem_used_mb: p.memory() / (1024 * 1024),
-                ..Default::default()
+            .map(|(pid, p)| (pid.as_u32(), p.cpu_usage(), p.memory() / (1024 * 1024)))
+            .collect();
+        let chosen = select_top_pid_order(picks, 8, 8, 12);
+
+        // 仅物化入选 pid 的 Brief（第二次查表只看 ≤12 个条目）
+        let procs = self.sys.processes();
+        let mut top: Vec<ProcessBrief> = chosen
+            .iter()
+            .filter_map(|&pid| {
+                let p = procs.get(&sysinfo::Pid::from_u32(pid))?;
+                Some(ProcessBrief {
+                    pid,
+                    name: p.name().to_string_lossy().into_owned(),
+                    cpu_usage: p.cpu_usage(),
+                    mem_used_mb: p.memory() / (1024 * 1024),
+                    ..Default::default()
+                })
             })
             .collect();
-
-        let top = ProcessBrief::merge_top(all, 8, 8, 12);
 
         // F-RC14-a/b：仅对进入 top 的进程采样软件指纹（限频、一次性打开）。
         // IO 速率需跨帧差分，故非卡顿帧（不调本函数）不更新基线，避免陈旧计数污染。
         let pids: Vec<u32> = top.iter().map(|p| p.pid).collect();
         let fps = self.fingerprint.sample(&self.sys, &pids);
-        top.into_iter()
-            .map(|mut p| {
-                if let Some(fp) = fps.get(&p.pid) {
-                    fp.apply_to(&mut p);
-                }
-                p
-            })
-            .collect()
+        for p in top.iter_mut() {
+            if let Some(fp) = fps.get(&p.pid) {
+                fp.apply_to(p);
+            }
+        }
+        top
     }
 
     /// 取缓存的 WMI 连接；缺失/失效时现场重建一次。返回 None 表示不可用。
@@ -965,6 +976,30 @@ impl Collector {
     }
 }
 
+/// 轻量双维度 top 选取：与 [`ProcessBrief::merge_top`] 的 pid 序列语义一致——
+/// CPU 降序取前 `cpu_take`、内存降序取前 `mem_take`，按该顺序去重合并至 `max`。
+/// 输入为 `(pid, cpu_usage, mem_mb)` 三元组，调用方无需先物化完整 Brief。
+fn select_top_pid_order(
+    mut picks: Vec<(u32, f32, u64)>,
+    cpu_take: usize,
+    mem_take: usize,
+    max: usize,
+) -> Vec<u32> {
+    picks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut chosen: Vec<u32> = picks.iter().take(cpu_take).map(|p| p.0).collect();
+    picks.sort_by(|a, b| b.2.cmp(&a.2));
+    for p in picks.iter().take(mem_take) {
+        if !chosen.contains(&p.0) {
+            chosen.push(p.0);
+        }
+        if chosen.len() >= max {
+            break;
+        }
+    }
+    chosen.truncate(max);
+    chosen
+}
+
 /// 聚合各 GPU 引擎的利用率：累加并封顶 100%。
 ///
 /// - 无引擎（空数组）→ `None`（无法从 WMI 拿到数据）
@@ -984,6 +1019,35 @@ pub fn aggregate_gpu_utilization(per_engine: &[Option<u64>]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 选取语义与 ProcessBrief::merge_top 对齐：CPU 维度优先、内存补位去重、上限截断。
+    #[test]
+    fn select_top_pid_order_matches_merge_top_semantics() {
+        // CPU: p1(90) p2(80) p3(70)；内存: p3 最大 → p3 已在 CPU 位次中不重复
+        let picks = vec![(1, 90.0, 100), (2, 80.0, 200), (3, 70.0, 900)];
+        assert_eq!(select_top_pid_order(picks, 2, 2, 12), vec![1, 2, 3]);
+
+        // 内存补位：p4/p5 不在 CPU 前二，按内存降序追加
+        let picks = vec![(1, 90.0, 10), (2, 80.0, 20), (4, 5.0, 800), (5, 4.0, 700)];
+        assert_eq!(select_top_pid_order(picks, 2, 2, 12), vec![1, 2, 4, 5]);
+
+        // 上限截断：CPU 前 8 + 内存补位最多到 max=12
+        let picks: Vec<(u32, f32, u64)> = (1..=20)
+            .map(|i| (i as u32, 100.0 - i as f32, (i as u64) * 10))
+            .collect();
+        let out = select_top_pid_order(picks, 8, 8, 12);
+        assert_eq!(out.len(), 12);
+        // 前 8 个必为 CPU 位次（pid 1..=8）
+        assert_eq!(&out[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// 空输入与不足额输入的退化行为。
+    #[test]
+    fn select_top_pid_order_handles_small_input() {
+        assert!(select_top_pid_order(Vec::new(), 8, 8, 12).is_empty());
+        let picks = vec![(7, 1.0, 1)];
+        assert_eq!(select_top_pid_order(picks, 8, 8, 12), vec![7]);
+    }
 
     #[test]
     fn collector_new() {

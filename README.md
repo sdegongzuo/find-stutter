@@ -202,6 +202,7 @@ find-stutter.exe upgrade               # 或 --no-build 跳过构建只重装
 | `process [--limit]` | 现场采集一次 top 进程快照（不写库；`--limit` 默认 10） |
 | `export --from <开始> --to <结束> [-o <文件>]` | 将时间范围采样数据导出为 CSV（中文表头；时间格式 `YYYY-MM-DD` 或 `YYYY-MM-DD HH:MM:SS`） |
 | `upgrade [--no-build]` | 升级：停服（提权）→ `rtk cargo build --release` → 重装启动（提权）；`--no-build` 跳过构建。详见 [UPGRADE.md](./UPGRADE.md) |
+| `maintenance [--skip-vacuum]` | 维护：立即完成存量冷数据降采样（替代逐小时分批回填），并在空闲页占比 ≥5% 时 `VACUUM` 收缩文件；服务运行中降采样可并发，VACUUM 需独占（建议先停服）。JSON 进度输出 |
 
 示例：
 
