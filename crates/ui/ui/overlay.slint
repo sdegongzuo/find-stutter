@@ -3,8 +3,8 @@
 // 布局（P3+）：
 //   ┌────────────────────────────────────────┐
 //   │  CPU  XX%       GPU  XX%        ● 绿    │  ← 指标 + 服务角标（无独立状态条）
-//   │  MEM  XX%       ↑  XX/s   今日 X.XG    │  ← 网速两行 + 当日累计流量（替代磁盘速率位）
-//   │  今日卡顿: 0     ↓  XX/s （悬浮=本周）   │  ← 操作收敛到右下
+//   │  MEM  XX%       ↑  XX/s  ↑ X.XG        │  ← 网速/当日流量各两行：上行、下行
+//   │  今日卡顿: 0     ↓  XX/s  ↓ X.XG（悬浮=本周）│  ← 操作收敛到右下
 //   └────────────────────────────────────────┘
 //
 // 沉浸感要点：
@@ -61,9 +61,10 @@ export component Overlay inherits Window {
     in property <string> gpu-text: "GPU  --";
     in property <string> net-send: "↑  --";
     in property <string> net-recv: "↓  --";
-    // 当日累计网络流量（默认显示；总 = 发送 + 接收，统计口径见 reader / sum_network_traffic）
-    in property <string> net-today-text: "今日 --";
-    // 当周（周一起）流量明细 tooltip 文本（多行；鼠标悬浮当日流量时显示）
+    // 当日累计网络流量（默认显示；↑ 上行 / ↓ 下行分开，统计口径见 reader / sum_network_traffic）
+    in property <string> net-today-up: "↑ --";
+    in property <string> net-today-down: "↓ --";
+    // 当周（周一起）流量明细 tooltip 文本（多行；鼠标悬浮任一流量文本时显示）
     in property <string> net-week-tip: "";
     in property <string> event-count: "今日卡顿: 0";
     in property <string> last-heartbeat: "";
@@ -139,12 +140,12 @@ export component Overlay inherits Window {
                     Text { height: 16px; vertical-alignment: center; text: event-count; color: root.event-color; font-size: max(10px, root.text-size - 3px); }
                 }
 
-                // 中列（占剩余空间）：GPU / 网速 / 当日累计流量
+                // 中列（占剩余空间）：GPU / 网速+当日上行 / 网速+当日下行
                 VerticalLayout {
                     spacing: 5px;
                     Text { height: 16px; vertical-alignment: center; text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
-                    // 上行网速 + 当日累计网络流量（替代原「磁盘读写速率」位；
-                    // 鼠标悬浮流量文本弹出当周明细 tooltip）
+                    // 网速左、当日累计流量右：↑ 行=上传，↓ 行=下载（替代原「磁盘读写速率」位）；
+                    // 鼠标悬浮任一流量文本弹出当周明细 tooltip
                     HorizontalLayout {
                         height: 16px;
                         spacing: 4px;
@@ -152,7 +153,7 @@ export component Overlay inherits Window {
                         Text {
                             height: 100%;
                             vertical-alignment: center;
-                            text: net-today-text;
+                            text: net-today-up;
                             color: root.net-color;
                             font-size: max(10px, root.text-size - 3px);
                             Tooltip { text: @markdown("\{net-week-tip}"); }
@@ -162,6 +163,14 @@ export component Overlay inherits Window {
                         height: 16px;
                         spacing: 4px;
                         Text { height: 100%; vertical-alignment: center; text: net-recv; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
+                        Text {
+                            height: 100%;
+                            vertical-alignment: center;
+                            text: net-today-down;
+                            color: root.net-color;
+                            font-size: max(10px, root.text-size - 3px);
+                            Tooltip { text: @markdown("\{net-week-tip}"); }
+                        }
                     }
                 }
 

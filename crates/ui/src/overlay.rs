@@ -84,16 +84,18 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
     (text, color)
 }
 
-/// 「当日累计网络流量」短文本（悬浮窗网速右侧默认显示；总 = 发送 + 接收）。
+/// 「当日上行累计流量」短文本（↑ 前缀与网速行一致）。
 /// 字节量格式化复用进程详情页累计列的紧凑口径（`format_bytes`）。
-pub fn format_today_traffic(sent: u64, recv: u64) -> String {
-    format!(
-        "今日 {}",
-        crate::process_list::format_bytes(sent.saturating_add(recv))
-    )
+pub fn format_today_up_traffic(sent: u64) -> String {
+    format!("↑ {}", crate::process_list::format_bytes(sent))
 }
 
-/// 「当周累计网络流量」tooltip 明细（鼠标悬浮当日流量文本时显示；多行）。
+/// 「当日下行累计流量」短文本（↓ 前缀与网速行一致）。
+pub fn format_today_down_traffic(recv: u64) -> String {
+    format!("↓ {}", crate::process_list::format_bytes(recv))
+}
+
+/// 「当周累计网络流量」tooltip 明细（鼠标悬浮任一当日流量文本时显示；多行）。
 pub fn format_week_traffic_tip(sent: u64, recv: u64) -> String {
     format!(
         "**本周累计流量**（周一起）：{}\n上传 {} · 下载 {}",
@@ -201,10 +203,12 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
         // 温度已从悬浮窗移除（采集/入库保留，仅不显示）
     }
 
-    // 3b) 当日累计网络流量（替代原「磁盘读写速率」位的默认展示）+
+    // 3b) 当日累计网络流量（替代原「磁盘读写速率」位；↑ 上行 / ↓ 下行分开显示）+
     //     当周明细 tooltip 文本。不依赖 summary 存在，db 打不开时也显示缓存值。
-    ui.set_net_today_text(SharedString::from(format_today_traffic(
+    ui.set_net_today_up(SharedString::from(format_today_up_traffic(
         state.today_net_bytes.0,
+    )));
+    ui.set_net_today_down(SharedString::from(format_today_down_traffic(
         state.today_net_bytes.1,
     )));
     ui.set_net_week_tip(SharedString::from(format_week_traffic_tip(
@@ -353,14 +357,16 @@ mod tests {
         assert!(s.last_heartbeat.is_some());
     }
 
-    /// 当日流量短文本：上/下行求和 + 「今日」前缀（紧凑字节口径）。
+    /// 当日流量短文本：↑ 上行 / ↓ 下行各自独立显示（紧凑字节口径）。
     #[test]
-    fn format_today_traffic_sums_send_recv() {
-        assert_eq!(format_today_traffic(0, 0), "今日 0B");
-        assert_eq!(format_today_traffic(1024, 2048), "今日 3.0K");
+    fn format_today_traffic_directional() {
+        assert_eq!(format_today_up_traffic(0), "↑ 0B");
+        assert_eq!(format_today_up_traffic(1536), "↑ 1.5K");
         // GB 级别显示一位小数
         let gb = 3 * 1024 * 1024 * 1024;
-        assert_eq!(format_today_traffic(gb, 0), "今日 3.0G");
+        assert_eq!(format_today_up_traffic(gb), "↑ 3.0G");
+        assert_eq!(format_today_down_traffic(2048), "↓ 2.0K");
+        assert_eq!(format_today_down_traffic(gb), "↓ 3.0G");
     }
 
     /// 当周 tooltip：含总量、上传、下载三段，且换行分两行。
