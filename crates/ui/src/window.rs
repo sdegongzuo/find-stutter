@@ -11,11 +11,16 @@
 
 use raw_window_handle::HasWindowHandle;
 use slint::ComponentHandle;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GWL_EXSTYLE, SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    DefWindowProcW,
+    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
+    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_GETMINMAXINFO, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, MINMAXINFO,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
 use crate::Overlay;
 
@@ -107,6 +112,109 @@ fn ensure_tool_window(hwnd: HWND) {
             );
         }
     }
+}
+
+/// 一次性设置窗口矩形（**物理像素** x, y, w, h）：move + size 在同一次
+/// SetWindowPos 调用内原子完成。
+///
+/// ## 为什么不用 Slint 的 set_position() + set_size()
+///
+/// 左/上边缘缩放需要同时改位置与尺寸；拆成两次 Slint 调用会在 Windows 上
+/// 产生两个独立的窗口操作（两次 WM_WINDOWPOSCHANGED），拖动中表现为
+/// 「先移后缩」的两段式跳动。原生 SetWindowPos 一步到位，窗口单帧到位。
+///
+/// winit 通过 WM_WINDOWPOSCHANGED 感知几何变化并同步内部状态、触发
+/// Slint relayout，因此绕过 Slint API 直接改 HWND 是安全的。
+///
+/// HWND 提取失败（非 Windows 平台 / 异常路径）时退回 Slint 两次调用，
+/// 牺牲原子性但不丢功能。
+pub fn set_window_rect(win: &slint::Window, x: i32, y: i32, w: i32, h: i32) {
+    #[cfg(windows)]
+    if let Some(hwnd) = extract_hwnd_from(win) {
+        // SAFETY：hwnd 来自当前进程的合法 Slint 窗口；仅改几何，不动 Z 序、
+        // 不抢焦点（SWP_NOZORDER | SWP_NOACTIVATE）
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                w.max(1),
+                h.max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        return;
+    }
+    // 兜底：Slint API（非 Windows 或 HWND 提取失败）
+    win.set_position(slint::PhysicalPosition::new(x, y));
+    win.set_size(slint::PhysicalSize::new(w.max(1) as u32, h.max(1) as u32));
+}
+
+/// 读取原生窗口矩形（物理像素 x, y, w, h）。非 Windows / HWND 提取失败返回 None。
+#[cfg(windows)]
+pub fn native_rect(win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    let hwnd = extract_hwnd_from(win)?;
+    let mut r = windows::Win32::Foundation::RECT::default();
+    // SAFETY：RECT 为合法输出指针，GetWindowRect 仅写入该结构
+    unsafe { GetWindowRect(hwnd, &mut r) }
+        .ok()
+        .map(|_| (r.left, r.top, r.right - r.left, r.bottom - r.top))
+}
+
+#[cfg(not(windows))]
+pub fn native_rect(_win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// 比对 Slint 认知矩形与原生矩形是否脱节（纯函数，便于单测）。
+/// 任一边不相等即视为脱节：slint 侧是「热区锚定布局」的真相源，
+/// native 侧是「用户实际点到的窗口」，两者偏差 1px 都会让右/下热区错位。
+fn geometry_diverged(
+    slint: (i32, i32, i32, i32),
+    native: (i32, i32, i32, i32),
+) -> bool {
+    slint != native
+}
+
+/// 检测并修复「Slint 布局几何 ≠ 原生窗口几何」的脱节，返回是否修复过。
+///
+/// ## 为什么需要
+///
+/// 边缘缩放写回走原生 SetWindowPos 原子完成 move+size，Slint 的新尺寸
+/// 依赖 winit 处理随之送达的 WM_WINDOWPOSCHANGED 后回传给布局层。实测
+/// （200% 缩放、连续拖拽）该回传偶发丢失：Slint 布局停留在旧尺寸，而
+/// 原生窗口已是新尺寸——锚定 parent.width/height 的右/下热区随之落进
+/// 窗口内部看不见的旧位置，用户按可见边缘毫无响应，且内容区与窗口
+/// 边缘之间出现透明空带。左/上拖拽因锚定 (0,0) 不受影响，且会从 Slint
+/// 基准重写整个矩形，客观上「治愈」脱节——这也是「右/下失灵、左/上
+/// 正常」这一不对称症状的来源。
+///
+/// ## 做法
+///
+/// 读原生矩形（GetWindowRect，无边框工具窗口下即窗口矩形）与 Slint 的
+/// position()/size() 逐项比对；不一致时经 Slint API（set_position +
+/// set_size）写回原生值。走 Slint API 而非再次 SetWindowPos，是为了让
+/// winit/Slint 内部状态链路整体重新同步。调用时机应在事件循环空闲时
+/// （拖拽开始 / 写回后延迟一拍 / 定时器），避免在事件风暴中误判。
+pub fn reconcile_geometry(win: &slint::Window) -> bool {
+    let Some((nx, ny, nw, nh)) = native_rect(win) else {
+        return false;
+    };
+    let pos = win.position();
+    let size = win.size();
+    let slint_rect = (pos.x, pos.y, size.width as i32, size.height as i32);
+    if !geometry_diverged(slint_rect, (nx, ny, nw, nh)) {
+        return false;
+    }
+    log::info!(
+        "检测到 Slint 布局与原生窗口几何脱节: slint={:?} native={:?}，经 Slint API 重新对齐",
+        slint_rect,
+        (nx, ny, nw, nh)
+    );
+    win.set_position(slint::PhysicalPosition::new(nx, ny));
+    win.set_size(slint::PhysicalSize::new(nw.max(1) as u32, nh.max(1) as u32));
+    true
 }
 
 /// 右键菜单项 ID（TrackPopupMenu 返回的命令码）
@@ -240,12 +348,15 @@ pub enum RowMenuOutcome {
     Cancelled,
 }
 
-/// 弹一次行右键菜单（顶部标题行 + 「打开文件所在的位置」+「停止进程」），
-/// **不循环**。返回 [`RowMenuOutcome`]：
+/// 弹一次行右键菜单（顶部标题行 + 「打开文件所在的位置」+「停止进程」，有子进程时
+/// 追加「结束进程树」），**不循环**。返回 [`RowMenuOutcome`]：
 ///
 /// - `Command(cmd)`：用户选择了菜单项
 /// - `Switch`：菜单被**右键**点击外部关闭 → 连续右键切换流程
 /// - `Cancelled`：左键/Esc 关闭，流程结束
+///
+/// `kill_tree_enabled`：该进程是否存在可终止的后代（由调用方从进程快照判定）；
+/// 为 `false` 时不显示「结束进程树」项。
 ///
 /// 弹出位置用 `GetCursorPos()` 取**鼠标当前屏幕坐标**（右键按下瞬间光标就在
 /// 目标行上），不依赖 Slint 坐标换算——`mouse-x` 是行内局部坐标（丢 ListView
@@ -260,6 +371,7 @@ pub fn show_row_menu_once(
     window: &slint::Window,
     pid: i32,
     name: &str,
+    kill_tree_enabled: bool,
 ) -> RowMenuOutcome {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -293,13 +405,16 @@ pub fn show_row_menu_once(
             wide("打开文件所在的位置"),
         );
         let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
-        // 结束进程树：连子进程一起终止（任务管理器同款入口）
-        let _ = AppendMenuW(
-            hmenu,
-            MF_STRING,
-            RowMenuCmd::KillTree as usize,
-            wide("结束进程树"),
-        );
+        // 结束进程树：连子进程一起终止（任务管理器同款入口）。
+        // 仅当该进程确实有后代时才显示——无可杀子树时该入口无意义。
+        if kill_tree_enabled {
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                RowMenuCmd::KillTree as usize,
+                wide("结束进程树"),
+            );
+        }
 
         // 鼠标当前位置（物理屏幕像素）作为菜单弹出点
         let mut pt = windows::Win32::Foundation::POINT::default();
@@ -377,6 +492,152 @@ pub fn wait_rbutton_release() {
         }
     }
 }
+
+// ===== 原生边缘缩放（WM_NCHITTEST 子类化，进程详情窗口专用）=====
+
+/// 详情面板是否打开。面板为全窗遮罩，打开期间边缘热区应让位（不接管命中测试），
+/// 由 process_list.rs 在 set_detail_visible 的两处调用点同步翻转。
+pub static DETAIL_PANEL_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 子类化 ID（同一 HWND 上多个子类时区分用；本窗口只有一个）
+const NATIVE_RESIZE_SUBCLASS_ID: usize = 0x46_53; // "FS"
+
+/// 边缘热区宽度（逻辑像素，与 slint 端 resize-margin 一致）
+const NATIVE_RESIZE_EDGE_LOGICAL: i32 = 8;
+/// 角落热区宽度（逻辑像素，与 slint 端右下角扁平热区一致）
+const NATIVE_RESIZE_CORNER_LOGICAL: i32 = 24;
+
+/// 按屏幕坐标（物理像素）判定命中区，返回 WM_NCHITTEST 应答码
+/// （HTLEFT/HTRIGHT/…/HTCLIENT 的 Win32 数值）。纯函数便于单测。
+/// `edge`/`corner` 为换算 DPI 后的物理像素热区宽度；角区优先于边区，
+/// 且四角取 corner×corner 的更大抓取范围（Windows 通行交互）。
+fn hit_test_zone(x: i32, y: i32, rect: (i32, i32, i32, i32), edge: i32, corner: i32) -> u32 {
+    let (l, t, r, b) = rect;
+    let in_left = x < l + edge;
+    let in_right = x >= r - edge;
+    let in_top = y < t + edge;
+    let in_bottom = y >= b - edge;
+    // 角区范围（corner ≥ edge，覆盖边的端头）
+    let near_left = x < l + corner;
+    let near_right = x >= r - corner;
+    let near_top = y < t + corner;
+    let near_bottom = y >= b - corner;
+
+    if near_left && near_top {
+        HTTOPLEFT
+    } else if near_right && near_top {
+        HTTOPRIGHT
+    } else if near_left && near_bottom {
+        HTBOTTOMLEFT
+    } else if near_right && near_bottom {
+        HTBOTTOMRIGHT
+    } else if in_left {
+        HTLEFT
+    } else if in_right {
+        HTRIGHT
+    } else if in_top {
+        HTTOP
+    } else if in_bottom {
+        HTBOTTOM
+    } else {
+        HTCLIENT
+    }
+}
+
+/// 子类过程：接管边缘/角落的 WM_NCHITTEST（返回 HT_* 后 Windows 自己驱动
+/// 原生尺寸拖拽循环，事件不再进入 Slint TouchArea），并施加最小/最大尺寸。
+///
+/// ## 为什么放弃 Slint TouchArea 方案
+///
+/// 原 TouchArea 方案的按压/拖动状态机在「窗口自身随拖拽连续变形」这一场景下
+/// 实测不可靠（复现配方：首个拖拽后，重复按压同一热区大概率无响应，
+/// resize-started 都不触发），且症状随操作序列非确定性地扩散到其他热区。
+/// 原生命中测试由 Windows 直接驱动尺寸循环，不经过任何按压状态机，
+/// 是无边框可缩放窗口的标准实现。
+unsafe extern "system" fn native_resize_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    // SAFETY：本回调由系统在窗口线程上调用；全部裸调用仅操作本窗口的
+    // 矩形/尺寸信息，不跨线程共享可变状态
+    unsafe {
+        match msg {
+        WM_NCHITTEST => {
+            // 详情面板为模态遮罩，打开期间不接管（热区让位给面板交互）
+            if DETAIL_PANEL_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+                return DefSubclassProc(hwnd, msg, wparam, lparam);
+            }
+            // lParam = 屏幕物理坐标；多屏/负坐标按 i16 符号扩展
+            let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
+            let mut rc = RECT::default();
+            if GetWindowRect(hwnd, &mut rc).is_err() {
+                return DefSubclassProc(hwnd, msg, wparam, lparam);
+            }
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let edge = NATIVE_RESIZE_EDGE_LOGICAL * dpi as i32 / 96;
+            let corner = NATIVE_RESIZE_CORNER_LOGICAL * dpi as i32 / 96;
+            let ht = hit_test_zone(x, y, (rc.left, rc.top, rc.right, rc.bottom), edge, corner);
+            if ht == HTCLIENT {
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            } else {
+                LRESULT(ht as isize)
+            }
+        }
+        WM_NCLBUTTONDOWN => {
+            // 边缘/角落的按下：绕过 winit 直通 DefWindowProc——只有它会把
+            // 尺寸类命中码转成原生尺寸拖拽模态循环（winit 会吞掉这条消息）
+            let ht = wparam.0 as u32;
+            if (HTLEFT..=HTBOTTOMRIGHT).contains(&ht) {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_GETMINMAXINFO => {
+            // 原生尺寸循环的 min/max 夹取（逻辑常量 × DPI → 物理像素）
+            let dpi = GetDpiForWindow(hwnd).max(96) as i32;
+            let mmi = lparam.0 as *mut MINMAXINFO;
+            (*mmi).ptMinTrackSize = POINT {
+                x: 500 * dpi / 96,
+                y: 300 * dpi / 96,
+            };
+            (*mmi).ptMaxTrackSize = POINT {
+                x: 1200 * dpi / 96,
+                y: 900 * dpi / 96,
+            };
+            LRESULT::default()
+        }
+        _ => DefSubclassProc(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// 给窗口安装原生边缘缩放命中测试（幂等：同 ID 重复安装只更新回调）。
+/// 仅 Windows 生效；其余平台无边框缩放仍走 Slint 热区（若保留）。
+#[cfg(windows)]
+pub fn install_native_resize(win: &slint::Window) {
+    if let Some(hwnd) = extract_hwnd_from(win) {
+        // SAFETY：hwnd 为当前线程上合法的 Slint 窗口；回调只读窗口矩形 /
+        // 写 MINMAXINFO，不持有任何跨线程状态
+        unsafe {
+            let _ = SetWindowSubclass(
+                hwnd,
+                Some(native_resize_proc),
+                NATIVE_RESIZE_SUBCLASS_ID,
+                0,
+            );
+        }
+    } else {
+        log::warn!("原生边缘缩放子类化失败：无法提取 HWND（500ms 后重试）");
+    }
+}
+
+#[cfg(not(windows))]
+pub fn install_native_resize(_win: &slint::Window) {}
 
 #[cfg(windows)]
 fn wide(s: &str) -> windows::core::PCWSTR {
@@ -536,6 +797,90 @@ mod tests {
         assert_eq!(map(5), Some(NativeMenuCmd::Analysis));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
+    }
+
+    // ===== 几何对账（Slint 布局 vs 原生窗口矩形）=====
+
+    /// 四边一致 → 不脱节
+    #[test]
+    fn geometry_diverged_false_when_identical() {
+        assert!(!geometry_diverged((100, 200, 800, 600), (100, 200, 800, 600)));
+    }
+
+    /// 右/下尺寸漂移 1px（丢一次 WM_WINDOWPOSCHANGED 同步的典型形态）→ 脱节
+    #[test]
+    fn geometry_diverged_true_on_size_drift() {
+        assert!(geometry_diverged((100, 200, 800, 600), (100, 200, 801, 600)));
+        assert!(geometry_diverged((100, 200, 800, 600), (100, 200, 800, 601)));
+    }
+
+    /// 位置漂移（跨屏拖动后位置回传丢失）→ 脱节
+    #[test]
+    fn geometry_diverged_true_on_position_drift() {
+        assert!(geometry_diverged((100, 200, 800, 600), (99, 200, 800, 600)));
+        assert!(geometry_diverged((100, 200, 800, 600), (100, -200, 800, 600)));
+    }
+
+    // ===== 原生边缘缩放命中测试（hit_test_zone）=====
+
+    /// HT 应答码 Win32 数值（windows-rs 常量），测试断言用
+    const HT_CODES: [(&str, u32); 9] = [
+        ("client", 1),
+        ("left", 10),
+        ("right", 11),
+        ("top", 12),
+        ("top-left", 13),
+        ("top-right", 14),
+        ("bottom", 15),
+        ("bottom-left", 16),
+        ("bottom-right", 17),
+    ];
+
+    fn ht_code(name: &str) -> u32 {
+        HT_CODES.iter().find(|(n, _)| *n == name).unwrap().1
+    }
+
+    /// 200% 缩放：edge=16、corner=48 物理像素，窗口 (100,200)-(900,800)
+    const R: (i32, i32, i32, i32) = (100, 200, 900, 800);
+    const EDGE: i32 = 16;
+    const CORNER: i32 = 48;
+
+    #[test]
+    fn hit_test_zone_edges() {
+        assert_eq!(hit_test_zone(105, 500, R, EDGE, CORNER), ht_code("left"));
+        assert_eq!(hit_test_zone(895, 500, R, EDGE, CORNER), ht_code("right"));
+        assert_eq!(hit_test_zone(500, 205, R, EDGE, CORNER), ht_code("top"));
+        assert_eq!(hit_test_zone(500, 795, R, EDGE, CORNER), ht_code("bottom"));
+    }
+
+    #[test]
+    fn hit_test_zone_corners() {
+        assert_eq!(hit_test_zone(110, 240, R, EDGE, CORNER), ht_code("top-left"));
+        assert_eq!(hit_test_zone(880, 220, R, EDGE, CORNER), ht_code("top-right"));
+        assert_eq!(hit_test_zone(120, 780, R, EDGE, CORNER), ht_code("bottom-left"));
+        assert_eq!(hit_test_zone(890, 790, R, EDGE, CORNER), ht_code("bottom-right"));
+    }
+
+    /// 边的端头被角区吸收（corner > edge）：左边缘的上端应判为左上角
+    #[test]
+    fn hit_test_zone_corner_absorbs_strip_end() {
+        assert_eq!(hit_test_zone(105, 230, R, EDGE, CORNER), ht_code("top-left"));
+        // 角区之外的边中段仍是边
+        assert_eq!(hit_test_zone(105, 500, R, EDGE, CORNER), ht_code("left"));
+    }
+
+    #[test]
+    fn hit_test_zone_interior_is_client() {
+        assert_eq!(hit_test_zone(500, 500, R, EDGE, CORNER), ht_code("client"));
+        // 100% 缩放（edge=8, corner=24）下窗口中心同样为 client
+        assert_eq!(hit_test_zone(500, 500, R, 8, 24), ht_code("client"));
+    }
+
+    /// 边热区宽度生效：100% 缩放下 x=l+8 恰在热区外缘 → client
+    #[test]
+    fn hit_test_zone_respects_edge_width() {
+        assert_eq!(hit_test_zone(107, 500, R, 8, 24), ht_code("left"));
+        assert_eq!(hit_test_zone(108, 500, R, 8, 24), ht_code("client"));
     }
 
     // ===== RowMenuCmd（进程详情行右键菜单命令）=====

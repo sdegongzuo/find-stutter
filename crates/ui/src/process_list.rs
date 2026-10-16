@@ -14,7 +14,8 @@
 //! - **搜索**：名称 / PID 过滤（大小写不敏感）
 //! - **停止按钮**：`Process::kill()`
 //! - **窗口缩放**：四边/四角热区 + 右下角手柄均可拖拽缩放（按下锁定
-//!   基准矩形，拖动按「基准 + 累计位移」换算，见 ResizeSession）
+//!   基准矩形与 scale_factor，拖动按「基准 + 累计位移」换算，一次
+//!   SetWindowPos 原子写回位置与尺寸，见 ResizeSession）
 //!
 //! ## 数据来源
 //!
@@ -2400,23 +2401,15 @@ impl ProcessListWindow {
             // 尽快采样；不在 UI 线程死等采样完成（旧实现轮询等 3s，首轮
             // sysinfo 初始化慢时窗口整个冻结）。
             if let Some(ui) = weak_refresh.upgrade() {
-                render(&ui, &cache_refresh, &sort_refresh, &search_refresh, &expanded_refresh, &shared_refresh);
-                sample_now_btn.store(true, Ordering::SeqCst);
-                // 采样线程 50ms 轮询 + 采样耗时：延迟几次重绘把新数据补上
-                // （常规采样 <500ms；首轮初始化慢时由 tick timer 兜底）
-                for delay_ms in [300u64, 1000, 2000] {
-                    let weak_late = weak_refresh.clone();
-                    let cache_late = cache_refresh.clone();
-                    let sort_late = sort_refresh.clone();
-                    let search_late = search_refresh.clone();
-                    let expanded_late = expanded_refresh.clone();
-                    let shared_late = shared_refresh.clone();
-                    slint::Timer::single_shot(Duration::from_millis(delay_ms), move || {
-                        if let Some(ui) = weak_late.upgrade() {
-                            render(&ui, &cache_late, &sort_late, &search_late, &expanded_late, &shared_late);
-                        }
-                    });
-                }
+                request_immediate_refresh(
+                    &ui,
+                    &cache_refresh,
+                    &sort_refresh,
+                    &search_refresh,
+                    &expanded_refresh,
+                    &shared_refresh,
+                    &sample_now_btn,
+                );
             }
         });
 
@@ -2426,6 +2419,11 @@ impl ProcessListWindow {
         // 若落在另一行则立即重弹该行菜单（无需先关闭再右键）。
         let weak_rowmenu = ui.as_weak();
         let cache_rowmenu = cache_tick.clone();
+        let sort_rowmenu = sort.clone();
+        let search_rowmenu = search.clone();
+        let expanded_rowmenu = expanded.clone();
+        let shared_rowmenu = shared.clone();
+        let sample_now_rowmenu = sample_now.clone();
         ui.on_row_context_menu(move |pid: i32, name: slint::SharedString| {
             use crate::window::{RowMenuCmd, RowMenuOutcome};
             log::info!("row-context-menu: pid={} name={}", pid, name);
@@ -2433,7 +2431,17 @@ impl ProcessListWindow {
                 let mut cur_pid = pid;
                 let mut cur_name = name.to_string();
                 loop {
-                    match crate::window::show_row_menu_once(ui.window(), cur_pid, &cur_name) {
+                    // 「结束进程树」仅在有后代时显示：从当前快照沿 parent_pid 判定
+                    let kill_tree_enabled = {
+                        let rows = cache_rowmenu.lock().unwrap();
+                        !collect_process_tree(cur_pid as u32, &rows).is_empty()
+                    };
+                    match crate::window::show_row_menu_once(
+                        ui.window(),
+                        cur_pid,
+                        &cur_name,
+                        kill_tree_enabled,
+                    ) {
                         RowMenuOutcome::Command(RowMenuCmd::Kill) => {
                             match kill_process(cur_pid as u32) {
                                 Ok(()) => log::info!("停止进程 {} 成功", cur_pid),
@@ -2443,7 +2451,17 @@ impl ProcessListWindow {
                                     prompt_kill_failure(cur_pid as u32, &cur_name, e);
                                 }
                             }
-                            break; // 下一次刷新自动更新
+                            // 立刻重采样刷新：被杀的进程从列表消失，不等下一次自动刷新
+                            request_immediate_refresh(
+                                &ui,
+                                &cache_rowmenu,
+                                &sort_rowmenu,
+                                &search_rowmenu,
+                                &expanded_rowmenu,
+                                &shared_rowmenu,
+                                &sample_now_rowmenu,
+                            );
+                            break;
                         }
                         RowMenuOutcome::Command(RowMenuCmd::KillTree) => {
                             // 结束进程树：沿 parent_pid 递归枚举后代并逐个终止
@@ -2461,7 +2479,17 @@ impl ProcessListWindow {
                                 // （连同子树一起终止）
                                 prompt_kill_tree_failure(cur_pid as u32, &cur_name);
                             }
-                            break; // 下一次刷新自动更新
+                            // 立刻重采样刷新：被杀的子树从列表消失，不等下一次自动刷新
+                            request_immediate_refresh(
+                                &ui,
+                                &cache_rowmenu,
+                                &sort_rowmenu,
+                                &search_rowmenu,
+                                &expanded_rowmenu,
+                                &shared_rowmenu,
+                                &sample_now_rowmenu,
+                            );
+                            break;
                         }
                         RowMenuOutcome::Command(RowMenuCmd::OpenLocation) => {
                             match open_process_location(cur_pid as u32) {
@@ -2559,6 +2587,8 @@ impl ProcessListWindow {
                 ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid_u32)));
                 ui.set_detail_text(SharedString::from(detail));
                 ui.set_detail_visible(true);
+                // 详情面板为全窗遮罩：打开期间暂停原生边缘缩放命中测试
+                crate::window::DETAIL_PANEL_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
                 log::info!("双击进程 {} 打开详情", pid_u32);
             }
         });
@@ -2568,6 +2598,7 @@ impl ProcessListWindow {
         ui.on_detail_close(move || {
             if let Some(ui) = weak_detail_ui.upgrade() {
                 ui.set_detail_visible(false);
+                crate::window::DETAIL_PANEL_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         });
 
@@ -2584,8 +2615,9 @@ impl ProcessListWindow {
         });
 
         // 窗口边缘 / 右下角 resize：
-        // - 按下（resize-started）→ 锁定当前窗口矩形 + 光标屏幕位置为基准；
-        // - 拖动（resize-requested）→ 目标矩形 = 基准 + 原生光标差分出的累计位移。
+        // - 按下（resize-started）→ 锁定当前窗口矩形 + 光标屏幕位置 + scale 为基准；
+        // - 拖动（resize-requested）→ 目标矩形 = 基准 + 原生光标差分出的累计位移，
+        //   一次 SetWindowPos 原子写回（位置 + 尺寸单步到位）。
         //   位移绝不能取自 TouchArea 元素相对坐标（热区随窗口移动会被污染，
         //   见 ResizeSession 注释），也绝不能再叠加到「当前」几何上（增量重复累加）。
         let resize_session =
@@ -2595,9 +2627,17 @@ impl ProcessListWindow {
         let weak_start = ui.as_weak();
         ui.on_resize_started(move || {
             if let Some(ui) = weak_start.upgrade() {
-                let (x, y, w, h) = window_logical_rect(ui.window());
+                let window = ui.window();
+                // 按下前先对账：上一次拖拽若丢失了尺寸同步，热区此刻可能
+                // 还偏离可见边缘；先对齐再锁基准，避免把脱节几何锁进基准
+                crate::window::reconcile_geometry(window);
+                let (x, y, w, h) = window_logical_rect(window);
                 let cursor = cursor_screen_px();
-                session_for_start.borrow_mut().start(x, y, w, h, cursor);
+                // scale 在按下瞬间锁定：拖拽跨显示器（DPI 突变）期间换算
+                // 系数不漂移；下次按下重新采样
+                session_for_start
+                    .borrow_mut()
+                    .start(x, y, w, h, cursor, window.scale_factor());
             }
         });
 
@@ -2605,40 +2645,53 @@ impl ProcessListWindow {
         let weak_resize = ui.as_weak();
         ui.on_resize_requested(move |edge: crate::ResizeEdge| {
             if let Some(ui) = weak_resize.upgrade() {
-                use slint::{LogicalSize, PhysicalPosition};
                 let window = ui.window();
+                let mut session = session_for_move.borrow_mut();
 
-                // 基于按下瞬间的基准矩形换算；基准缺失时兜底用当前矩形
-                let (cur_x, cur_y, cur_w, cur_h) = window_logical_rect(window);
-                let (dx, dy) = {
-                    let session = session_for_move.borrow();
-                    session.displacement(cursor_screen_px(), window.scale_factor())
+                // 位移 = 按下点差分 ÷ 会话锁定 scale。已锁基准时不再读当前
+                // 窗口几何（moved 每帧都触发，基准本身就是几何真相源）
+                let (dx, dy) = session.displacement(cursor_screen_px());
+                let fallback = if session.has_base() {
+                    None
+                } else {
+                    // 基准缺失（异常路径漏发 start）才兜底读当前矩形
+                    Some(window_logical_rect(window))
                 };
-                let (new_x, new_y, new_w, new_h) =
-                    session_for_move.borrow_mut().apply(edge, dx, dy, cur_x, cur_y, cur_w, cur_h);
+                let (new_x, new_y, new_w, new_h) = session.apply(edge, dx, dy, fallback);
 
-                // 仅涉及左/上的边缘才需要动位置（对边保持不动）；
-                // 纯右/下拖动只改尺寸，少一次 SetWindowPos，拖动更顺滑
-                if matches!(
-                    edge,
-                    crate::ResizeEdge::Left
-                        | crate::ResizeEdge::Top
-                        | crate::ResizeEdge::TopLeft
-                        | crate::ResizeEdge::TopRight
-                        | crate::ResizeEdge::BottomLeft
-                ) {
-                    // 目标矩形是逻辑坐标，写回时换回物理像素
-                    let scale = window.scale_factor();
-                    window.set_position(PhysicalPosition::new(
-                        (new_x * scale) as i32,
-                        (new_y * scale) as i32,
-                    ));
+                // 逻辑 → 物理（会话锁定 scale + round），一次 SetWindowPos
+                // 原子完成 move + size：左/上边缘不再「先移后缩」两段跳动，
+                // 与上次相同的目标矩形则跳过写回（拖到 min/max 后继续动光标
+                // 不再刷无谓的窗口操作）
+                let (px, py, pw, ph) =
+                    logical_to_physical_rect(new_x, new_y, new_w, new_h, session.scale());
+                if session.need_apply(px, py, pw, ph) {
+                    crate::window::set_window_rect(window, px, py, pw, ph);
+                    session.mark_applied(px, py, pw, ph);
+                    // 写回后延迟一拍核对同步：winit 对 WM_WINDOWPOSCHANGED 的
+                    // 处理若把 Slint 布局尺寸的更新弄丢，右/下热区会随旧布局
+                    // 偏离可见边缘。事件循环空闲后比对才准确，故用 single_shot
+                    // 而非立即比对；同步正常时对账是零开销的纯比较。
+                    let weak_check = ui.as_weak();
+                    slint::Timer::single_shot(Duration::from_millis(50), move || {
+                        if let Some(ui) = weak_check.upgrade() {
+                            crate::window::reconcile_geometry(ui.window());
+                        }
+                    });
                 }
-                window.set_size(LogicalSize::new(new_w, new_h));
             }
         });
 
         ui.show()?;
+        // 安装原生边缘缩放命中测试：WM_NCHITTEST 子类化让 Windows 直接驱动
+        // 尺寸拖拽循环（绕开 Slint TouchArea 的按压状态机——实测其对
+        // 「窗口随拖拽连续变形」场景不可靠：首个拖拽后重复按压热区大概率
+        // 无响应）。安装后 slint 端热区在 Windows 上不再接收边缘事件，
+        // 仅作为非 Windows 平台与代码语义的保留。
+        //
+        // 刚 show 完 winit 的 HWND 句柄可能还取不到（实测首次安装会失败），
+        // 因此在下方 500ms 延迟回调里重试；install 幂等。
+        crate::window::install_native_resize(ui.window());
         // 初始化标题栏：刷新间隔下拉索引 + header 显示当前间隔
         ui.set_refresh_interval_index(interval_ms_to_index(*refresh_ms.lock().unwrap()));
         ui.set_header_text(SharedString::from(format!(
@@ -2654,6 +2707,8 @@ impl ProcessListWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 crate::window::ensure_tool_window_for(ui.window());
+                // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）
+                crate::window::install_native_resize(ui.window());
             }
         });
 
@@ -2678,6 +2733,11 @@ impl ProcessListWindow {
             Duration::from_millis(150),
             move || {
                 if let Some(ui) = weak_tick.upgrade() {
+                    // 几何对账兜底：拖拽写回丢失的尺寸同步若未被前两处
+                    // （按下/写回后）捕获，最迟在下一个刷新周期内自愈
+                    if ui.window().is_visible() {
+                        crate::window::reconcile_geometry(ui.window());
+                    }
                     render(
                         &ui,
                         &cache_tick,
@@ -2751,8 +2811,16 @@ impl ProcessListWindow {
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
             let _ = self.ui.show();
-            // show 可能触发 winit 重算样式 → 重新确保不在任务栏显示
+            // show 可能触发 winit 重算扩展样式 → 重新确保不在任务栏显示
             crate::window::ensure_tool_window_for(self.ui.window());
+            // 重新显示后延迟对账一次：show 路径若把 Slint 布局尺寸重置回
+            // 声明值而原生窗口保持旧尺寸，右/下热区会整体失效
+            let weak_refresh = self.ui.as_weak();
+            slint::Timer::single_shot(Duration::from_millis(50), move || {
+                if let Some(ui) = weak_refresh.upgrade() {
+                    crate::window::reconcile_geometry(ui.window());
+                }
+            });
         }
         render(
             &self.ui,
@@ -2820,9 +2888,9 @@ fn cursor_screen_px() -> Option<(f32, f32)> {
     None
 }
 
-/// 一次边缘拖拽缩放会话：pointer 按下瞬间锁定「基准矩形 + 基准光标位置」，
-/// 之后每个 moved 事件用原生光标当前位置差分出「自按下起的真实位移」，
-/// 一律基于基准矩形换算目标。
+/// 一次边缘拖拽缩放会话：pointer 按下瞬间锁定「基准矩形 + 基准光标位置 +
+/// scale_factor」，之后每个 moved 事件用原生光标当前位置差分出「自按下起的
+/// 真实位移」，一律基于基准矩形换算目标。
 ///
 /// 为什么必须锁基准：窗口的「当前」尺寸/位置在拖拽过程中每帧都在变。若每次
 /// 都读当前几何再叠加位移（最初实现），同一段位移会被重复累加——向外拖几个
@@ -2833,45 +2901,82 @@ fn cursor_screen_px() -> Option<(f32, f32)> {
 /// 上随窗口 position 动），元素相对差值混入「已应用增量」这个反馈项，把
 /// 「目标 = 基准 + 累计位移」退化成二阶递推（匀速拖动稳态仅约半速跟随）。
 /// 屏幕绝对坐标差分对窗口/热区的任何运动都不敏感。
+///
+/// 为什么必须锁 scale：拖拽跨越不同缩放率的显示器时 scale_factor 会突变，
+/// 若每帧读当前 scale，同一段物理位移换算出的逻辑位移随之跳变，基准矩形与
+/// 屏幕的对应关系被破坏。Windows 原生拖拽同样在拖动期间锁定 DPI；下一次
+/// 按下时重新采样，正常路径不受影响。
 #[derive(Debug, Default)]
 pub(crate) struct ResizeSession {
     /// 按下瞬间的窗口矩形（逻辑像素 x, y, w, h）
     base: Option<(f32, f32, f32, f32)>,
     /// 按下瞬间的鼠标屏幕位置（物理像素）；取不到时为 None（位移按 0 处理）
     press_cursor: Option<(f32, f32)>,
+    /// 按下瞬间锁定的 scale_factor；基准缺失（未 start）时按 1.0 兜底
+    scale: f32,
+    /// 上次实际写回的物理矩形。本次换算结果与之相同（拖到 min/max 后光标
+    /// 继续移动、或 clamp 区间内往复）则跳过窗口操作，避免无谓的
+    /// SetWindowPos / WM_WINDOWPOSCHANGED 刷屏。
+    last_applied: Option<(i32, i32, i32, i32)>,
 }
 
 impl ResizeSession {
-    /// pointer 按下（slint resize-started 回调）：记录本次拖拽的基准矩形与光标位置。
-    fn start(&mut self, x: f32, y: f32, w: f32, h: f32, cursor_px: Option<(f32, f32)>) {
+    /// pointer 按下（slint resize-started 回调）：记录本次拖拽的基准矩形、
+    /// 光标位置与 scale_factor，并清空上一次会话的写回记录。
+    fn start(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        cursor_px: Option<(f32, f32)>,
+        scale: f32,
+    ) {
         self.base = Some((x, y, w, h));
         self.press_cursor = cursor_px;
+        self.scale = scale;
+        self.last_applied = None;
     }
 
-    /// 自按下起的鼠标位移（逻辑像素）。基准光标缺失 / 当前光标取不到 → (0, 0)
-    /// （该次事件视为无位移，窗口保持原地；下一次成功采样后自动恢复跟踪）。
-    fn displacement(&self, now_px: Option<(f32, f32)>, scale: f32) -> (f32, f32) {
+    /// 本次会话锁定的 scale_factor。
+    fn scale(&self) -> f32 {
+        if self.base.is_some() {
+            self.scale
+        } else {
+            1.0
+        }
+    }
+
+    /// 是否已锁定基准（决定 moved 热路径要不要读当前窗口几何）。
+    fn has_base(&self) -> bool {
+        self.base.is_some()
+    }
+
+    /// 自按下起的鼠标位移（逻辑像素，除以锁定的 scale）。基准光标缺失 /
+    /// 当前光标取不到 → (0, 0)（该次事件视为无位移，窗口保持原地；
+    /// 下一次成功采样后自动恢复跟踪）。
+    fn displacement(&self, now_px: Option<(f32, f32)>) -> (f32, f32) {
         match (self.press_cursor, now_px) {
-            (Some((cx, cy)), Some((nx, ny))) => ((nx - cx) / scale, (ny - cy) / scale),
+            (Some((cx, cy)), Some((nx, ny))) => {
+                let scale = self.scale();
+                ((nx - cx) / scale, (ny - cy) / scale)
+            }
             _ => (0.0, 0.0),
         }
     }
 
-    /// 拖动中（slint resize-requested 回调）：返回「基准矩形 + 累计位移」的目标矩形。
-    /// cur_* 是当前窗口矩形，仅在基准缺失（异常路径漏发 start）时兜底使用，
-    /// 行为退化为旧实现但不 panic。
+    /// 拖动中（slint resize-requested 回调）：返回「基准矩形 + 累计位移」的目标
+    /// 矩形（逻辑像素）。fallback 仅在基准缺失（异常路径漏发 start）时使用当前
+    /// 窗口矩形，行为退化为旧实现但不 panic。
     #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
         edge: crate::ResizeEdge,
         dx: f32,
         dy: f32,
-        cur_x: f32,
-        cur_y: f32,
-        cur_w: f32,
-        cur_h: f32,
+        fallback: Option<(f32, f32, f32, f32)>,
     ) -> (f32, f32, f32, f32) {
-        let (bx, by, bw, bh) = self.base.unwrap_or((cur_x, cur_y, cur_w, cur_h));
+        let (bx, by, bw, bh) = self.base.or(fallback).unwrap_or((0.0, 0.0, 0.0, 0.0));
         compute_resized_rect(
             edge,
             dx,
@@ -2886,6 +2991,37 @@ impl ResizeSession {
             RESIZE_MAX_H,
         )
     }
+
+    /// 本次换算出的物理矩形与上次实际写回的不同（或尚未写过）才需要写回。
+    fn need_apply(&self, px: i32, py: i32, pw: i32, ph: i32) -> bool {
+        self.last_applied != Some((px, py, pw, ph))
+    }
+
+    /// 记录刚写回的物理矩形（紧跟 need_apply == true 的写回调用）。
+    fn mark_applied(&mut self, px: i32, py: i32, pw: i32, ph: i32) {
+        self.last_applied = Some((px, py, pw, ph));
+    }
+}
+
+/// 逻辑矩形 → 物理矩形（round 而非截断）。
+///
+/// 125% / 150% 等非整数缩放下，逻辑坐标乘 scale 常得非整数物理值：过去
+/// position 用 `as i32` 截断而 Slint set_size 内部四舍五入，两者取整方向
+/// 不一致会造成边缘 1px 错位、拖动中轻微抖动。统一 round 后逻辑↔物理往返
+/// 误差不超过 0.5px，且同一目标矩形换算结果稳定（配合 last_applied 判等）。
+fn logical_to_physical_rect(
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    scale: f32,
+) -> (i32, i32, i32, i32) {
+    (
+        (x * scale).round() as i32,
+        (y * scale).round() as i32,
+        ((w * scale).round() as i32).max(1),
+        ((h * scale).round() as i32).max(1),
+    )
 }
 
 /// 根据拖动边缘/角落计算新的窗口位置与尺寸。
@@ -3014,6 +3150,41 @@ struct RenderShared {
     /// 由采样线程按 30s TTL 刷新（SCM 枚举 10~100ms，不能每 render 都查——
     /// 搜索框每敲一个字符都会触发 render）。
     services: Arc<Mutex<std::collections::HashMap<u32, Vec<String>>>>,
+}
+
+/// 请求立即刷新：用当前缓存重绘一次 + 通知采样线程尽快采样，并延迟几次
+/// 重绘把采样完成后的新数据补上（非阻塞，UI 线程不等待采样）。
+///
+/// 刷新按钮与「停止进程 / 结束进程树」后复用：kill 后下一次自动刷新可能还要
+/// 等数十秒，期间已退出的进程仍留在列表里，需要立刻刷一次。
+#[allow(clippy::too_many_arguments)]
+fn request_immediate_refresh(
+    ui: &crate::ProcessList,
+    cache: &Arc<Mutex<Vec<ProcessRow>>>,
+    sort: &Arc<Mutex<(String, bool)>>,
+    search: &Arc<Mutex<String>>,
+    expanded: &Arc<Mutex<std::collections::HashSet<String>>>,
+    shared: &Arc<RenderShared>,
+    sample_now: &Arc<AtomicBool>,
+) {
+    render(ui, cache, sort, search, expanded, shared);
+    sample_now.store(true, Ordering::SeqCst);
+    // 采样线程 50ms 轮询 + 采样耗时：延迟几次重绘把新数据补上
+    // （常规采样 <500ms；首轮初始化慢时由 tick timer 兜底）
+    let weak = ui.as_weak();
+    for delay_ms in [300u64, 1000, 2000] {
+        let weak_late = weak.clone();
+        let cache_late = cache.clone();
+        let sort_late = sort.clone();
+        let search_late = search.clone();
+        let expanded_late = expanded.clone();
+        let shared_late = shared.clone();
+        slint::Timer::single_shot(Duration::from_millis(delay_ms), move || {
+            if let Some(ui) = weak_late.upgrade() {
+                render(&ui, &cache_late, &sort_late, &search_late, &expanded_late, &shared_late);
+            }
+        });
+    }
 }
 
 /// 用缓存渲染列表（不采样）：过滤 + 分组 + 排序 + 展开 + 填充。
@@ -3351,18 +3522,16 @@ mod tests {
     #[test]
     fn resize_session_right_edge_uses_press_time_baseline() {
         let mut s = ResizeSession::default();
-        s.start(100.0, 200.0, 800.0, 500.0, None);
-        // 模拟 moved 连续触发：dx 为相对按下点的累计位移，cur_* 为当时实际尺寸
+        s.start(100.0, 200.0, 800.0, 500.0, None, 1.0);
+        // 模拟 moved 连续触发：dx 为相对按下点的累计位移；兜底矩形故意喂入
+        // 「滞后一步」的当前宽——锁定的基准必须优先于兜底，结果不受其影响
         let steps: [(f32, f32); 3] = [(10.0, 810.0), (20.0, 820.0), (30.0, 830.0)];
         for (dx, want_w) in steps {
             let (_, _, w, _) = s.apply(
                 crate::ResizeEdge::Right,
                 dx,
                 0.0,
-                100.0,
-                200.0,
-                want_w - 10.0, // 当前宽滞后一步，模拟上一事件已应用过增量
-                500.0,
+                Some((100.0, 200.0, want_w - 10.0, 500.0)),
             );
             assert_eq!(w, want_w, "dx={dx}");
         }
@@ -3370,21 +3539,23 @@ mod tests {
 
     /// 回归测试：左边缘分步拖小时同样基于基准换算，且位置修正保持右边缘不动
     /// （旧实现每步都在已缩小的宽度上再减一遍累计位移，瞬间贴死最小宽 500）。
-    /// 方向语义：左边缘 dx>0（向右拖）为收窄；cx/cw 模拟真实回调传入的当前矩形，
-    /// 随每步应用结果推进。
+    /// 方向语义：左边缘 dx>0（向右拖）为收窄；兜底矩形模拟「已应用增量」的
+    /// 当前几何随每步推进——基准存在时它必须被完全忽略。
     #[test]
     fn resize_session_left_edge_shrink_does_not_collapse() {
         let mut s = ResizeSession::default();
-        s.start(100.0, 100.0, 900.0, 600.0, None);
-        let (mut cx, mut cw) = (100.0_f32, 900.0_f32);
+        s.start(100.0, 100.0, 900.0, 600.0, None, 1.0);
         for (i, want_w) in [890.0, 880.0, 870.0].iter().enumerate() {
             let dx = 10.0 * (i as f32 + 1.0); // 相对按下点的累计位移
-            let (x, _, w, _) = s.apply(crate::ResizeEdge::Left, dx, 0.0, cx, 100.0, cw, 600.0);
+            let (x, _, w, _) = s.apply(
+                crate::ResizeEdge::Left,
+                dx,
+                0.0,
+                Some((0.0, 0.0, 1.0, 1.0)), // 误导性兜底：基准存在时不参与计算
+            );
             assert_eq!(w, *want_w, "step {i}");
             // 对边不动：新 x = 基准 x + (基准 w - 新 w)
             assert_eq!(x, 100.0 + (900.0 - *want_w), "step {i}");
-            cx = x;
-            cw = w;
         }
     }
 
@@ -3392,7 +3563,12 @@ mod tests {
     #[test]
     fn resize_session_missing_start_falls_back_to_current_rect() {
         let mut s = ResizeSession::default();
-        let (_, _, w, h) = s.apply(crate::ResizeEdge::BottomRight, 5.0, 15.0, 0.0, 0.0, 800.0, 500.0);
+        let (_, _, w, h) = s.apply(
+            crate::ResizeEdge::BottomRight,
+            5.0,
+            15.0,
+            Some((0.0, 0.0, 800.0, 500.0)),
+        );
         assert_eq!((w, h), (805.0, 515.0));
     }
 
@@ -3400,10 +3576,10 @@ mod tests {
     #[test]
     fn resize_session_clamps_to_limits() {
         let mut s = ResizeSession::default();
-        s.start(0.0, 0.0, 800.0, 500.0, None);
-        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 5000.0, 0.0, 0.0, 0.0, 800.0, 500.0);
+        s.start(0.0, 0.0, 800.0, 500.0, None, 1.0);
+        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 5000.0, 0.0, None);
         assert_eq!(w, RESIZE_MAX_W);
-        let (_, y, _, h) = s.apply(crate::ResizeEdge::Top, 0.0, 5000.0, 0.0, 0.0, 800.0, 500.0);
+        let (_, y, _, h) = s.apply(crate::ResizeEdge::Top, 0.0, 5000.0, None);
         assert_eq!(h, RESIZE_MIN_H);
         assert_eq!(y, 500.0 - RESIZE_MIN_H); // 下边缘保持不动
     }
@@ -3412,12 +3588,73 @@ mod tests {
     #[test]
     fn resize_session_restart_overrides_baseline() {
         let mut s = ResizeSession::default();
-        s.start(0.0, 0.0, 800.0, 500.0, None);
-        s.apply(crate::ResizeEdge::Right, 40.0, 0.0, 0.0, 0.0, 830.0, 500.0);
+        s.start(0.0, 0.0, 800.0, 500.0, None, 1.0);
+        s.apply(crate::ResizeEdge::Right, 40.0, 0.0, None);
         // 第二次按下：以当时的矩形为新基准
-        s.start(0.0, 0.0, 840.0, 500.0, None);
-        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 10.0, 0.0, 0.0, 0.0, 845.0, 500.0);
+        s.start(0.0, 0.0, 840.0, 500.0, None, 1.0);
+        let (_, _, w, _) = s.apply(crate::ResizeEdge::Right, 10.0, 0.0, None);
         assert_eq!(w, 850.0);
+    }
+
+    // ===== ResizeSession 优化项：锁定 scale / 写回去重 =====
+
+    /// 会话锁定 scale：位移按「按下瞬间」的 scale_factor 换算，拖拽途中
+    /// DPI 突变（跨显示器）不影响换算——displacement 不再接收外部 scale，
+    /// 回调侧也就没有「每帧读 scale」这个漂移源。
+    #[test]
+    fn resize_session_locks_scale_at_press() {
+        let mut s = ResizeSession::default();
+        // 150% 屏上按下：基准光标 (150, 0)
+        s.start(0.0, 0.0, 800.0, 500.0, Some((150.0, 0.0)), 1.5);
+        // 光标移到 (450, 0)：物理位移 300 → 逻辑 dx = 300 / 1.5 = 200
+        let (dx, dy) = s.displacement(Some((450.0, 0.0)));
+        assert_eq!((dx, dy), (200.0, 0.0));
+        // 继续移动到 (600, 0)：物理位移 450 → 逻辑 300，仍按锁定的 1.5 换算
+        let (dx, _) = s.displacement(Some((600.0, 0.0)));
+        assert_eq!(dx, 300.0);
+    }
+
+    /// 未 start（无基准）时 scale 按 1.0 兜底、has_base 为 false。
+    #[test]
+    fn resize_session_no_start_uses_unit_scale() {
+        let s = ResizeSession::default();
+        assert_eq!(s.scale(), 1.0);
+        assert!(!s.has_base());
+        let (dx, dy) = s.displacement(Some((500.0, 500.0)));
+        assert_eq!((dx, dy), (0.0, 0.0));
+    }
+
+    /// need_apply / mark_applied：与上次写回相同的目标矩形跳过窗口操作
+    /// （拖到 min/max 后光标继续移动、或亚像素抖动取整后相同）；新一次
+    /// 按下清空记录，保证首个 moved 一定落盘。
+    #[test]
+    fn resize_session_need_apply_skips_repeated_rect() {
+        let mut s = ResizeSession::default();
+        s.start(0.0, 0.0, 800.0, 600.0, None, 1.0);
+        assert!(s.need_apply(100, 100, 800, 600));
+        s.mark_applied(100, 100, 800, 600);
+        assert!(!s.need_apply(100, 100, 800, 600));
+        // 新会话：记录被 start 清空
+        s.start(0.0, 0.0, 800.0, 600.0, None, 1.0);
+        assert!(s.need_apply(100, 100, 800, 600));
+    }
+
+    // ===== 逻辑 → 物理矩形换算 =====
+
+    /// 125% 缩放下逻辑坐标乘 scale 常得非整数物理值：必须 round 而非截断
+    /// （旧实现 position 用 as i32 截断、set_size 内部四舍五入，取整方向
+    /// 不一致造成边缘 1px 错位）。
+    #[test]
+    fn logical_to_physical_rect_rounds_instead_of_truncating() {
+        // 12.5 → 13（Rust round：远离零取整）
+        let (x, y, w, h) = logical_to_physical_rect(10.0, 20.0, 800.0, 600.0, 1.25);
+        assert_eq!((x, y, w, h), (13, 25, 1000, 750));
+        // 150% 整数倍：不受影响
+        let (x, y, w, h) = logical_to_physical_rect(100.0, 50.0, 800.0, 600.0, 1.5);
+        assert_eq!((x, y, w, h), (150, 75, 1200, 900));
+        // 尺寸下限保护：换算结果至少 1 物理像素
+        let (_, _, w, h) = logical_to_physical_rect(0.0, 0.0, 0.1, 0.1, 1.0);
+        assert_eq!((w, h), (1, 1));
     }
 
     #[test]
