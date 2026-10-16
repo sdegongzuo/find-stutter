@@ -20,6 +20,21 @@ use find_stutter_core::{CauseKind, Config, ProcessBrief, StutterEvent};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 
+/// 探测 `stutter_events` 是否含某列（旧库兼容）。
+///
+/// 与 `logger::event_count_today` / `analytics::load_kpi` 同口径：`build_induced`
+/// 为 2026-10-16 新增列，旧库缺失时计数查询退化为不排除（不报错）。
+fn events_has_column(conn: &Connection, column: &str) -> bool {
+    conn.prepare("PRAGMA table_info(stutter_events)")
+        .and_then(|mut stmt| {
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|n| n == column))
+        })
+        .unwrap_or(false)
+}
+
 /// 服务健康状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceHealth {
@@ -205,11 +220,17 @@ impl DbReader {
         //     与 logger.event_count_today 共用 local_today_bounds，保证悬浮窗与分析页一致）
         let today_event_count: u32 = {
             let (start, end) = find_stutter_core::logger::local_today_bounds();
-            conn.query_row(
-                "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
-                rusqlite::params![start, end],
-                |row| row.get::<_, i64>(0),
-            )
+            // 构建自伤事件不计入「今日卡顿 N 次」（2026-10-16 治理），与
+            // logger.event_count_today / analytics.load_kpi 同口径。
+            let sql = if events_has_column(conn, "build_induced") {
+                "SELECT COUNT(*) FROM stutter_events \
+                 WHERE timestamp BETWEEN ?1 AND ?2 AND build_induced = 0"
+            } else {
+                "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2"
+            };
+            conn.query_row(sql, rusqlite::params![start, end], |row| {
+                row.get::<_, i64>(0)
+            })
             .map(|n| n as u32)
             .unwrap_or(0)
         };
@@ -256,6 +277,8 @@ impl DbReader {
             // F-RC1 新列：检测是否存在（与 culprits 同理）。四列随同一迁移批次写入，
             // 存在性以 lead 列 cause_kinds 代表即可，缺失则回退默认值。
             let has_cause_kinds = columns.iter().any(|n| n == "cause_kinds");
+            // 2026-10-16 新增列：构建自伤标记。
+            let has_build_induced = columns.iter().any(|n| n == "build_induced");
 
             let mut select =
                 "id, timestamp, duration_ms, severity, causes, snapshot".to_string();
@@ -264,6 +287,9 @@ impl DbReader {
             }
             if has_cause_kinds {
                 select.push_str(", cause_kinds, primary_cause, cause_first_touch, onset_ts");
+            }
+            if has_build_induced {
+                select.push_str(", build_induced");
             }
             let event_sql = format!(
                 "SELECT {} FROM stutter_events ORDER BY id DESC LIMIT 1",
@@ -313,6 +339,11 @@ impl DbReader {
                 } else {
                     (Vec::new(), None, std::collections::HashMap::new(), None)
                 };
+                let build_induced = if has_build_induced {
+                    row.get::<_, i64>(idx)? != 0
+                } else {
+                    false
+                };
                 let mut event = StutterEvent {
                     id,
                     timestamp,
@@ -325,6 +356,7 @@ impl DbReader {
                     onset_ts,
                     snapshot,
                     culprits,
+                    build_induced,
                 };
                 // 旧库 cause_kinds 为空时用 cause_key 可靠回填（精确映射，非脆弱关键词）：
                 // 仅当结构化字段为空、但自由文本 causes 非空时触发（见 PRD §3.1）。

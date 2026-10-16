@@ -20,7 +20,7 @@
 //   - "card"（默认）：三列白卡布局
 //   - "bubble"：三列绿色气泡布局，与 card 同为完整指标集（上传/下载/CPU/内存/
 //     GPU/今日卡顿/服务状态/心跳/当日流量），仅配色与尺寸不同；见背板内第二个
-//     内容块。暂停区为右侧悬浮区（x: width-36..width-6），悬浮/暂停时显示图标
+//     内容块。暂停区为右侧常驻图标（x: width-24..width-4），始终显示
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
 // 卡顿分析页面组件（PRD M1）：直接作为顶层组件定义在本文件末尾（export component
@@ -28,6 +28,43 @@ import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from
 // 的根文件」的顶层组件，被 `import` 的子文件组件不会进入 Rust 侧生成代码；若拆成独立
 // 文件再 import，Rust 端 `crate::Analysis` 取不到。故内联于此（避免与 src/analysis.rs 的
 // `analysis` Rust 模块混淆——slint 按 `export component` 名生成 `Analysis` 类型）。
+
+// 可点击的指标数字：常驻下划线标示「可点击区域」，鼠标悬浮加浅色底。
+// 几何（absolute-position + width/height）供 Overlay 做精确命中判定——
+// 只有数字可点，前面的标签不可点。
+component ClickableValue inherits Rectangle {
+    in property <string> text;
+    in property <color> text-color: #1e1e2e;
+    in property <length> font-size: 13px;
+    in property <bool> hovered: false;
+    property <length> pad-x: 4px;
+    height: 16px;
+    width: value-text.preferred-width + 2 * self.pad-x;
+    // 悬浮浅色底：用文字色低透明度，白卡 / 绿气泡都能适配
+    background: root.hovered ? root.text-color.with-alpha(0.15) : transparent;
+    border-radius: 3px;
+
+    value-text := Text {
+        x: root.pad-x;
+        width: root.width - 2 * root.pad-x;
+        height: 100%;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+        text: root.text;
+        color: root.text-color;
+        font-size: root.font-size;
+        overflow: elide;
+    }
+    // 下划线：常驻（标示可点击），悬浮加深
+    Rectangle {
+        x: root.pad-x;
+        y: root.height - 2px;
+        width: root.width - 2 * root.pad-x;
+        height: 1px;
+        background: root.text-color;
+        opacity: root.hovered ? 0.95 : 0.4;
+    }
+}
 
 export component Overlay inherits Window {
     width: root.skin-width;
@@ -62,11 +99,17 @@ export component Overlay inherits Window {
     in property <float> service-bar-height: 0.0;
 
     // === 指标 ===
-    in property <string> cpu-text: "CPU  --";
-    in property <string> mem-text: "内存  --";
+    // 标签与数字拆开：只有数字（ClickableValue）可点击弹出进程弹窗，
+    // 数字下方常驻下划线标示可点击区域，标签不可点。
+    in property <string> cpu-label: "CPU";
+    in property <string> cpu-value: "--";
+    in property <string> mem-label: "内存";
+    in property <string> mem-value: "--";
     in property <string> gpu-text: "GPU  --";
-    in property <string> net-send: "↑  --";
-    in property <string> net-recv: "↓  --";
+    in property <string> net-send-label: "↑";
+    in property <string> net-send-value: "--";
+    in property <string> net-recv-label: "↓";
+    in property <string> net-recv-value: "--";
     // 当日累计网络流量（默认显示；↑ 上行 / ↓ 下行分开，统计口径见 reader / sum_network_traffic）
     in property <string> net-today-up: "↑ --";
     in property <string> net-today-down: "↓ --";
@@ -79,11 +122,15 @@ export component Overlay inherits Window {
     // "card"   = 三列白卡（默认，上方原有布局）
     // "bubble" = 2×2 绿色迷你气泡（上传/下载/CPU/内存）
     in property <string> layout-mode: "card";
-    // bubble 布局的 2×2 网格文本 + 悬浮 tooltip（服务状态/今日卡顿/心跳/当日流量）
-    in property <string> bubble-up: "上传: --";
-    in property <string> bubble-down: "下载: --";
-    in property <string> bubble-cpu: "CPU: --";
-    in property <string> bubble-mem: "内存: --";
+    // bubble 布局的 2×2 网格：标签与数字拆开（数字可点击）
+    in property <string> bubble-up-label: "上传:";
+    in property <string> bubble-up-value: "--";
+    in property <string> bubble-down-label: "下载:";
+    in property <string> bubble-down-value: "--";
+    in property <string> bubble-cpu-label: "CPU:";
+    in property <string> bubble-cpu-value: "--";
+    in property <string> bubble-mem-label: "内存:";
+    in property <string> bubble-mem-value: "--";
     in property <string> bubble-tip: "";
     // 可选吉祥物图片（皮肤 mascot 字段；未配置/加载失败时隐藏）
     in property <image> mascot-image;
@@ -104,6 +151,47 @@ export component Overlay inherits Window {
     // 在鼠标位置弹系统菜单（可超出悬浮窗区域，不受窗口大小限制）。
     callback drag-moved(length, length);
     callback menu-requested(length, length);
+
+    // 资源区左键点击：点 CPU / 内存 / 网络文字区 → 打开按该维度排序的进程弹窗。
+    // 参数 "cpu" / "mem" / "net"；未命中返回 ""（Rust 端忽略）。
+    callback resource-clicked(string);
+
+    // === 资源区命中判定（全窗口 TouchArea 用坐标判定，见 ta.clicked）===
+    // 只命中数字（ClickableValue）的矩形：用元素 absolute-position + 宽高精确判定，
+    // 点标签 / GPU / 空白都不触发。card 与 bubble 各自一套。
+    function in-elem(px: length, py: length, rx: length, ry: length, rw: length, rh: length) -> bool {
+        return px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
+    }
+    function card-hit(x: length, y: length) -> string {
+        if (root.in-elem(x, y, card-cpu-value.absolute-position.x, card-cpu-value.absolute-position.y, card-cpu-value.width, card-cpu-value.height)) { return "cpu"; }
+        if (root.in-elem(x, y, card-mem-value.absolute-position.x, card-mem-value.absolute-position.y, card-mem-value.width, card-mem-value.height)) { return "mem"; }
+        if (root.in-elem(x, y, card-net-send-value.absolute-position.x, card-net-send-value.absolute-position.y, card-net-send-value.width, card-net-send-value.height)
+            || root.in-elem(x, y, card-net-recv-value.absolute-position.x, card-net-recv-value.absolute-position.y, card-net-recv-value.width, card-net-recv-value.height)) { return "net"; }
+        return "";
+    }
+    function bubble-hit(x: length, y: length) -> string {
+        if (root.in-elem(x, y, bubble-cpu-value.absolute-position.x, bubble-cpu-value.absolute-position.y, bubble-cpu-value.width, bubble-cpu-value.height)) { return "cpu"; }
+        if (root.in-elem(x, y, bubble-mem-value.absolute-position.x, bubble-mem-value.absolute-position.y, bubble-mem-value.width, bubble-mem-value.height)) { return "mem"; }
+        if (root.in-elem(x, y, bubble-up-value.absolute-position.x, bubble-up-value.absolute-position.y, bubble-up-value.width, bubble-up-value.height)
+            || root.in-elem(x, y, bubble-down-value.absolute-position.x, bubble-down-value.absolute-position.y, bubble-down-value.width, bubble-down-value.height)) { return "net"; }
+        return "";
+    }
+    function resource-kind(x: length, y: length) -> string {
+        return root.layout-mode == "bubble" ? root.bubble-hit(x, y) : root.card-hit(x, y);
+    }
+    // 数字悬浮高亮：元素自身矩形内
+    function hovering(el-x: length, el-y: length, el-w: length, el-h: length) -> bool {
+        return ta.has-hover && root.in-elem(ta.mouse-x, ta.mouse-y, el-x, el-y, el-w, el-h);
+    }
+    // 暂停按钮热区（与 ta.clicked 原判定一致，抽出复用）
+    function pause-hit(x: length, y: length) -> bool {
+        if (root.layout-mode == "bubble") {
+            return x >= root.width - 36px && x <= root.width - 6px
+                && y >= (root.height - 32px) / 2 && y <= (root.height + 32px) / 2;
+        }
+        return x >= root.width - 6px - 96px && x <= root.width - 6px && y >= 52px && y <= 68px;
+    }
+
     // 命名 ta 供 bubble 暂停悬浮区引用（has-hover / mouse-x）
     ta := TouchArea {
         z: 100;
@@ -118,23 +206,15 @@ export component Overlay inherits Window {
         // 暂停按钮：点击落在右列按钮区域时切换暂停。
         // 用同一 TouchArea 坐标判断，不依赖 z 层级（多 TouchArea 叠层在
         // 本窗口实测点击不生效，统一到一个 TouchArea 最可靠）。
-        // - card 布局：x = width-6-96 .. width-6；y = 52..68（列顶10+16+5+16+5）
-        // - bubble 布局：右侧悬浮区 x = width-36 .. width-6；垂直居中 ±16px
+        // 未命中暂停区时判定资源区（CPU/内存/网络）→ 通知 Rust 弹对应弹窗。
         clicked => {
-            if (root.pause-enabled) {
-                if (root.layout-mode == "bubble"
-                    && self.pressed-x >= root.width - 36px
-                    && self.pressed-x <= root.width - 6px
-                    && self.pressed-y >= (root.height - 32px) / 2
-                    && self.pressed-y <= (root.height + 32px) / 2) {
-                    root.paused = !root.paused;
-                    root.toggle-pause();
-                } else if (self.pressed-x >= root.width - 6px - 96px
-                    && self.pressed-x <= root.width - 6px
-                    && self.pressed-y >= 52px
-                    && self.pressed-y <= 68px) {
-                    root.paused = !root.paused;
-                    root.toggle-pause();
+            if (root.pause-enabled && root.pause-hit(self.pressed-x, self.pressed-y)) {
+                root.paused = !root.paused;
+                root.toggle-pause();
+            } else {
+                // 仅命中资源区（CPU/内存/网络）才发回调，其余空白/GPU 区忽略
+                if (root.resource-kind(self.pressed-x, self.pressed-y) != "") {
+                    root.resource-clicked(root.resource-kind(self.pressed-x, self.pressed-y));
                 }
             }
         }
@@ -167,8 +247,30 @@ export component Overlay inherits Window {
                 VerticalLayout {
                     spacing: 5px;
                     width: 28%;
-                    Text { height: 16px; vertical-alignment: center; text: cpu-text; color: root.cpu-color; font-size: root.text-size; }
-                    Text { height: 16px; vertical-alignment: center; text: mem-text; color: root.mem-color; font-size: root.text-size; }
+                    // 行内用容器 + 显式定位（不用 HorizontalLayout：标签会被拉伸，
+                    // 把数字推到右侧）。标签紧贴，数字紧跟其后。
+                    Rectangle {
+                        height: 16px;
+                        card-cpu-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.cpu-label; color: root.cpu-color; font-size: root.text-size; }
+                        card-cpu-value := ClickableValue {
+                            x: card-cpu-lbl.preferred-width + 2px;
+                            text: root.cpu-value;
+                            text-color: root.cpu-color;
+                            font-size: root.text-size;
+                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                        }
+                    }
+                    Rectangle {
+                        height: 16px;
+                        card-mem-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.mem-label; color: root.mem-color; font-size: root.text-size; }
+                        card-mem-value := ClickableValue {
+                            x: card-mem-lbl.preferred-width + 2px;
+                            text: root.mem-value;
+                            text-color: root.mem-color;
+                            font-size: root.text-size;
+                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                        }
+                    }
                     Text { height: 16px; vertical-alignment: center; text: event-count; color: root.event-color; font-size: max(10px, root.text-size - 3px); }
                 }
 
@@ -178,11 +280,19 @@ export component Overlay inherits Window {
                     Text { height: 16px; vertical-alignment: center; text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
                     // 网速左、当日累计流量右：↑ 行=上传，↓ 行=下载（替代原「磁盘读写速率」位）；
                     // 鼠标悬浮任一流量文本弹出当周明细 tooltip
-                    HorizontalLayout {
+                    Rectangle {
                         height: 16px;
-                        spacing: 4px;
-                        Text { height: 100%; vertical-alignment: center; text: net-send; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
+                        card-net-send-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.net-send-label; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
+                        card-net-send-value := ClickableValue {
+                            x: card-net-send-lbl.preferred-width + 2px;
+                            text: root.net-send-value;
+                            text-color: root.net-color;
+                            font-size: max(12px, root.text-size - 1px);
+                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                        }
                         Text {
+                            x: card-net-send-value.x + card-net-send-value.width + 4px;
+                            width: self.preferred-width;
                             height: 100%;
                             vertical-alignment: center;
                             text: net-today-up;
@@ -191,11 +301,19 @@ export component Overlay inherits Window {
                             Tooltip { text: @markdown("\{net-week-tip}"); }
                         }
                     }
-                    HorizontalLayout {
+                    Rectangle {
                         height: 16px;
-                        spacing: 4px;
-                        Text { height: 100%; vertical-alignment: center; text: net-recv; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
+                        card-net-recv-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.net-recv-label; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
+                        card-net-recv-value := ClickableValue {
+                            x: card-net-recv-lbl.preferred-width + 2px;
+                            text: root.net-recv-value;
+                            text-color: root.net-color;
+                            font-size: max(12px, root.text-size - 1px);
+                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                        }
                         Text {
+                            x: card-net-recv-value.x + card-net-recv-value.width + 4px;
+                            width: self.preferred-width;
                             height: 100%;
                             vertical-alignment: center;
                             text: net-today-down;
@@ -251,7 +369,7 @@ export component Overlay inherits Window {
         // 与 card 相同的三列三行结构，展示全部指标：
         //   左列 CPU/内存/GPU、中列 上传/下载/今日卡顿、右列 服务状态/心跳/当日流量。
         // 气泡配色（浅绿底 + 深灰绿字）由皮肤注入；悬浮任一指标弹出辅助 tooltip；
-        // 右侧为暂停/恢复悬浮区（图标为窗口级叠层，不占布局空间）。
+        // 右侧为暂停/恢复按钮（图标为窗口级叠层、常驻显示，不占布局空间）。
         HorizontalLayout {
             visible: root.layout-mode == "bubble";
             x: 0;
@@ -259,24 +377,49 @@ export component Overlay inherits Window {
             width: 100%;
             height: 100%;
             padding-left: 12px;
-            padding-right: 8px;
+            // 预留右侧暂停/恢复图标区（常驻显示，见文件末窗口级叠层），避免压住右列文字
+            padding-right: 30px;
             padding-top: 10px;
             padding-bottom: 10px;
             spacing: 8px;
 
             // 左列：CPU / 内存 / GPU
+            // 三列均 horizontal-stretch:1：按各自内容宽度 + 等分剩余空间，
+            // 列间距均匀（原先左列固定 24%、右列固定 32%，中列吃掉剩余 → 中列过宽）。
             VerticalLayout {
                 spacing: 5px;
-                width: 24%;
-                Text {
+                horizontal-stretch: 1;
+                Rectangle {
                     height: 16px;
-                    vertical-alignment: center;
-                    text: root.bubble-cpu;
-                    color: root.cpu-color;
-                    font-size: root.text-size;
-                    Tooltip { text: @markdown("\{root.bubble-tip}"); }
+                    bubble-cpu-lbl := Text {
+                        x: 0;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.bubble-cpu-label;
+                        color: root.cpu-color;
+                        font-size: root.text-size;
+                        Tooltip { text: @markdown("\{root.bubble-tip}"); }
+                    }
+                    bubble-cpu-value := ClickableValue {
+                        x: bubble-cpu-lbl.preferred-width + 2px;
+                        text: root.bubble-cpu-value;
+                        text-color: root.cpu-color;
+                        font-size: root.text-size;
+                        hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
                 }
-                Text { height: 16px; vertical-alignment: center; text: root.bubble-mem; color: root.mem-color; font-size: root.text-size; }
+                Rectangle {
+                    height: 16px;
+                    bubble-mem-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-mem-label; color: root.mem-color; font-size: root.text-size; }
+                    bubble-mem-value := ClickableValue {
+                        x: bubble-mem-lbl.preferred-width + 2px;
+                        text: root.bubble-mem-value;
+                        text-color: root.mem-color;
+                        font-size: root.text-size;
+                        hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
                 Text { height: 16px; vertical-alignment: center; text: root.gpu-text; color: root.gpu-color; font-size: max(11px, root.text-size - 1px); }
             }
 
@@ -284,15 +427,35 @@ export component Overlay inherits Window {
             VerticalLayout {
                 spacing: 5px;
                 horizontal-stretch: 1;
-                Text { height: 16px; vertical-alignment: center; text: root.bubble-up; color: root.net-color; font-size: root.text-size; }
-                Text { height: 16px; vertical-alignment: center; text: root.bubble-down; color: root.net-color; font-size: root.text-size; }
+                Rectangle {
+                    height: 16px;
+                    bubble-up-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-up-label; color: root.net-color; font-size: root.text-size; }
+                    bubble-up-value := ClickableValue {
+                        x: bubble-up-lbl.preferred-width + 2px;
+                        text: root.bubble-up-value;
+                        text-color: root.net-color;
+                        font-size: root.text-size;
+                        hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
+                Rectangle {
+                    height: 16px;
+                    bubble-down-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-down-label; color: root.net-color; font-size: root.text-size; }
+                    bubble-down-value := ClickableValue {
+                        x: bubble-down-lbl.preferred-width + 2px;
+                        text: root.bubble-down-value;
+                        text-color: root.net-color;
+                        font-size: root.text-size;
+                        hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
+                    }
+                }
                 Text { height: 16px; vertical-alignment: center; text: root.event-count; color: root.event-color; font-size: max(11px, root.text-size - 2px); }
             }
 
             // 右列：服务状态 / 心跳 / 当日流量（↑ 上行 ↓ 下行；悬浮看当周明细）
             VerticalLayout {
                 spacing: 5px;
-                width: 32%;
+                horizontal-stretch: 1;
                 Text { height: 16px; vertical-alignment: center; text: root.service-status; color: root.service-status-color; font-size: max(10px, root.text-size - 3px); overflow: elide; }
                 Text { height: 16px; vertical-alignment: center; text: root.last-heartbeat; color: root.hb-color; font-size: max(10px, root.text-size - 4px); }
                 Text {
@@ -315,11 +478,10 @@ export component Overlay inherits Window {
             }
         }
 
-        // 暂停/恢复图标：仅 bubble 布局显示；鼠标悬浮右侧区域或暂停中时可见。
+        // 暂停/恢复图标：仅 bubble 布局显示；常驻可见（不再依赖鼠标悬浮）。
         // 作窗口级叠层（不参与 HorizontalLayout 排布，避免挤压三列文本）。
         Text {
-            visible: root.layout-mode == "bubble"
-                && (root.paused || (ta.has-hover && ta.mouse-x >= root.width - 36px));
+            visible: root.layout-mode == "bubble";
             x: root.width - 24px;
             y: (root.height - 16px) / 2;
             width: 20px;
@@ -430,6 +592,8 @@ struct ProcessRowData {
 
 component ProcessRow inherits Rectangle {
     in property <ProcessRowData> data;
+    // 精简列模式（资源区点击弹出的窗口）：隐藏 专用工作集 / 磁盘 / 累计网络 / 端口
+    in property <bool> compact: false;
     callback group-toggle(string);
     callback context-menu(int, string);
     // 非聚合行单击（Rust 端做双击检测 → 弹详情面板）
@@ -522,8 +686,9 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 物理内存（专用工作集；右对齐）
+        // 物理内存（专用工作集；右对齐；精简列模式隐藏）
         Text {
+            visible: !root.compact;
             min-width: 76px;
             max-width: 76px;
             height: 100%;
@@ -535,8 +700,9 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 磁盘（加宽到 132px 装下 "R 217.8K/s W 28.6K/s"；右对齐 + 悬浮完整）
+        // 磁盘（加宽到 132px 装下 "R 217.8K/s W 28.6K/s"；右对齐 + 悬浮完整；精简列模式隐藏）
         Text {
+            visible: !root.compact;
             min-width: 132px;
             max-width: 132px;
             height: 100%;
@@ -563,8 +729,9 @@ component ProcessRow inherits Rectangle {
             Tooltip { text: @markdown("\{data.net-full}"); }
         }
 
-        // 累计网络传输量（右对齐）
+        // 累计网络传输量（右对齐；精简列模式隐藏）
         Text {
+            visible: !root.compact;
             min-width: 66px;
             max-width: 66px;
             height: 100%;
@@ -578,8 +745,9 @@ component ProcessRow inherits Rectangle {
         }
 
         // 端口（监听 TCP + UDP；右对齐；空时显示 "—"；110px 装下
-        // "80, 443 +11" 这类长列表，WorkBuddy(13) 等聚合行也能完整显示）
+        // "80, 443 +11" 这类长列表，WorkBuddy(13) 等聚合行也能完整显示；精简列模式隐藏）
         Text {
+            visible: !root.compact;
             min-width: 110px;
             max-width: 110px;
             height: 100%;
@@ -626,6 +794,8 @@ export component ProcessList inherits Window {
     background: transparent;
 
     in property <[ProcessRowData]> process-model: [];
+    // 精简列模式：隐藏 专用工作集 / 磁盘 / 累计网络 / 端口（资源区点击弹出的窗口用）
+    in property <bool> compact-columns: false;
     in property <string> header-text: "进程详情（30s 自动刷新）";
     in property <string> search-text: "";
     // 排序列 + 方向（Rust 端维护，用于列头箭头显示）
@@ -661,9 +831,9 @@ export component ProcessList inherits Window {
     // 次数、热区是否随动均无关。
     callback resize-started();
 
-    // 列表滚动偏移（viewport-y，未滚动=0，向下滚动为负；Rust 端命中测试用：
+    // 列表滚动偏移（content-y，未滚动=0，向下滚动为负；Rust 端命中测试用：
     // 连续右键切换时把鼠标 y 换算成列表行号需扣除滚动量）
-    out property <length> list-scroll-y: process-list-view.viewport-y;
+    out property <length> list-scroll-y: process-list-view.content-y;
 
     // 标题栏拖动（仅标题栏区域接收拖动事件）
     callback drag-moved(length, length);
@@ -804,6 +974,7 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
+                    visible: !root.compact-columns;
                     min-width: 76px;
                     max-width: 76px;
                     height: 100%;
@@ -820,6 +991,7 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
+                    visible: !root.compact-columns;
                     min-width: 132px;
                     max-width: 132px;
                     height: 100%;
@@ -850,6 +1022,7 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
+                    visible: !root.compact-columns;
                     min-width: 66px;
                     max-width: 66px;
                     height: 100%;
@@ -865,6 +1038,7 @@ export component ProcessList inherits Window {
                     }
                 }
                 Rectangle {
+                    visible: !root.compact-columns;
                     min-width: 110px;
                     max-width: 110px;
                     height: 100%;
@@ -885,6 +1059,7 @@ export component ProcessList inherits Window {
             process-list-view := ListView {
                 for row in root.process-model : ProcessRow {
                     data: row;
+                    compact: root.compact-columns;
                     group-toggle(key) => { root.group-toggle(key); }
                     context-menu(pid, name) => { root.row-context-menu(pid, name); }
                     row-clicked(pid) => { root.row-clicked(pid); }

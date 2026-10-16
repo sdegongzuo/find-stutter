@@ -1,6 +1,9 @@
 #[cfg(not(test))]
 use crate::collector::probe_foreground_window_frozen;
-use crate::types::{cause_key, CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
+use crate::types::{
+    build_induced_note, build_induced_tools, cause_key, CauseKind, DetectionConfig, ProcessBrief,
+    Sample, Severity, StutterEvent,
+};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -355,7 +358,7 @@ impl Detector {
                 // 落库文案（2026-10-16 治理）：同类型若当前只剩带内「滞回保持」文案，
                 // 优先回填本轮记录的真实越线文案，保证事件自带「为何触发」的证据；
                 // 活跃视图 `current_causes` 不动（severity 判级口径不变）。
-                let stored_causes: Vec<String> = self
+                let mut stored_causes: Vec<String> = self
                     .current_causes
                     .iter()
                     .map(|c| {
@@ -369,6 +372,16 @@ impl Detector {
                         }
                     })
                     .collect();
+                // 构建自伤（2026-10-16 治理）：元凶含显著占用的编译/链接工具时，
+                // 追加中文标注并置 build_induced —— 该事件不计入「今日卡顿次数」等
+                // KPI（仍落库、可查询、可在列表中区分），避免用户/CI 本地编译时的
+                // 自伤负载被当成真实卡顿噪音。判级 / 压力闸门口径不受影响
+                // （detect 在此之前已算好 severity / cause_kinds / primary_cause）。
+                let build_tools = build_induced_tools(&culprits);
+                let build_induced = !build_tools.is_empty();
+                if build_induced {
+                    stored_causes.push(build_induced_note(&build_tools));
+                }
                 let event = StutterEvent {
                     id: 0,
                     timestamp: Utc::now(),
@@ -386,6 +399,7 @@ impl Detector {
                     onset_ts: Some(onset_ts),
                     snapshot: sample.clone(),
                     culprits,
+                    build_induced,
                 };
                 self.current_causes.clear();
                 self.current_cause_first_touch.clear();
@@ -2787,6 +2801,50 @@ mod tests {
         assert!(!event.culprits.is_empty(), "应记录 culprit 进程");
         assert_eq!(event.culprits[0].name, "heavy.exe");
         assert_eq!(event.culprits[0].pid, 1001);
+        assert!(!event.build_induced, "普通进程不应标记为构建自伤");
+    }
+
+    /// 构建自伤（2026-10-16 治理）：元凶含显著占用的编译 / 链接工具时，
+    /// 事件置 `build_induced` 并在 `causes` 末尾追加中文标注（供 KPI 排除与展示区分）。
+    #[test]
+    fn analyze_marks_build_induced_when_linker_dominates() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        let mut s = make_sample(95.0, 2000, 10.0); // 触发 CPU 卡顿
+        s.top_processes = vec![
+            ProcessBrief {
+                pid: 2001,
+                name: "link.exe".into(),
+                cpu_usage: 12.0,
+                mem_used_mb: 2700, // 大 crate 链接：内存显著
+                ..Default::default()
+            },
+            ProcessBrief {
+                pid: 2002,
+                name: "rustup.exe".into(),
+                cpu_usage: 360.0, // 满多核：CPU 显著
+                mem_used_mb: 60,
+                ..Default::default()
+            },
+        ];
+        for _ in 0..3 {
+            d.analyze(&s);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 累计真实越线时长，满足落库闸门
+
+        let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
+        assert!(event.build_induced, "link.exe/rustup.exe 主导应标记构建自伤");
+        assert!(
+            event
+                .causes
+                .iter()
+                .any(|c| c.starts_with(crate::types::BUILD_INDUCED_CAUSE_PREFIX)),
+            "causes 应含构建自伤标注，实际：{:?}",
+            event.causes
+        );
     }
 
     /// 无 top 进程（默认采样）时 culprits 应为空，不应 panic。

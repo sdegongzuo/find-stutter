@@ -29,7 +29,7 @@
 //! 本模块持有 `Mutex<System>` 供刷新循环复用。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -2185,6 +2185,9 @@ fn group_display(
     )
 }
 
+/// 资源区弹窗唯一 id 分配器（lib.rs 跟踪表用）
+static NEXT_WINDOW_ID: AtomicUsize = AtomicUsize::new(1);
+
 /// 进程列表窗口句柄。
 pub struct ProcessListWindow {
     ui: crate::ProcessList,
@@ -2225,21 +2228,37 @@ pub struct ProcessListWindow {
     sampler_handle: Option<std::thread::JoinHandle<()>>,
     /// 刷新 Timer（Arc 共享：下拉改间隔时重启；持有防 drop）
     _timer: Arc<slint::Timer>,
+    /// 资源区弹窗唯一 id（lib.rs 跟踪表用；关闭时按 id 移除并 drop）
+    id: usize,
+    /// 关闭回调（资源区弹窗用：关闭按钮点击后通知调用方移除跟踪，
+    /// 触发 drop 以停止采样线程，避免多次点击累积常驻线程）
+    on_closed: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
 }
 
 impl ProcessListWindow {
     /// 创建并显示进程详情窗口。
     ///
     /// `highlight_pct`：CPU/内存高亮阈值（%，来自 config.ui.process_highlight_pct）；
-    /// `refresh_ms`：自动刷新间隔（毫秒，来自 config.ui.process_refresh_ms）。
+    /// `refresh_ms`：自动刷新间隔（毫秒，来自 config.ui.process_refresh_ms）；
+    /// `compact_columns`：精简列模式（资源区点击弹出时为 true，隐藏
+    ///   专用工作集/磁盘/累计网络/端口四列）；
+    /// `initial_sort`：初始排序列（"cpu"/"mem"/"net" 等；资源区点击时按维度指定）。
     ///
     /// **拖动延迟**：窗口由右键菜单弹出，`TrackPopupMenu` 的模态循环会
     /// 吞掉 MouseUp 事件，winit 误以为鼠标仍按住 → 新窗口一出现就被拖动
     /// 跟着鼠标走。因此创建后 300ms 内忽略 drag-moved。
-    pub fn show(highlight_pct: f32, refresh_ms: u64) -> anyhow::Result<Self> {
+    pub fn show(
+        highlight_pct: f32,
+        refresh_ms: u64,
+        compact_columns: bool,
+        initial_sort: &str,
+    ) -> anyhow::Result<Self> {
+        let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::SeqCst);
         let ui = crate::ProcessList::new()?;
+        ui.set_compact_columns(compact_columns);
         let sampler: Arc<Mutex<ProcessSampler>> = Arc::new(Mutex::new(ProcessSampler::new()));
-        let sort: Arc<Mutex<(String, bool)>> = Arc::new(Mutex::new(("cpu".to_string(), false)));
+        let sort: Arc<Mutex<(String, bool)>> =
+            Arc::new(Mutex::new((initial_sort.to_string(), false)));
         let search: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let expanded: Arc<Mutex<std::collections::HashSet<String>>> =
             Arc::new(Mutex::new(std::collections::HashSet::new()));
@@ -2275,6 +2294,8 @@ impl ProcessListWindow {
         });
         // 最近一次打开的详情文本（详情面板「复制」按钮用）
         let detail_text: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        // 关闭回调（资源区弹窗用；默认空，lib.rs 创建后按需注册）
+        let on_closed: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(None));
 
         // #12 采样/渲染分离：采样线程独立跑（UI 只消费 cache 快照），
         // 间隔跟随 refresh_ms（下拉可调，线程每轮读取）。
@@ -2343,11 +2364,15 @@ impl ProcessListWindow {
             }
         });
 
-        // 关闭按钮 → 隐藏窗口
+        // 关闭按钮 → 隐藏窗口 + 通知关闭回调（资源区弹窗据此移除跟踪并 drop）
         let weak_close = ui.as_weak();
+        let on_closed_for_close = on_closed.clone();
         ui.on_close_requested(move || {
             if let Some(ui) = weak_close.upgrade() {
                 let _ = ui.hide();
+            }
+            if let Some(cb) = on_closed_for_close.lock().unwrap().as_ref() {
+                cb();
             }
         });
 
@@ -2799,6 +2824,8 @@ impl ProcessListWindow {
             cache_version,
             sampler_handle: Some(sampler_handle),
             _timer: tick_timer,
+            id,
+            on_closed,
         })
     }
 
@@ -2838,6 +2865,17 @@ impl ProcessListWindow {
     /// 底层 Slint 窗口（供 tick 守护重新设置任务栏样式）。
     pub fn window(&self) -> &slint::Window {
         self.ui.window()
+    }
+
+    /// 资源区弹窗唯一 id（lib.rs 跟踪表按此移除）。
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// 注册关闭回调（资源区弹窗用；关闭按钮点击后触发，通知调用方从跟踪表
+    /// 移除本窗口 → Arc 计数归零 → drop 停止采样线程）。
+    pub fn set_on_closed(&self, f: impl Fn() + Send + 'static) {
+        *self.on_closed.lock().unwrap() = Some(Box::new(f));
     }
 }
 

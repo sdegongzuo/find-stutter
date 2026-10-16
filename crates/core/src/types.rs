@@ -189,6 +189,95 @@ impl ProcessBrief {
     }
 }
 
+/// 编译 / 链接工具的可执行文件主名（小写、不含 `.exe`）。
+///
+/// 用于「本地构建自伤」识别（2026-10-16 治理）：覆盖主流工具链的编译器 / 链接器 /
+/// 构建驱动——MSVC（`cl`/`link`/`ml`/`mc`）、Rust（`rustc`/`cargo`/`rustup`）、
+/// LLVM/Clang（`clang`/`clang-cl`/`lld`/`lld-link`）、GNU（`gcc`/`g++`/`cc1`/`cc1plus`/
+/// `ld`/`as`）、JVM（`javac`/`gradle`/`mvn`）、.NET（`msbuild`/`dotnet`）、
+/// Go（`go`）与构建系统（`cmake`/`ninja`）。
+///
+/// 仅列入「编译期高占用」工具：`go`/`dotnet` 既是运行时也是构建驱动，但只有在
+/// 显著占用（见 [`ProcessBrief::is_build_significant`]）时才参与判定，故误标可控。
+const BUILD_TOOL_STEMS: &[&str] = &[
+    "link", "rustc", "cargo", "rustup", "cc1", "cc1plus", "cl", "clang", "clang-cl", "lld",
+    "lld-link", "ld", "ld.lld", "as", "ml", "ml64", "mc", "mt", "rc", "msbuild", "ninja",
+    "cmake", "gcc", "g++", "javac", "gradle", "mvn", "dotnet", "go",
+];
+
+/// 构建自伤标注文案前缀（稳定 key）。
+///
+/// 命中构建自伤时会在事件 `causes` 末尾追加一段以此前缀开头的说明；
+/// `analytics::classify_cause` 依此前缀归类为「构建自伤」，避免被误算进「其他」。
+pub const BUILD_INDUCED_CAUSE_PREFIX: &str = "本地构建自伤";
+
+impl ProcessBrief {
+    /// 进程名的文件主名（小写、去 `.exe`）；同时兼容带路径 / 不带路径的 name。
+    fn name_stem(&self) -> String {
+        let base = self
+            .name
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(self.name.as_str());
+        base.to_ascii_lowercase()
+            .strip_suffix(".exe")
+            .map(str::to_string)
+            .unwrap_or_else(|| base.to_ascii_lowercase())
+    }
+
+    /// 该进程是否为编译 / 链接工具（构建自伤识别的第一半条件）。
+    pub fn is_build_tool(&self) -> bool {
+        BUILD_TOOL_STEMS.contains(&self.name_stem().as_str())
+    }
+
+    /// 该进程占用是否「显著」——构建自伤需构建工具确实吃掉资源才成立，避免
+    /// 「后台恰好跑着编译但真正元凶是别的进程」时误标。
+    ///
+    /// 口径：CPU ≥ 100%（≈ 满一核；`rustup`/`rustc` 编译常见）或常驻内存 ≥ 300MB
+    /// （大 crate 链接时 `link.exe` 可达 2~3GB）。
+    pub fn is_build_significant(&self) -> bool {
+        self.cpu_usage >= 100.0 || self.mem_used_mb >= 300
+    }
+}
+
+/// 从 culprits 中识别构成「本地构建自伤」的编译 / 链接工具。
+///
+/// 返回命中的构建工具进程名及其出现次数（按首次出现顺序、同名合并），
+/// 空列表表示非构建自伤。判定需同时满足「是构建工具」且「占用显著」
+/// （见 [`ProcessBrief::is_build_tool`] / [`ProcessBrief::is_build_significant`]）。
+pub fn build_induced_tools(culprits: &[ProcessBrief]) -> Vec<(String, usize)> {
+    let mut out: Vec<(String, usize)> = Vec::new();
+    for p in culprits {
+        if !p.is_build_tool() || !p.is_build_significant() {
+            continue;
+        }
+        if let Some(entry) = out.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case(&p.name)) {
+            entry.1 += 1;
+        } else {
+            out.push((p.name.clone(), 1));
+        }
+    }
+    out
+}
+
+/// 生成构建自伤的中文标注文案（追加到事件 `causes`，以 [`BUILD_INDUCED_CAUSE_PREFIX`] 开头）。
+///
+/// 例：`本地构建自伤：编译/链接进程 link.exe ×3、rustup.exe 显著占用资源（不计入卡顿次数）`。
+pub fn build_induced_note(tools: &[(String, usize)]) -> String {
+    let list = tools
+        .iter()
+        .map(|(name, count)| {
+            if *count > 1 {
+                format!("{name} ×{count}")
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("、");
+    format!("{BUILD_INDUCED_CAUSE_PREFIX}：编译/链接进程 {list} 显著占用资源（不计入卡顿次数）")
+}
+
 /// 卡顿严重程度
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Severity {
@@ -395,6 +484,15 @@ pub struct StutterEvent {
     pub snapshot: Sample,
     /// 造成本次卡顿的进程（CPU / 内存维度 top 进程，去重最多 ~6 个）
     pub culprits: Vec<ProcessBrief>,
+    /// 是否为「本地构建自伤」事件（2026-10-16 治理）：元凶中含显著占用的编译 /
+    /// 链接工具（`link`/`rustc`/`cargo`/`clang`/…，见 [`build_induced_tools`]）。
+    ///
+    /// 命中时会在 `causes` 追加一段 [`BUILD_INDUCED_CAUSE_PREFIX`] 开头的标注，
+    /// 且**不计入「今日卡顿 N 次」等 KPI**（仍落库、可查询、可在列表中区分），
+    /// 避免用户 / CI 跑本地编译时的自伤负载被当成真实卡顿噪音。
+    /// 旧库读回缺该列时默认 false（`#[serde(default)]`）。
+    #[serde(default)]
+    pub build_induced: bool,
 }
 
 /// 检测器配置
@@ -1055,6 +1153,48 @@ pub struct RootCauseReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pb(pid: u32, name: &str, cpu: f32, mem: u64) -> ProcessBrief {
+        ProcessBrief {
+            pid,
+            name: name.to_string(),
+            cpu_usage: cpu,
+            mem_used_mb: mem,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_induced_detects_linker_and_rustup() {
+        // link.exe 吃内存（~2.7GB）×2 + rustup.exe 吃 CPU（368%）→ 命中
+        let culprits = vec![
+            pb(1, "link.exe", 0.5, 2700),
+            pb(2, "link.exe", 0.3, 2600),
+            pb(3, "rustup.exe", 368.0, 50),
+        ];
+        let tools = build_induced_tools(&culprits);
+        assert_eq!(
+            tools,
+            vec![("link.exe".to_string(), 2), ("rustup.exe".to_string(), 1)]
+        );
+        let note = build_induced_note(&tools);
+        assert!(note.starts_with(BUILD_INDUCED_CAUSE_PREFIX));
+        assert!(note.contains("link.exe ×2"), "note={note}");
+        assert!(note.contains("rustup.exe"));
+    }
+
+    #[test]
+    fn build_induced_ignores_non_build_and_low_load() {
+        // 非构建工具：即使占用很高也不命中
+        let non_build = vec![pb(1, "chrome.exe", 200.0, 4096)];
+        assert!(build_induced_tools(&non_build).is_empty());
+        // 构建工具但占用不显著（cpu < 100 且 mem < 300MB）：不命中
+        let low = vec![pb(1, "cargo.exe", 5.0, 120)];
+        assert!(build_induced_tools(&low).is_empty());
+        // 带路径 / 大小写混排也能识别（取文件主名、忽略大小写）
+        let path = vec![pb(1, r"C:\tools\LINK.EXE", 0.0, 2048)];
+        assert_eq!(build_induced_tools(&path).len(), 1);
+    }
 
     #[test]
     fn sample_default_values() {

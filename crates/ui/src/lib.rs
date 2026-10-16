@@ -162,6 +162,56 @@ pub fn run() -> anyhow::Result<()> {
         std::sync::Mutex<Option<std::sync::Arc<crate::analysis::AnalysisWindow>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let analysis_win_for_menu = analysis_win.clone();
+
+    // 3a2b) 资源区左键点击：点悬浮窗 CPU / 内存 / 网络文字区 → 新开一个精简列
+    //        进程弹窗，按点击维度排序（cpu/mem/net）。每次点击都是独立窗口，
+    //        故用 Vec 跟踪：每 tick 守护 toolwindow 样式；关闭时经 on_closed
+    //        回调按 id 移除并 drop（停下该窗口的采样线程）。
+    let resource_wins: std::sync::Arc<
+        std::sync::Mutex<Vec<std::sync::Arc<crate::process_list::ProcessListWindow>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let resource_closed: std::sync::Arc<std::sync::Mutex<Vec<usize>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let weak_ui_for_res = ui.as_weak();
+    let resource_wins_cb = resource_wins.clone();
+    let resource_closed_cb = resource_closed.clone();
+    ui.on_resource_clicked(move |kind: slint::SharedString| {
+        let sort = match kind.as_str() {
+            "cpu" | "mem" | "net" => kind.to_string(),
+            _ => return, // 未命中资源区（返回空串）
+        };
+        log::info!("资源区点击: 打开进程弹窗（按 {} 排序）", sort);
+        let w = match crate::process_list::ProcessListWindow::show(
+            proc_highlight_pct,
+            proc_refresh_ms,
+            true,
+            &sort,
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                log::warn!("资源区进程弹窗打开失败: {}", e);
+                return;
+            }
+        };
+        // 位置：悬浮窗左下方偏移 8px，避免遮挡悬浮窗
+        if let Some(ui) = weak_ui_for_res.upgrade() {
+            let win = ui.window();
+            let scale = win.scale_factor();
+            let pos = win.position();
+            let size = win.size();
+            let x = pos.x;
+            let y = pos.y + size.height as i32 + (8.0 * scale) as i32;
+            w.window().set_position(slint::PhysicalPosition::new(x, y));
+        }
+        let w = std::sync::Arc::new(w);
+        let wid = w.id();
+        let closed = resource_closed_cb.clone();
+        w.set_on_closed(move || {
+            closed.lock().unwrap().push(wid);
+        });
+        resource_wins_cb.lock().unwrap().push(w);
+    });
+
     ui.on_menu_requested(move |x: f32, y: f32| {
         let paused = state_for_menu.lock().paused;
         if let Some(ui) = weak_ui_for_menu.upgrade() {
@@ -194,6 +244,8 @@ pub fn run() -> anyhow::Result<()> {
                         match crate::process_list::ProcessListWindow::show(
                             proc_highlight_pct,
                             proc_refresh_ms,
+                            false,
+                            "cpu",
                         ) {
                             Ok(w) => {
                                 log::info!("进程详情窗口已打开");
@@ -284,6 +336,8 @@ pub fn run() -> anyhow::Result<()> {
     let taskbar_for_tick = taskbar.clone();
     let process_win_for_tick = process_win.clone();
     let analysis_win_for_tick = analysis_win.clone();
+    let resource_wins_for_tick = resource_wins.clone();
+    let resource_closed_for_tick = resource_closed.clone();
 
     // 测试钩子：FIND_STUTTER_TEST_OPEN_PROCESS=1 时启动即打开进程详情窗口，
     // 供自动化回归直连（绕开右键菜单的模拟点击不可靠问题）
@@ -294,6 +348,8 @@ pub fn run() -> anyhow::Result<()> {
             match crate::process_list::ProcessListWindow::show(
                 proc_highlight_pct,
                 proc_refresh_ms,
+                false,
+                "cpu",
             ) {
                 Ok(w) => {
                     log::info!("[TEST] 进程详情窗口已打开");
@@ -321,6 +377,21 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 if let Some(aw) = analysis_win_for_tick.lock().unwrap().as_ref() {
                     crate::window::ensure_tool_window_for(aw.window());
+                }
+                // 资源区弹窗：先移除已关闭的（drop 停采样线程），再守护剩余
+                {
+                    let mut wins = resource_wins_for_tick.lock().unwrap();
+                    let closed: Vec<usize> = resource_closed_for_tick
+                        .lock()
+                        .unwrap()
+                        .drain(..)
+                        .collect();
+                    if !closed.is_empty() {
+                        wins.retain(|w| !closed.contains(&w.id()));
+                    }
+                    for w in wins.iter() {
+                        crate::window::ensure_tool_window_for(w.window());
+                    }
                 }
             }
             // -1) 消费托盘命令（后台线程投递）

@@ -153,6 +153,8 @@ pub fn event_to_json(e: &StutterEvent) -> Value {
             .collect::<Vec<_>>()),
     );
     m.insert("causes".into(), json!(e.causes));
+    // 构建自伤（2026-10-16）：命中本地编译/链接负载的误报事件标记（不计入 KPI）。
+    m.insert("build_induced".into(), json!(e.build_induced));
     m.insert("culprits".into(), culprits_json(&e.culprits));
     // 各 cause 首触时刻：**相对 onset 的偏移毫秒**（0=与卡顿同时起点，正数=晚于起点；
     // 见 detector.rs「首触时刻：相对 onset（卡顿起点）的偏移毫秒」与 types.rs 注释）。

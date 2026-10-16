@@ -70,9 +70,9 @@ env_logger = "0.11"
 notify = "8.2"
 
 # P1：系统托盘图标 + 右键菜单
-# 系统托盘（tray-icon 0.24 配套 muda 0.19）
-tray-icon = "0.24"
-muda = "0.19"
+# 系统托盘（tray-icon 0.26 配套 muda 0.21）
+tray-icon = "0.26"
+muda = "0.21"
 
 # 平台层（Windows 原生窗口句柄 + 点击穿透/置顶 + UAC 提权）
 [target.'cfg(windows)'.dependencies]
@@ -97,7 +97,7 @@ windows = { version = "0.62", features = [
 raw-window-handle = "0.6"
 
 [build-dependencies]
-slint-build = "1.12"
+slint-build = "1.18"
 
 [dev-dependencies]
-i-slint-backend-testing = "1.17"
+i-slint-backend-testing = "1.18"

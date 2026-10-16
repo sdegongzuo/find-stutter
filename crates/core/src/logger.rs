@@ -23,6 +23,21 @@ pub struct Logger {
 /// 心跳最小落库间隔
 const MIN_HEARTBEAT_INTERVAL_MS: u64 = 2000;
 
+/// 探测 `stutter_events` 是否含某列（旧库兼容）。
+///
+/// `build_induced` 为 2026-10-16 新增列：旧库缺列时不能直接引用，否则 SQL 报错，
+/// 故计数查询前先用本函数判断，缺失即退化为「不排除任何事件」。
+fn events_has_column(conn: &Connection, column: &str) -> bool {
+    conn.prepare("PRAGMA table_info(stutter_events)")
+        .and_then(|mut stmt| {
+            let names: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(names.iter().any(|n| n == column))
+        })
+        .unwrap_or(false)
+}
+
 /// F-RC15 共享落库：幂等确保 root_cause_reports 表存在（兼容旧库首次写结论）。
 /// 由 logger（服务侧）与 analytics（GUI 侧窄写权连接）共同调用，避免 SQL 重复定义。
 pub fn ensure_root_cause_report_table(conn: &Connection) -> anyhow::Result<()> {
@@ -173,6 +188,10 @@ impl Logger {
         let _ = conn
             .execute_batch("ALTER TABLE stutter_events ADD COLUMN cause_first_touch TEXT NOT NULL DEFAULT '{}';");
         let _ = conn.execute_batch("ALTER TABLE stutter_events ADD COLUMN onset_ts INTEGER;");
+        // 迁移（2026-10-16）：构建自伤标记列（0/1）。命中时该事件不计入 KPI。
+        let _ = conn.execute_batch(
+            "ALTER TABLE stutter_events ADD COLUMN build_induced INTEGER NOT NULL DEFAULT 0;",
+        );
 
         // 迁移：给历史库里的 samples 补 commit_bytes / commit_limit / page_reads_per_sec 列（旧库无此列）。
         // 每条 ALTER 独立执行并忽略错误——SQLite 不支持 `ADD COLUMN IF NOT EXISTS`，
@@ -290,8 +309,8 @@ impl Logger {
         let cause_first_touch = serde_json::to_string(&event.cause_first_touch)?;
         let onset_ts = event.onset_ts.unwrap_or(0);
         self.conn.execute(
-            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot, culprits, cause_kinds, primary_cause, cause_first_touch, onset_ts)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO stutter_events (timestamp, duration_ms, severity, causes, snapshot, culprits, cause_kinds, primary_cause, cause_first_touch, onset_ts, build_induced)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 event.timestamp.to_rfc3339(),
                 event.duration_ms as i64,
@@ -303,6 +322,7 @@ impl Logger {
                 primary_cause,
                 cause_first_touch,
                 onset_ts,
+                event.build_induced as i64,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -591,11 +611,17 @@ impl Logger {
         // 库里 timestamp 统一存 UTC（`+00:00`），故把本地零点换算成 UTC 后再用
         // BETWEEN 比较——不能用本地日期前缀去 LIKE（会与 UTC 串前缀对不上）。
         let (start, end) = local_today_bounds();
-        let count: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
-            params![start, end],
-            |row| row.get(0),
-        )?;
+        // 构建自伤事件不计入「今日卡顿 N 次」（2026-10-16 治理）：仍落库可查，
+        // 但不构成真实卡顿 KPI。旧库无该列时自动退化为不排除。
+        let sql = if events_has_column(&self.conn, "build_induced") {
+            "SELECT COUNT(*) FROM stutter_events \
+             WHERE timestamp BETWEEN ?1 AND ?2 AND build_induced = 0"
+        } else {
+            "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2"
+        };
+        let count: u32 = self
+            .conn
+            .query_row(sql, params![start, end], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -1445,6 +1471,55 @@ mod tests {
 
         let count = logger.event_count_today().unwrap();
         assert_eq!(count, 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 构建自伤（2026-10-16 治理）：`build_induced` 随事件落库、可回读，
+    /// 且**不计入**「今日卡顿次数」（仍落库可查）。
+    #[test]
+    fn logger_build_induced_persisted_but_excluded_from_count() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir
+            .join("test_build_induced.db")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let config = StorageConfig {
+            db_path,
+            retention_days: 30,
+            event_retention_days: 30,
+            hot_retention_days: 0,
+        };
+
+        let logger = Logger::new(&config).unwrap();
+        // 1 条普通 + 2 条构建自伤
+        logger.write_event(&make_event()).unwrap();
+        for _ in 0..2 {
+            let mut ev = make_event();
+            ev.build_induced = true;
+            logger.write_event(&ev).unwrap();
+        }
+
+        // 落库 3 条，但 KPI 只算 1 条
+        let total: i64 = logger
+            .conn
+            .query_row("SELECT COUNT(*) FROM stutter_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 3, "build_induced 事件也应落库");
+        assert_eq!(logger.event_count_today().unwrap(), 1, "构建自伤不计入 KPI");
+
+        // 列可回读
+        let flagged: i64 = logger
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM stutter_events WHERE build_induced = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 2);
 
         std::fs::remove_dir_all(&dir).ok();
     }

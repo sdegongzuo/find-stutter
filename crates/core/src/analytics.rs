@@ -26,7 +26,7 @@ use std::path::Path;
 use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use crate::{
     CauseKind, DetectionConfig, ProcessBrief, ProcessModule, RootCauseReport, Sample, Severity,
-    StackSample, StutterEvent, WindowsEventRecord,
+    StackSample, StutterEvent, WindowsEventRecord, BUILD_INDUCED_CAUSE_PREFIX,
 };
 use rusqlite::{params, Connection, OpenFlags};
 
@@ -482,6 +482,9 @@ pub fn classify_cause(cause: &str) -> &'static str {
         "提交电荷"
     } else if cause.starts_with("Memory paging") {
         "内存分页"
+    } else if cause.starts_with(BUILD_INDUCED_CAUSE_PREFIX) {
+        // 构建自伤标注（2026-10-16 治理）：单独归类，避免被算成「其他」噪音。
+        "构建自伤"
     } else {
         "其他"
     }
@@ -547,10 +550,21 @@ pub fn load_cause_types(
 pub fn load_kpi(conn: &Connection, range: &TimeRange) -> anyhow::Result<KpiSummary> {
     let (start, end) = range.bounds();
 
+    // 构建自伤事件不计入 KPI（2026-10-16 治理）：计数与「最严重时长」都排除，
+    // 但事件仍落库、仍在事件列表 / 趋势 / 元凶聚合中可见（带标注）。旧库缺
+    // `build_induced` 列时不排除（退化为原口径）。
+    let not_build = if has_column(conn, "stutter_events", "build_induced") {
+        " AND build_induced = 0"
+    } else {
+        ""
+    };
+
     // 1) 区间次数（Today 范围时与 reader.event_count_today / logger 一致）
     let today_count: u32 = conn
         .query_row(
-            "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2",
+            &format!(
+                "SELECT COUNT(*) FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2{not_build}"
+            ),
             params![start, end],
             |row| row.get::<_, i64>(0).map(|n| n as u32),
         )
@@ -559,8 +573,10 @@ pub fn load_kpi(conn: &Connection, range: &TimeRange) -> anyhow::Result<KpiSumma
     // 2) 最严重一次持续时长
     let worst_duration_ms: u64 = conn
         .query_row(
-            "SELECT COALESCE(MAX(duration_ms), 0) FROM stutter_events \
-             WHERE timestamp BETWEEN ?1 AND ?2",
+            &format!(
+                "SELECT COALESCE(MAX(duration_ms), 0) FROM stutter_events \
+                 WHERE timestamp BETWEEN ?1 AND ?2{not_build}"
+            ),
             params![start, end],
             |row| row.get::<_, i64>(0).map(|n| n as u64),
         )
@@ -1599,6 +1615,7 @@ pub fn load_full_events(
     let has_touch = has_column(conn, "stutter_events", "cause_first_touch");
     let has_snapshot = has_column(conn, "stutter_events", "snapshot");
     let has_onset = has_column(conn, "stutter_events", "onset_ts");
+    let has_build = has_column(conn, "stutter_events", "build_induced");
 
     let causes_sql = if has_causes { "COALESCE(causes, '[]')" } else { "'[]'" };
     let culprits_sql = if has_culprits {
@@ -1623,10 +1640,11 @@ pub fn load_full_events(
         "'{}'"
     };
     let onset_sql = if has_onset { "onset_ts" } else { "0" };
+    let build_sql = if has_build { "build_induced" } else { "0" };
 
     let sql = format!(
         "SELECT id, timestamp, duration_ms, severity, {causes_sql}, {culprits_sql}, \
-         {kinds_sql}, {primary_sql}, {touch_sql}, {snapshot_sql}, {onset_sql} \
+         {kinds_sql}, {primary_sql}, {touch_sql}, {snapshot_sql}, {onset_sql}, {build_sql} \
          FROM stutter_events WHERE timestamp BETWEEN ?1 AND ?2 ORDER BY timestamp"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -1643,12 +1661,25 @@ pub fn load_full_events(
             row.get::<_, String>(8)?,
             row.get::<_, String>(9)?,
             row.get::<_, i64>(10)?,
+            row.get::<_, i64>(11)?,
         ))
     })?;
     let mut out = Vec::new();
     for r in rows {
-        let (id, ts, dur, sev, causes_json, culprits_json, kinds_json, primary_json, touch_json, snapshot_json, onset) =
-            r?;
+        let (
+            id,
+            ts,
+            dur,
+            sev,
+            causes_json,
+            culprits_json,
+            kinds_json,
+            primary_json,
+            touch_json,
+            snapshot_json,
+            onset,
+            build_induced,
+        ) = r?;
         let timestamp = DateTime::parse_from_rfc3339(&ts)
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now());
@@ -1674,6 +1705,7 @@ pub fn load_full_events(
             onset_ts: if onset <= 0 { None } else { Some(onset) },
             snapshot,
             culprits,
+            build_induced: build_induced != 0,
         });
     }
     Ok(out)
@@ -2048,6 +2080,44 @@ mod tests {
         // 头号元凶非空（app0.exe / app1.exe 各出现，取其一）
         assert_ne!(kpi.top_culprit, "—");
         assert!(kpi.top_culprit.starts_with("app"));
+        std::fs::remove_file(&db).ok();
+    }
+
+    #[test]
+    fn load_kpi_excludes_build_induced() {
+        let db = unique_db("kpi_build");
+        let cfg = StorageConfig {
+            db_path: db.clone(),
+            retention_days: 30,
+            event_retention_days: 30,
+            hot_retention_days: 0,
+        };
+        let mut logger = Logger::new(&cfg).unwrap();
+        let base = Local::now();
+        // 1 条普通（1000ms）+ 1 条构建自伤（更长的 9000ms）
+        for (i, build) in [(0i64, false), (1i64, true)] {
+            let ts = (base - ChronoDuration::minutes(10 - i)).with_timezone(&Utc);
+            let mut s = Sample::default();
+            s.cpu_usage = 95.0;
+            let ev = crate::StutterEvent {
+                timestamp: ts,
+                duration_ms: if build { 9000 } else { 1000 },
+                severity: Severity::Major,
+                causes: vec!["CPU usage 95.0% > 90.0%".into()],
+                snapshot: s,
+                culprits: vec![],
+                build_induced: build,
+                ..Default::default()
+            };
+            logger.write_event(&ev).unwrap();
+        }
+        logger.flush().unwrap();
+
+        let conn = open_readonly(std::path::Path::new(&db)).unwrap();
+        let kpi = load_kpi_today(&conn).unwrap();
+        // 构建自伤不计入 KPI：次数只算普通那条，最严重时长也不被 9000ms 抬升
+        assert_eq!(kpi.today_count, 1, "构建自伤不应计入今日卡顿次数");
+        assert_eq!(kpi.worst_duration_ms, 1000, "构建自伤不应抬高最严重时长");
         std::fs::remove_file(&db).ok();
     }
 

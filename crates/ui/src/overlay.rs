@@ -150,23 +150,23 @@ pub fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
-/// bubble 布局的 2×2 网格文本：`(上传, 下载, CPU, 内存)`。
+/// bubble 布局的 2×2 网格数字值：`(上传, 下载, CPU, 内存)`（仅数字，标签在 slint 侧）。
 /// 速率复用 `format_bps`（trim 掉对齐空格）；无采样数据时显示 `--`。
 pub fn format_bubble_metrics(
     summary: Option<&LatestSampleSummary>,
 ) -> (String, String, String, String) {
     match summary {
         Some(s) => (
-            format!("上传: {}", format_bps(s.net_sent_bps).trim()),
-            format!("下载: {}", format_bps(s.net_recv_bps).trim()),
-            format!("CPU: {:.0} %", s.cpu_usage),
-            format!("内存: {:.0} %", s.mem_usage_percent),
+            format_bps(s.net_sent_bps).trim().to_string(),
+            format_bps(s.net_recv_bps).trim().to_string(),
+            format!("{:.0} %", s.cpu_usage),
+            format!("{:.0} %", s.mem_usage_percent),
         ),
         None => (
-            "上传: --".to_string(),
-            "下载: --".to_string(),
-            "CPU: --".to_string(),
-            "内存: --".to_string(),
+            "--".to_string(),
+            "--".to_string(),
+            "--".to_string(),
+            "--".to_string(),
         ),
     }
 }
@@ -272,13 +272,11 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
 
     // 3) 指标（仅在 Running 时更新，Stale/Stopped 时保留最后值）
     if let Some(s) = &state.last_summary {
-        ui.set_cpu_text(SharedString::from(format!("CPU {:5.1}%", s.cpu_usage)));
-        ui.set_mem_text(SharedString::from(format!(
-            "内存 {:4.1}%",
-            s.mem_usage_percent
-        )));
-        ui.set_net_send(SharedString::from(format!("↑ {}", format_bps(s.net_sent_bps))));
-        ui.set_net_recv(SharedString::from(format!("↓ {}", format_bps(s.net_recv_bps))));
+        // 只有数字（value）可点击弹出进程弹窗；标签（label）在 slint 侧为静态默认值
+        ui.set_cpu_value(SharedString::from(format!("{:.1}%", s.cpu_usage)));
+        ui.set_mem_value(SharedString::from(format!("{:.1}%", s.mem_usage_percent)));
+        ui.set_net_send_value(SharedString::from(format_bps(s.net_sent_bps).trim().to_string()));
+        ui.set_net_recv_value(SharedString::from(format_bps(s.net_recv_bps).trim().to_string()));
         if let Some(g) = s.gpu_usage {
             ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
         }
@@ -306,10 +304,10 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
 
     // 4b) bubble 布局：2×2 网格文本 + 悬浮 tooltip（主区只显 4 项，辅助信息收敛到 tooltip）
     let (b_up, b_down, b_cpu, b_mem) = format_bubble_metrics(state.last_summary.as_ref());
-    ui.set_bubble_up(SharedString::from(b_up));
-    ui.set_bubble_down(SharedString::from(b_down));
-    ui.set_bubble_cpu(SharedString::from(b_cpu));
-    ui.set_bubble_mem(SharedString::from(b_mem));
+    ui.set_bubble_up_value(SharedString::from(b_up));
+    ui.set_bubble_down_value(SharedString::from(b_down));
+    ui.set_bubble_cpu_value(SharedString::from(b_cpu));
+    ui.set_bubble_mem_value(SharedString::from(b_mem));
     ui.set_bubble_tip(SharedString::from(format_bubble_tip(state)));
 
     // 5) 上次心跳时间（调试用）
@@ -561,18 +559,16 @@ mod tests {
             cpu_temp: None,
         };
         let (up, down, cpu, mem) = format_bubble_metrics(Some(&summary));
-        assert!(up.starts_with("上传: "), "{up}");
         assert!(up.contains("KB/s"), "{up}");
-        assert!(down.starts_with("下载: "), "{down}");
         assert!(down.contains("KB/s"), "{down}");
-        assert_eq!(cpu, "CPU: 17 %");
-        assert_eq!(mem, "内存: 74 %");
+        assert_eq!(cpu, "17 %");
+        assert_eq!(mem, "74 %");
 
         let (up, down, cpu, mem) = format_bubble_metrics(None);
-        assert_eq!(up, "上传: --");
-        assert_eq!(down, "下载: --");
-        assert_eq!(cpu, "CPU: --");
-        assert_eq!(mem, "内存: --");
+        assert_eq!(up, "--");
+        assert_eq!(down, "--");
+        assert_eq!(cpu, "--");
+        assert_eq!(mem, "--");
     }
 
     /// bubble tooltip：服务状态 / 今日卡顿 / 心跳 / 当日流量四行齐全
