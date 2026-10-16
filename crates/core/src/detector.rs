@@ -1,3 +1,4 @@
+#[cfg(not(test))]
 use crate::collector::probe_foreground_window_frozen;
 use crate::types::{cause_key, CauseKind, DetectionConfig, ProcessBrief, Sample, Severity, StutterEvent};
 use chrono::Utc;
@@ -8,6 +9,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// 降频仅在负载下才有归因意义——空闲时频率本就低（节能降频），不能算卡顿根因。
 /// 取 50% 是经验值：低于此不视为「负载下频率不升反降」。
 const THERMAL_LOAD_MIN_USAGE: f32 = 50.0;
+
+/// 上下文切换风暴的连续确认参数（2026-08-30 治理）：最近 `CTX_CONFIRM_WINDOW`
+/// 帧中 ≥`CTX_CONFIRM_MIN` 帧越线才算「风暴在场」，对齐 `spike_check` 的
+/// 连续确认模式。机器日常基线（6~9k/core）本就骑在滞回退出线（×0.5 = 5k/core）
+/// 之上，一次尖峰激活后滞回几乎不可自然退出、尖峰反复重置带保持计时即可锁死
+/// 数分钟（实测凌晨连环 major/critical 误报）；占比确认让间歇尖峰既无法首次
+/// 激活，也无法重置带保持计时续命。
+const CTX_CONFIRM_WINDOW: usize = 10;
+const CTX_CONFIRM_MIN: usize = 6;
 
 pub struct Detector {
     config: DetectionConfig,
@@ -60,6 +70,13 @@ pub struct Detector {
     dpc_band_since: Option<Instant>,
     interrupt_band_since: Option<Instant>,
     ctx_band_since: Option<Instant>,
+    /// 上下文切换「越线帧」滑动窗口（最近 `CTX_CONFIRM_WINDOW` 帧）：占比确认用，
+    /// 防间歇尖峰激活/续命风暴（见 `CTX_CONFIRM_WINDOW` 常量注释）。
+    ctx_over_recent: Vec<bool>,
+    /// 当前会话内「压力类 cause 真实越线（非滞回保持）」的累计毫秒。
+    /// severity 的时长判级只认这个值——墙钟 duration 会被滞回带「保持」帧拖长，
+    /// 把间歇尖峰撑成的长会话虚增为 Major/Critical（2026-08-30 治理）。
+    session_confirmed_ms: u64,
     /// 卡顿持续期间累积的进程快照（pid -> 取最大 CPU / 内存用量），
     /// 卡顿结束时提取 top 作为 culprits。
     current_culprits: HashMap<u32, ProcessBrief>,
@@ -94,7 +111,7 @@ impl Detector {
             thermal_active: false,
             ui_freeze_active: false,
             last_ui_probe: None,
-            ui_probe: Box::new(probe_foreground_window_frozen),
+            ui_probe: Self::default_ui_probe(),
             last_tick: None,
             mem_level_active: false,
             mem_level_suppressed: false,
@@ -105,6 +122,8 @@ impl Detector {
             dpc_band_since: None,
             interrupt_band_since: None,
             ctx_band_since: None,
+            ctx_over_recent: Vec::new(),
+            session_confirmed_ms: 0,
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
             need_process_snapshot: false,
@@ -117,6 +136,23 @@ impl Detector {
         self.need_process_snapshot
     }
 
+    /// F-RC3 前台窗口冻结探测的默认实现（依赖注入点，见 `ui_probe` 字段）。
+    ///
+    /// 生产走真实 Win32 探测；单测环境默认注入「未冻结」——前台窗口是否响应
+    /// 取决于运行测试时的桌面会话（agent / CI 常无交互会话，或前台窗口不泵
+    /// WM_NULL），真实探测返回 true 会凭空多出一条 `UI frozen` cause，令
+    /// `current_causes` 计数与 severity 用例随环境漂移（本机实测 7 例）。需要
+    /// 验证冻结路径的用例自行覆盖 `ui_probe`，不受本默认值影响。
+    #[cfg(not(test))]
+    fn default_ui_probe() -> Box<dyn Fn(u32) -> bool + Send> {
+        Box::new(probe_foreground_window_frozen)
+    }
+
+    #[cfg(test)]
+    fn default_ui_probe() -> Box<dyn Fn(u32) -> bool + Send> {
+        Box::new(|_| false)
+    }
+
     pub fn analyze(&mut self, sample: &Sample) -> Option<StutterEvent> {
         // ===== 阶段 E：采样中断防护 =====
         // 与上一 tick 的墙钟间隔超过 `max_tick_gap_secs` 判定为采样中断
@@ -125,14 +161,19 @@ impl Detector {
         // `start.elapsed()` 算进卡顿 duration（实测出现过 3.9 天的巨长事件）。
         // 与 duration 同用 SystemTime 墙钟；时钟回拨（NTP）不算中断。
         let tick_now = SystemTime::now();
+        // 本帧与上一帧的实际间隔（severity 确认时长累计用）：睡眠中断时归零，
+        // 不得把睡眠时长算进确认累计。
+        let mut frame_dt = Duration::ZERO;
         if let Some(last) = self.last_tick {
-            if tick_now
-                .duration_since(last)
-                .map_or(false, |gap| {
-                    gap > Duration::from_secs(self.config.max_tick_gap_secs as u64)
-                })
-            {
-                self.reset_after_gap();
+            match tick_now.duration_since(last) {
+                Ok(gap)
+                    if gap > Duration::from_secs(self.config.max_tick_gap_secs as u64) =>
+                {
+                    self.reset_after_gap();
+                }
+                Ok(gap) => frame_dt = gap,
+                // 时钟回拨（NTP）：不计入确认累计
+                Err(_) => {}
             }
         }
         self.last_tick = Some(tick_now);
@@ -156,6 +197,20 @@ impl Detector {
         causes.extend(self.check_spike());
 
         if !causes.is_empty() {
+            // 「真实越线」判定（2026-08-30 治理）：压力类 cause 且文案非「滞回保持」。
+            // 「滞回保持」是 §4 明文约定的带内标记——severity 时长判级只认真饱和
+            // 累计，滞回带续命帧不算（DiskBusy 带内维持暂无带内文案标注，会按
+            // 真实越线计，属可接受的高估方向）。
+            let frame_confirmed = causes.iter().any(|c| {
+                !c.contains("滞回保持")
+                    && matches!(CauseKind::from_cause(c), Some(k) if k.is_pressure())
+            });
+            if self.stutter_start.is_none() {
+                self.session_confirmed_ms = 0;
+            }
+            if frame_confirmed {
+                self.session_confirmed_ms += frame_dt.as_millis() as u64;
+            }
             // F-RC3：仅在前台窗口「已触发其它 cause」的卡顿帧探一次冻结，
             // 不进入采集热路径（200ms 探测只在真正卡顿帧发生，且 2s 限频）。
             self.maybe_probe_ui_freeze();
@@ -246,13 +301,18 @@ impl Detector {
                         (*k, off)
                     })
                     .collect();
-                // 结构化根因（对齐 CauseKind；按 current_causes 顺序去重）
-                let mut cause_kinds: Vec<CauseKind> = self
-                    .current_causes
-                    .iter()
-                    .filter_map(|c| CauseKind::from_cause(c))
-                    .collect();
-                cause_kinds.dedup();
+                // 结构化根因（对齐 CauseKind）。先按 kind 去重再按首触稳定排序：
+                // 同 kind 的多条文案在不同 tick 先后触达时（如「Memory usage…」@t0、
+                // 「Available memory…」@t2），到达序使重复项不相邻，先 dedup() 后排序
+                // 会留下 [MemLow, MemLow, …] 式重复（2026-08-24 落库数据实际出现）。
+                let mut cause_kinds: Vec<CauseKind> = Vec::new();
+                for c in &self.current_causes {
+                    if let Some(k) = CauseKind::from_cause(c) {
+                        if !cause_kinds.contains(&k) {
+                            cause_kinds.push(k);
+                        }
+                    }
+                }
                 // 按首触时刻升序（最早触发者在前）：F-RC1 主因取首触最早者，
                 // 同时让 cause_kinds 顺序即「触发者→放大器」走向，供 F-RC9 因果链使用；
                 // F-RC5 将在此基础上按信号强度×持续细化加权。
@@ -266,7 +326,12 @@ impl Detector {
                     id: 0,
                     timestamp: Utc::now(),
                     duration_ms,
-                    severity: Self::determine_severity(&self.current_causes, duration_ms),
+                    // severity 时长判级用「确认越线累计」而非墙钟 duration：
+                    // 滞回带保持帧拖长的会话不得凭墙钟时长虚增级别（§6）
+                    severity: Self::determine_severity(
+                        &self.current_causes,
+                        self.session_confirmed_ms,
+                    ),
                     causes: self.current_causes.clone(),
                     cause_kinds,
                     primary_cause,
@@ -277,6 +342,7 @@ impl Detector {
                 };
                 self.current_causes.clear();
                 self.current_cause_first_touch.clear();
+                self.session_confirmed_ms = 0;
                 // 卡顿已结束：下一帧 collect 不再需要进程快照。
                 // 时序权衡见上方 causes 分支：analyze 设置的标志影响下一帧。
                 self.need_process_snapshot = false;
@@ -285,6 +351,7 @@ impl Detector {
             self.current_causes.clear();
             self.current_culprits.clear();
             self.current_cause_first_touch.clear();
+            self.session_confirmed_ms = 0;
             // 卡顿不足 sustained 秒即结束：同样不再需要下一帧进程快照。
             self.need_process_snapshot = false;
             None
@@ -320,6 +387,8 @@ impl Detector {
         self.dpc_band_since = None;
         self.interrupt_band_since = None;
         self.ctx_band_since = None;
+        self.ctx_over_recent.clear();
+        self.session_confirmed_ms = 0;
         self.history.clear();
     }
 
@@ -368,7 +437,8 @@ impl Detector {
         //              停止发射 cause；直到回落到退出线以下才解锁）
         // Active 且未抑制时发射 cause，口径与旧实现一致：哪个条件瞬时成立发哪条
         // （两个条件为「或」关系，config.toml 注释为「或」）。
-        // 分页（paging）不受抑制影响——真颠簸由 paging cause 独立触发（见下）。
+        // 分页（paging）共用本锁存（2026-08-30 治理，见下方分页判定处注释）：
+        // 水位+分页同属内存侧稳态，锁存后一并停发，会话有界。
         let usage_over_entry = sample.mem_usage_percent > self.config.mem_threshold_percent;
         let avail_under_entry =
             (sample.mem_available_mb as f32) < self.config.mem_threshold_mb as f32;
@@ -422,18 +492,38 @@ impl Detector {
             self.mem_active_since = None;
         }
         if self.mem_level_active {
+            // 带内帧（低于进入线、未到退出线）必须发射「滞回保持」文案维持会话，
+            // 对齐 CPU / DPC / 中断 / 磁盘 / 上下文切换信号的语义。旧实现在带内帧
+            // 不发射任何 cause → 任一回落帧都令 causes 为空、立即关闭会话，水位在
+            // 进入线附近每抖一次就碎出一条新事件（2026-08-24 20:55 三连事件的根源，
+            // 回归测试 analyze_mem_oscillation_yields_single_session）。
+            let avail_exit_line =
+                self.config.mem_threshold_mb as f32 * self.config.mem_available_exit_ratio;
             if avail_under_entry {
                 causes.push(format!(
                     "Available memory {}MB < {}MB",
                     sample.mem_available_mb, self.config.mem_threshold_mb
                 ));
+            } else if (sample.mem_available_mb as f32) < avail_exit_line {
+                // 仅靠水位滞回维持激活：数值已回落但未到退出线（进入 500 / 退出 600）。
+                causes.push(format!(
+                    "Available memory {}MB（滞回保持，退出线 {}MB）",
+                    sample.mem_available_mb, avail_exit_line as u64
+                ));
             }
             // 内存使用率过高（百分比口径）：与 `mem_threshold_mb`（绝对可用下限）
             // 互补，覆盖「大内存机器上可用内存绝对值仍高、但使用率已爆表」的漏报
             // （例如 32G 机器用到 95% 时可用仍 >500MB，仅看绝对下限会漏报）。
+            let usage_exit_line =
+                self.config.mem_threshold_percent - self.config.mem_hysteresis_percent;
             if usage_over_entry {
                 causes.push(format!(
                     "Memory usage {:.1}% > {}%",
+                    sample.mem_usage_percent, self.config.mem_threshold_percent
+                ));
+            } else if sample.mem_usage_percent > usage_exit_line {
+                causes.push(format!(
+                    "Memory usage {:.1}%（滞回保持，阈值 {}%）",
                     sample.mem_usage_percent, self.config.mem_threshold_percent
                 ));
             }
@@ -460,13 +550,23 @@ impl Detector {
         // severity，已降级为仅展示。
         // 修正（用户实测反馈）：Page Reads/sec 是瞬时抖动极大的计数器，开发机/模拟器场景
         // （Android Studio / qemu / IDE 等）正常负载也频繁超阈值，但磁盘空闲、提交电荷不高时
-        // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「内存/磁盘压力
-        // 证据」（commit 高 / 内存使用率高 / 可用内存不足 / 磁盘繁忙）才记为卡顿 cause——
+        // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「内存侧压力
+        // 证据」（commit 高 / 内存使用率高 / 可用内存不足）才记为卡顿 cause——
         // paging 退化为真卡顿的「放大器」，避免孤立分页尖峰连环误报。
+        // 2026-08-29 治理：压力证据不再包含「磁盘繁忙」——分页读盘会把磁盘打忙、
+        // 磁盘忙再给分页供证（循环论证），大文件冷读（Page Reads 计入预读）即可
+        // 凭「分页高 + 磁盘忙」误报成 MemLow；详见 DetectionConfig 方法注释。
         let paging_has_pressure_evidence =
             self.config.paging_has_pressure_evidence(commit_ratio, sample);
+        // 2026-08-30 治理：分页与水位共用稳态抑制锁存。内存高压机器上分页
+        // 2000~4000/s 可常态越线（水位 90%+ 连续活跃时几乎全程在场），旧口径
+        // 「分页不受抑制影响」让分页给整个会话无限续命——实测 121s 的事件里
+        // 94/96 帧分页越线、稳态抑制锁存了水位却锁不住会话。内存侧（水位+分页）
+        // 连续活跃超 mem_chronic_seconds 即整体判为稳态：本次越线只产生一条
+        // 有界事件；真颠簸通常在最初 sustained 窗口内已落库，不受影响。
         if sample.page_reads_per_sec > self.config.page_reads_threshold
             && paging_has_pressure_evidence
+            && !self.mem_level_suppressed
         {
             causes.push(format!(
                 "Memory paging {:.1}/s > {}/s",
@@ -479,10 +579,12 @@ impl Detector {
         // 与 CPU 硬阈值模型一致。滞回比例取自 `sys_signal_hysteresis_ratio`
         // （默认 0.5：触发后需降到阈值的一半才解除）。
 
-        // 磁盘真繁忙度：% Disk Time 或 单次 IO 延迟，任一超阈值即判定磁盘繁忙。
-        // 替代原磁盘 B/s spike——吞吐高不代表磁盘饱和，繁忙度/IO 延迟才是真信号。
-        let disk_busy = sample.disk_busy_percent > self.config.disk_busy_threshold_percent
-            || sample.disk_avg_io_ms > self.config.disk_io_threshold_ms;
+        // 磁盘真繁忙度：IO 延迟单独越线（饱和金标准），或 % Disk Time 越线且
+        // IO 延迟同时超过确认线。替代原磁盘 B/s spike——吞吐高不代表磁盘饱和，
+        // 延迟才是排队证据；busy% 在 SSD/NVMe 上并行读写即可打满 100% 而无排队，
+        // 须由延迟确认（2026-08-29 治理）。共用 DetectionConfig::disk_busy_saturated，
+        // 与 what-if 单帧重算（analytics.rs）不漂移。
+        let disk_busy = self.config.disk_busy_saturated(sample);
         if disk_busy {
             self.disk_busy_active = true;
         } else if sample.disk_busy_percent
@@ -579,20 +681,33 @@ impl Detector {
         let ctx_cores = crate::types::logical_core_count(sample) as f32;
         let ctx_per_core = sample.context_switches_per_sec / ctx_cores;
         let ctx_over_entry = ctx_per_core > self.config.context_switch_threshold_per_core;
+        // 连续确认（2026-08-30 治理，见 CTX_CONFIRM_WINDOW 注释）：占比确认独立于
+        // 单帧越线——间歇尖峰（如每 5s 一帧）在窗口内占比远低于 6/10，既无法首次
+        // 激活，也无法在下方的带保持计时中重置续命。
+        self.ctx_over_recent.push(ctx_over_entry);
+        if self.ctx_over_recent.len() > CTX_CONFIRM_WINDOW {
+            self.ctx_over_recent.remove(0);
+        }
+        let ctx_confirmed =
+            self.ctx_over_recent.iter().filter(|&&b| b).count() >= CTX_CONFIRM_MIN;
         let ctx_want_active = sys_signal_hysteresis(
             self.ctx_switch_active,
             ctx_per_core,
             self.config.context_switch_threshold_per_core,
             self.config.sys_signal_hysteresis_ratio,
         );
-        // 未激活 → 激活的跳变必须同时有压力证据；保持/退出交给滞回
+        // 未激活 → 激活的跳变必须同时有确认 + 压力证据；保持/退出交给滞回
         self.ctx_switch_active = ctx_want_active
             && (self.ctx_switch_active
-                || (ctx_over_entry && self.config.ctx_switch_has_pressure_evidence(sample)));
+                || (ctx_over_entry
+                    && ctx_confirmed
+                    && self.config.ctx_switch_has_pressure_evidence(sample)));
+        // 带保持计时的重置条件用占比确认而非单帧越线：滞回是防抖工具，
+        // 间歇尖峰不得反复重置计时把风暴锁死在滞回带内（2026-08-30 治理）。
         band_hold_step(
             &mut self.ctx_switch_active,
             &mut self.ctx_band_since,
-            ctx_over_entry,
+            ctx_confirmed,
             self.config.hysteresis_hold_max_secs,
         );
         if self.ctx_switch_active {
@@ -699,7 +814,7 @@ impl Detector {
         );
 
         // 磁盘 B/s spike 已移除：F-RC2 改用每 tick 的磁盘真繁忙度（% Disk Time /
-        // Avg Disk sec/Transfer）判定 `DiskBusy` cause（见 `check_hard_thresholds`），
+        // Avg. Disk sec/Transfer）判定 `DiskBusy` cause（见 `check_hard_thresholds`），
         // 吞吐高不代表磁盘饱和，繁忙度才是真信号。`disk_rate_spike_ratio` 配置项保留
         // 供 F-RC12 what-if 复用，但检测器不再据此产出磁盘 spike。
 
@@ -781,17 +896,42 @@ impl Detector {
         }
     }
 
-    fn determine_severity(causes: &[String], duration_ms: u64) -> Severity {
+    /// severity 判定（2026-08-30 治理：时长判级改用 `confirmed_ms`）。
+    ///
+    /// - cause 计数维度不变：只计压力类、按 CauseKind 去重（见下）。
+    /// - 时长维度改用**确认越线累计**（会话内压力类 cause 真实越线、非「滞回
+    ///   保持」帧的累计毫秒），不再用墙钟 duration：滞回带「保持」帧会把间歇
+    ///   尖峰撑成的短会话拖长到 >10s/>30s，凭墙钟判级即虚增为 Major/Critical
+    ///   （2026-08-30 实测：凌晨 6 条 ContextSwitchStorm 滞回锁死事件全部因此
+    ///   升级弹窗）。落库的 `duration_ms` 仍保留墙钟值，口径不变。
+    fn determine_severity(causes: &[String], confirmed_ms: u64) -> Severity {
         // 阶段 E：只计压力类 cause——非压力类（NetSpike 等纯吞吐信号）不虚增
         // 严重度（否则 CpuHigh + 网络 spike 凑 2 因即 Major）。无法映射到
         // CauseKind 的文本按压力类计（防御：宁可虚高也不漏）。
+        // 计数按 CauseKind 去重：同一根因的多条文案（「Memory usage…」
+        // 「Memory paging…」「Available memory…」同为 MemLow）只计 1 因，
+        // 否则 90% 边缘抖动的两帧样本即可凑满 2 因被虚增为 Major
+        // （2026-08-24 误报分析；回归测试 determine_severity_same_kind_not_double_counted）。
+        let mut seen_kinds: Vec<CauseKind> = Vec::new();
         let count = causes
             .iter()
-            .filter(|c| CauseKind::from_cause(c).map_or(true, |k| k.is_pressure()))
+            .filter(|c| match CauseKind::from_cause(c) {
+                Some(k) => {
+                    if !k.is_pressure() {
+                        return false;
+                    }
+                    if seen_kinds.contains(&k) {
+                        return false;
+                    }
+                    seen_kinds.push(k);
+                    true
+                }
+                None => true,
+            })
             .count();
-        if count >= 3 || duration_ms > 30_000 {
+        if count >= 3 || confirmed_ms > 30_000 {
             Severity::Critical
-        } else if count >= 2 || duration_ms > 10_000 {
+        } else if count >= 2 || confirmed_ms > 10_000 {
             Severity::Major
         } else {
             Severity::Minor
@@ -966,6 +1106,142 @@ mod tests {
         );
     }
 
+    /// 回归（2026-08-24 误报分析）：内存水位在进入线附近抖动时，会话不得碎裂成
+    /// 连环短事件。带内帧（低于进入线、未到退出线）必须发射「滞回保持」文案维持
+    /// 会话——对齐 CPU / DPC / 磁盘信号的语义。旧实现在带内帧不发射任何 cause，
+    /// 任一回落帧都会令 causes 为空、立即关闭会话：水位在 90% 附近每抖一次就碎出
+    /// 一条新事件（当晚 20:55 前后 20 秒内连出 3 条 major/minor 事件即此模式）。
+    #[test]
+    fn analyze_mem_oscillation_yields_single_session() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.hysteresis_hold_max_secs = 4; // 缩短带内保持上限，控制测试时长
+        let mut d = Detector::new(&config);
+
+        let mk_over = || {
+            let mut s = make_sample(30.0, 8000, 10.0);
+            s.mem_usage_percent = 90.5; // 越过进入线 90
+            s
+        };
+        let mk_band = || {
+            let mut s = make_sample(30.0, 8000, 10.0);
+            s.mem_usage_percent = 88.0; // 滞回带内（85 ~ 90），未到退出线
+            s
+        };
+
+        let tick = std::time::Duration::from_millis(1000);
+        let mut events = Vec::new();
+        // 越线×2 → 带内×2 → 再越线×2 → 带内直到 band-hold 超时后收尾
+        for sample in [
+            mk_over(),
+            mk_over(),
+            mk_band(), // 旧实现：此帧 causes 为空，立即关闭会话 → 事件 #1
+            mk_band(),
+            mk_over(), // 旧实现：重新开始会话
+            mk_over(),
+            mk_band(), // 旧实现：再次关闭 → 事件 #2
+        ] {
+            if let Some(ev) = d.analyze(&sample) {
+                events.push(ev);
+            }
+            std::thread::sleep(tick);
+        }
+        for _ in 0..6 {
+            if let Some(ev) = d.analyze(&mk_band()) {
+                events.push(ev);
+            }
+            std::thread::sleep(tick);
+        }
+
+        assert_eq!(
+            events.len(),
+            1,
+            "水位抖动不得碎裂成多条事件，实际 {}: {:?}",
+            events.len(),
+            events.iter().map(|e| (e.duration_ms, &e.causes)).collect::<Vec<_>>()
+        );
+        assert!(
+            events[0].duration_ms >= 6000,
+            "单次会话应覆盖整段震荡期，实际 {}ms",
+            events[0].duration_ms
+        );
+        assert!(
+            events[0].causes.iter().any(|c| c.contains("滞回保持")),
+            "带内帧应发射「滞回保持」文案，got: {:?}",
+            events[0].causes
+        );
+    }
+
+    /// 回归（2026-08-24 误报分析）：severity 按 CauseKind 去重计数——同一根因的
+    /// 多条文案（「Memory usage…」与「Memory paging…」同为 MemLow）不得凑数把
+    /// 2 帧 90.2% 的边缘抖动虚增为 Major（旧实现按文本条数计数即如此）。
+    #[test]
+    fn determine_severity_same_kind_not_double_counted() {
+        let same_kind = vec![
+            "Memory usage 90.2% > 90%".to_string(),
+            "Memory paging 550.0/s > 300/s".to_string(),
+        ];
+        assert_eq!(
+            Detector::determine_severity(&same_kind, 4000),
+            Severity::Minor,
+            "同 kind 的两条文案只计 1 因"
+        );
+        // 防御路径保持不变：无法映射到 CauseKind 的文本按压力类逐条计。
+        let unmapped = vec!["未知信号甲".to_string(), "未知信号乙".to_string()];
+        assert_eq!(Detector::determine_severity(&unmapped, 4000), Severity::Major);
+        // 2026-08-30 治理：时长判级改用「确认越线累计」——1 因 + 确认累计
+        // >10s 升 Major，≤10s 保持 Minor（墙钟 duration 不再参与判级）。
+        let one_cause = vec!["CPU usage 95.0% > 90%".to_string()];
+        assert_eq!(
+            Detector::determine_severity(&one_cause, 4_000),
+            Severity::Minor,
+            "确认累计未过线应保持 Minor"
+        );
+        assert_eq!(
+            Detector::determine_severity(&one_cause, 11_000),
+            Severity::Major,
+            "确认累计超 10s 应升级 Major"
+        );
+    }
+
+    /// 回归（2026-08-24 数据 observed [MemLow, MemLow, DiskBusy]）：同 kind 文案在
+    /// 不同 tick 先后触达时，cause_kinds 不得出现重复——旧实现先 dedup() 后按首触
+    /// 排序，「使用率@t0、磁盘@t1、可用@t2」的到达序使两个 MemLow 不相邻，
+    /// dedup() 失效；必须先按 kind 去重再排序。
+    #[test]
+    fn analyze_cause_kinds_dedup_same_kind() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // f1：仅使用率越线（MemLow 首触）
+        let mut s1 = make_sample(30.0, 5000, 10.0);
+        s1.mem_usage_percent = 91.0;
+        d.analyze(&s1);
+        // f2：叠加磁盘繁忙（DiskBusy，插到两条 MemLow 文案之间）；
+        // busy% 越线须同时给 IO 延迟确认（2026-08-29 治理）
+        let mut s2 = s1.clone();
+        s2.disk_busy_percent = 96.0;
+        s2.disk_avg_io_ms = 12.0;
+        d.analyze(&s2);
+        // f3：可用内存跌破绝对下限（第二条 MemLow 文案，触达晚于 DiskBusy）
+        let mut s3 = s2.clone();
+        s3.mem_available_mb = 100;
+        d.analyze(&s3);
+
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let normal = make_sample(20.0, 8000, 10.0);
+        let ev = d.analyze(&normal).expect("应生成事件");
+
+        let mem_count = ev.cause_kinds.iter().filter(|k| **k == CauseKind::MemLow).count();
+        assert_eq!(mem_count, 1, "MemLow 只应出现一次，got: {:?}", ev.cause_kinds);
+        assert!(
+            ev.cause_kinds.contains(&CauseKind::DiskBusy),
+            "DiskBusy 应保留，got: {:?}",
+            ev.cause_kinds
+        );
+    }
+
     /// 回归：分页活动速率（Page Reads/sec）只有与「内存/磁盘压力证据」同时成立才触发
     /// 「Memory paging」原因（阶段 C）。修正（用户实测反馈）：Page Reads/sec 瞬时抖动极大，
     /// 开发机/模拟器正常负载也频繁超阈值，但磁盘空闲、提交电荷不高时系统并不卡顿——
@@ -1005,6 +1281,25 @@ mod tests {
             d3.current_causes
         );
 
+        // 回归（2026-08-29 循环论证治理）：分页高 + 磁盘 busy 100%（延迟亚毫秒）、
+        // 内存侧健康（74% / 可用 8GB / commit 41%）-> 不得触发。旧口径把「磁盘忙」
+        // 当压力证据，而磁盘忙正是分页读自己造成的，大文件冷读即凭此连环误报成
+        // MemLow 卡顿（实测凌晨两条 major）；磁盘真饱和由 DiskBusy 独立表达。
+        let mut cold_read = make_sample(25.0, 8300, 10.0);
+        cold_read.mem_usage_percent = 74.0;
+        cold_read.commit_bytes = 41_000;
+        cold_read.commit_limit = 100_000; // commit 41%
+        cold_read.page_reads_per_sec = 1229.0;
+        cold_read.disk_busy_percent = 100.0;
+        cold_read.disk_avg_io_ms = 0.5;
+        let mut d4 = Detector::new(&config);
+        d4.analyze(&cold_read);
+        assert!(
+            d4.current_causes.is_empty(),
+            "大文件冷读（分页高 + 磁盘忙但延迟低 + 内存健康）不应触发任何 cause，got: {:?}",
+            d4.current_causes
+        );
+
         // 未达阈值时不触发（即使内存有压力）
         let mut normal = make_sample(30.0, 2000, 10.0);
         normal.mem_usage_percent = 95.0;
@@ -1018,8 +1313,9 @@ mod tests {
         );
     }
 
-    /// F-RC2：磁盘真繁忙度（% Disk Time 或 IO 延迟）超阈值应触发 `DiskBusy` cause，
-    /// 且落库结构化根因为 `CauseKind::DiskBusy`（替代原磁盘 B/s spike）。
+    /// F-RC2：磁盘真繁忙度（IO 延迟单独越线，或 % Disk Time 越线且延迟超确认线）
+    /// 应触发 `DiskBusy` cause，且落库结构化根因为 `CauseKind::DiskBusy`
+    /// （替代原磁盘 B/s spike）。
     #[test]
     fn analyze_disk_busy_triggers() {
         let mut config = DetectionConfig::default();
@@ -1028,6 +1324,7 @@ mod tests {
 
         let mut s = make_sample(30.0, 2000, 10.0);
         s.disk_busy_percent = 98.0; // % Disk Time 超 95
+        s.disk_avg_io_ms = 12.0; // 且延迟超确认线 10ms（2026-08-29 治理）
         d.analyze(&s);
         assert!(
             d.current_causes.iter().any(|c| c.contains("Disk busy")),
@@ -1035,7 +1332,7 @@ mod tests {
             d.current_causes
         );
 
-        // IO 延迟口径同样应触发（与 % Disk Time 为「或」）
+        // IO 延迟口径单独越线即触发（延迟是饱和金标准，与 busy% 分支为「或」）
         let mut s2 = make_sample(30.0, 2000, 10.0);
         s2.disk_avg_io_ms = 120.0;
         let mut d2 = Detector::new(&config);
@@ -1056,6 +1353,45 @@ mod tests {
             event.cause_kinds.contains(&CauseKind::DiskBusy),
             "cause_kinds 应含 DiskBusy，got: {:?}",
             event.cause_kinds
+        );
+    }
+
+    /// 回归（2026-08-29 误报治理，凌晨 2329/2330 实测数据）：NVMe/SSD 并行读写
+    /// 把 % Disk Time 打满 100% 而 IO 延迟亚毫秒（无排队、不饱和）——吞吐 ≠ 饱和，
+    /// busy% 越线若无延迟确认不得判 DiskBusy。原「任一越线即忙」的 OR 判定把
+    /// 100~150MB/s 顺序读误判成磁盘饱和，与 paging 循环互证撑起两条 major 误报。
+    #[test]
+    fn analyze_disk_busy_high_but_low_latency_no_trigger() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 实测误报样本形态：busy 100% + IO 0.5ms + 150MB/s 读，内存/CPU 健康
+        let mut s = make_sample(25.0, 8300, 10.0);
+        s.mem_usage_percent = 74.0;
+        s.disk_busy_percent = 100.0;
+        s.disk_avg_io_ms = 0.5;
+        s.disk_read_bps = 150 * 1024 * 1024;
+        s.page_reads_per_sec = 1229.0; // Page Reads 计入大文件预读
+        d.analyze(&s);
+        assert!(
+            !d.disk_busy_active,
+            "busy 100% 但延迟亚毫秒不应激活 DiskBusy（吞吐 ≠ 饱和）"
+        );
+        assert!(
+            d.current_causes.is_empty(),
+            "NVMe 大吞吐冷读 + 内存健康不应产生任何卡顿 cause，got: {:?}",
+            d.current_causes
+        );
+
+        // 持续多帧 + 回落：不得落库事件（原实现连出两条 major）
+        for _ in 0..5 {
+            d.analyze(&s);
+        }
+        let normal = make_sample(20.0, 8300, 10.0);
+        assert!(
+            d.analyze(&normal).is_none(),
+            "未进入卡顿跟踪则不得产出事件"
         );
     }
 
@@ -1115,6 +1451,7 @@ mod tests {
 
     /// F-RC2：`Context Switches/sec` 按核越线 + CPU 侧压力证据 → 触发
     /// `ContextSwitchStorm` cause 并落库 `CauseKind::ContextSwitchStorm`。
+    /// 2026-08-30 治理：激活需连续确认（recent 10 中 ≥6 帧越线），故喂满确认帧。
     #[test]
     fn analyze_context_switch_triggers() {
         let mut config = DetectionConfig::default();
@@ -1125,7 +1462,9 @@ mod tests {
         let mut s = make_sample(85.0, 2000, 10.0);
         s.cpu_per_core = vec![85.0; 14];
         s.context_switches_per_sec = 150_000.0;
-        d.analyze(&s);
+        for _ in 0..6 {
+            d.analyze(&s);
+        }
         assert!(
             d.current_causes
                 .iter()
@@ -1197,17 +1536,20 @@ mod tests {
 
     /// 激活后按核速率回落到滞回带内（退出线 5k/core 之上）→ cause 保持、文案标注
     /// 「滞回保持」；降到退出线以下才解除并落库事件（滞回语义不因证据门改变）。
+    /// 2026-08-30 治理后激活需连续确认（recent 10 中 ≥6 帧越线），故先喂满确认帧。
     #[test]
     fn analyze_ctx_switch_hysteresis_hold_then_release() {
         let mut config = DetectionConfig::default();
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // 进入：150k/s ≈ 10.7k/core，CPU 85%（证据成立）
+        // 进入：150k/s ≈ 10.7k/core，CPU 85%（证据成立）；喂满 6 帧确认
         let mut storm = make_sample(85.0, 2000, 10.0);
         storm.cpu_per_core = vec![85.0; 14];
         storm.context_switches_per_sec = 150_000.0;
-        d.analyze(&storm);
+        for _ in 0..6 {
+            d.analyze(&storm);
+        }
         assert!(
             d.current_causes
                 .iter()
@@ -1236,6 +1578,50 @@ mod tests {
         release.context_switches_per_sec = 50_000.0;
         let event = d.analyze(&release).unwrap();
         assert!(event.cause_kinds.contains(&CauseKind::ContextSwitchStorm));
+    }
+
+    /// 回归（2026-08-30 误报治理）：机器日常基线（6~9k/core）骑在滞回退出线
+    /// （×0.5 = 5k/core）之上，一次尖峰激活后滞回几乎不可自然退出、间歇尖峰又
+    /// 反复重置带保持计时——实测凌晨连环 major/critical 误报的根源。占比确认
+    /// 之后：间歇尖峰（占比 < 6/10）既不得首次激活，也不得重置带保持计时续命。
+    #[test]
+    fn analyze_ctx_switch_intermittent_spikes_not_sustained() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.hysteresis_hold_max_secs = 1; // 缩短带保持上限，控制测试时长
+        let mut d = Detector::new(&config);
+
+        // 阶段一：交替尖峰/基线（占比 50% < 60% 确认线）→ 不得激活
+        let mut spike = make_sample(85.0, 2000, 10.0); // CPU 证据成立
+        spike.cpu_per_core = vec![85.0; 14];
+        spike.context_switches_per_sec = 150_000.0; // ≈10.7k/core 越线
+        let mut base = spike.clone();
+        base.context_switches_per_sec = 70_000.0; // ≈5k/core 带内
+        for i in 0..12 {
+            d.analyze(if i % 2 == 0 { &spike } else { &base });
+        }
+        assert!(
+            d.current_causes
+                .iter()
+                .all(|c| !c.contains("Context switches")),
+            "间歇尖峰（占比 50%）不得激活风暴，got: {:?}",
+            d.current_causes
+        );
+
+        // 阶段二：喂满确认帧激活后尖峰稀疏化（一帧尖峰 + 长段带内）——
+        // 带保持计时不被尖峰重置，超时强制解除
+        for _ in 0..6 {
+            d.analyze(&spike);
+        }
+        assert!(d.ctx_switch_active, "持续越线应激活风暴");
+        for i in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            d.analyze(if i == 0 { &spike } else { &base });
+        }
+        assert!(
+            !d.ctx_switch_active,
+            "稀疏尖峰不得重置带保持计时续命，应超时强制解除"
+        );
     }
 
     /// F-RC4 辅助：构造带温度/频率的样本（慢通道每 5 tick 才有读数，测试直接给定）。
@@ -1574,10 +1960,13 @@ mod tests {
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // High CPU + low memory + 内存使用率爆表 → 3 causes
-        // （swap 已降级为仅展示；这里用 mem_usage_percent 凑出第三条原因）
+        // High CPU + low memory/使用率爆表 + 磁盘繁忙 → 4 条文案但恰好 3 个压力类
+        // CauseKind（两条内存文案同为 MemLow，severity 按 kind 去重只计 1 因；
+        // swap 已降级为仅展示）
         let mut bad = make_sample(95.0, 100, 10.0);
         bad.mem_usage_percent = 95.0;
+        bad.disk_busy_percent = 96.0;
+        bad.disk_avg_io_ms = 12.0; // busy% 越线须 IO 延迟确认（2026-08-29 治理）
         for _ in 0..3 {
             d.analyze(&bad);
         }
@@ -1800,7 +2189,9 @@ mod tests {
     }
 
     /// 阶段 E2b：内存水位滞回——使用率 92% 进入后回落 87%（带内 85~90）状态保持
-    /// （防抖），但瞬时未越过进入线不发射 cause；回落 84%（低于退出线 85）才解除。
+    /// （防抖），带内发射「滞回保持」文案维持会话不碎裂（2026-08-24 回归修复：
+    /// 旧的带内静默会让任一回落帧关闭会话，90% 附近每抖一次就碎出一条事件）；
+    /// 回落 84%（低于退出线 85）才解除。
     #[test]
     fn mem_level_hysteresis_band_and_exit() {
         let mut config = DetectionConfig::default();
@@ -1817,14 +2208,15 @@ mod tests {
             d.current_causes
         );
 
-        // 带内 87%：状态保持（滞回防抖），但不再发射 cause（未越过进入线）
+        // 带内 87%：状态保持（滞回防抖），发射「滞回保持」文案（数值已回落、未到退出线）
         let mut band = make_sample(30.0, 2000, 10.0);
         band.mem_usage_percent = 87.0;
         d.analyze(&band);
         assert!(d.mem_level_active, "带内应保持激活（滞回防抖）");
+        assert_eq!(d.current_causes.len(), 1, "同类型文案应被去重替换而非追加");
         assert!(
-            d.current_causes.is_empty(),
-            "带内（未越过进入线）不应发射内存 cause，got: {:?}",
+            d.current_causes[0].contains("Memory usage") && d.current_causes[0].contains("滞回保持"),
+            "带内应发射「滞回保持」文案维持会话，got: {:?}",
             d.current_causes
         );
 
@@ -1893,6 +2285,106 @@ mod tests {
             d.current_causes.iter().any(|c| c.contains("Memory usage")),
             "解锁后再次越线应恢复发射 cause，got: {:?}",
             d.current_causes
+        );
+    }
+
+    /// 回归（2026-08-30 误报治理）：内存高压机器上分页可常态越线（实测 121s
+    /// 事件中 94/96 帧分页 >300/s），旧口径「分页不受稳态抑制影响」让它给整个
+    /// 会话无限续命。分页与水位共用 mem_chronic 锁存：稳态判立后一并停发，
+    /// 会话有界；回落解锁后恢复。
+    #[test]
+    fn analyze_paging_chronic_suppressed_with_mem_level() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.mem_chronic_seconds = 1; // 测试用：1s 即判定稳态
+        let mut d = Detector::new(&config);
+
+        // 水位 92% + 分页 400/s（证据：使用率越线）→ 会话开始
+        let mut high = make_sample(30.0, 2000, 10.0);
+        high.mem_usage_percent = 92.0;
+        high.page_reads_per_sec = 400.0;
+        d.analyze(&high);
+        assert!(d.stutter_start.is_some());
+
+        // 连续活跃 >1s → 稳态锁存：水位与分页一并停发 → 会话有界落库
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let event = d.analyze(&high).expect("稳态锁存应有界落库");
+        assert!(
+            event.causes.iter().any(|c| c.contains("Memory paging")),
+            "事件应携带抑制前的分页 cause，got: {:?}",
+            event.causes
+        );
+
+        // 锁存期：分页仍越线、证据仍在 → 不得重开内存侧会话
+        d.analyze(&high);
+        assert!(
+            d.stutter_start.is_none(),
+            "锁存期内分页不得重开内存侧会话"
+        );
+        assert!(
+            d.current_causes
+                .iter()
+                .all(|c| !c.contains("Memory paging")),
+            "锁存期内分页 cause 应停发，got: {:?}",
+            d.current_causes
+        );
+
+        // 回落到退出线以下 → 解锁 → 再次越线恢复触发
+        let mut recover = make_sample(30.0, 2000, 10.0);
+        recover.mem_usage_percent = 84.0;
+        d.analyze(&recover);
+        assert!(!d.mem_level_suppressed, "水位回落应解锁");
+        d.analyze(&high);
+        assert!(
+            d.current_causes
+                .iter()
+                .any(|c| c.contains("Memory paging")),
+            "解锁后分页应恢复发射，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 回归（2026-08-30 误报治理）：severity 时长判级用「确认越线累计」而非
+    /// 墙钟 duration——滞回带「保持」帧把短会话拖过 10s 不得虚增为 Major
+    /// （实测凌晨 ContextSwitchStorm 滞回锁死事件全部凭墙钟时长升级弹窗）。
+    #[test]
+    fn analyze_severity_uses_confirmed_duration_not_wallclock() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 首帧真越线，随后长期带内「滞回保持」把墙钟时长撑过 Major 线（10s）
+        d.analyze(&make_sample(95.0, 2000, 10.0));
+        let band = make_sample(85.0, 2000, 10.0); // 80~90 带内：滞回保持
+        for _ in 0..13 {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            d.analyze(&band);
+        }
+        let event = d
+            .analyze(&make_sample(20.0, 2000, 10.0))
+            .expect("正常帧应结束会话并落库");
+        assert!(
+            event.duration_ms > 10_000,
+            "墙钟时长应已超过 Major 线（10s），实际 {}ms",
+            event.duration_ms
+        );
+        assert_eq!(
+            event.severity,
+            Severity::Minor,
+            "仅首帧真越线（确认累计≈1 帧）不得凭墙钟时长升级 Major，got {:?}，causes={:?}",
+            event.severity,
+            event.causes
+        );
+
+        // 对照：真饱和帧的确认累计应跟随帧间隔增长（时长判级对真卡顿不变）
+        let mut d2 = Detector::new(&config);
+        d2.analyze(&make_sample(95.0, 2000, 10.0));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        d2.analyze(&make_sample(95.0, 2000, 10.0));
+        assert!(
+            d2.session_confirmed_ms >= 200,
+            "真饱和帧的确认累计应增长，实际 {}ms",
+            d2.session_confirmed_ms
         );
     }
 

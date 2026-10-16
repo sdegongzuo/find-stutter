@@ -199,17 +199,20 @@ pub fn run_upgrade(plan: &UpgradePlan) -> anyhow::Result<bool> {
                 }
             }
             UpgradeStep::BuildRelease => {
-                let output = std::process::Command::new(&plan.rtk)
+                // 透传 rtk/cargo 输出到当前终端（.status() 继承 stdio）：
+                // 旧实现用 .output() 静默缓冲，release 全量构建数分钟内一行
+                // 进度都没有，实测被当成卡死连按两次 Ctrl+C（2026-08-30）。
+                // 失败时 cargo 的报错也已实时在屏，此处只需带出退出码。
+                let status = std::process::Command::new(&plan.rtk)
                     .args(["cargo", "build", "--release"])
                     .current_dir(&plan.repo_root)
-                    .output();
-                match output {
-                    Ok(out) if out.status.success() => {
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
                         eprintln!("[upgrade] 构建完成");
                     }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        anyhow::bail!("构建失败（exit={:?}）：{}", out.status.code(), stderr);
+                    Ok(s) => {
+                        anyhow::bail!("构建失败（exit={:?}，报错见上方构建输出）", s.code());
                     }
                     Err(e) => {
                         anyhow::bail!("启动 rtk 失败（{}）：{}", plan.rtk.display(), e);

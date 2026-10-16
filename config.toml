@@ -34,9 +34,15 @@ mem_available_exit_ratio = 1.2
 mem_chronic_seconds = 60
 # 分页活动速率（Page Reads/sec）阈值（/s）：度量换页活动强度（流量）而非已用存量，
 # 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。瞬时抖动大，
-# 不单指标硬触发——须同时存在内存/磁盘压力证据（commit 高 / 内存使用率高 /
-# 可用内存不足 / 磁盘繁忙）才记为卡顿 cause
+# 不单指标硬触发——须同时存在内存侧压力证据（commit 高 / 内存使用率高 /
+# 可用内存不足）才记为卡顿 cause（2026-08-29 治理：磁盘忙不再作证据——分页
+# 读盘会自己把磁盘打忙、再给分页供证，构成循环论证，大文件冷读凭此误报）
 page_reads_threshold = 300.0
+# busy% 分支的 IO 延迟确认线（ms）：% Disk Time 超过 95% 时还须单次 IO 延迟 > 本值
+# 才判 DiskBusy。吞吐 ≠ 饱和：SSD/NVMe 并行读写可打满 100% busy 而延迟亚毫秒
+# （无排队、不饱和），延迟才是排队证据（2026-08-29 治理）；IO 延迟单独 > 50ms
+# 仍直接判忙
+disk_busy_confirm_io_ms = 10.0
 # 磁盘瞬时读写速率相对均值的突增倍数：不参与实时判定（吞吐 ≠ 饱和），仅供 what-if 参考
 disk_rate_spike_ratio = 10.0
 # 综合指标相对基线的突增倍数
@@ -87,7 +93,8 @@ context_switch_min_cpu_percent = 80.0
 
 [ui]
 # 皮肤名称，对应 skins 目录下的 TOML 文件（默认 "default"）
-skin = "default"
+# "bubble" = 2×2 绿色迷你气泡布局（上传/下载/CPU/内存）
+skin = "bubble"
 # 是否置顶显示
 always_on_top = true
 # 各指标是否显示（可独立关闭）

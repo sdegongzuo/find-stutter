@@ -24,6 +24,8 @@ use find_stutter_core::{Collector, Config, Detector, Logger, StackSampler};
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use std::ffi::OsString;
@@ -35,7 +37,9 @@ use windows_service::service::{
     ServiceType,
 };
 #[cfg(windows)]
-use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+use windows_service::service_control_handler::{
+    self, ServiceControlHandlerResult, ServiceStatusHandle,
+};
 #[cfg(windows)]
 use windows_service::service_dispatcher;
 
@@ -279,11 +283,32 @@ fn scm_service_entry(_arguments: Vec<OsString>) {
 #[cfg(windows)]
 fn scm_loop() -> anyhow::Result<()> {
     diag_log("scm_loop: entering");
+
+    // 共享句柄槽：register 返回的 ServiceStatusHandle 需要 clone 一份给 control handler，
+    // 以便收到 Stop 时能立即上报 StopPending。否则从 `sc stop` 到主循环退出前，
+    // SCM 状态一直停在 Running，用户会看到 `sc stop` 后仍是 RUNNING、紧接着
+    // `sc start` 报 1056（instance already running）。
+    let handle_slot: Arc<Mutex<Option<ServiceStatusHandle>>> = Arc::new(Mutex::new(None));
+    let handle_slot_for_handler = Arc::clone(&handle_slot);
+
     let handler = service_control_handler::register(SERVICE_NAME, move |control_event| {
         diag_log(&format!("scm_loop: control_event = {:?}", control_event));
         match control_event {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 info!("SCM Stop/Shutdown received");
+                // 立即上报 StopPending，让 `sc stop` / `sc query` 立刻反映「正在停止」，
+                // 而不是继续显示 Running（否则 `sc start` 会撞 1056）。
+                if let Some(h) = handle_slot_for_handler.lock().unwrap().as_ref() {
+                    let _ = h.set_service_status(ServiceStatus {
+                        service_type: ServiceType::OWN_PROCESS,
+                        current_state: ServiceState::StopPending,
+                        controls_accepted: ServiceControlAccept::empty(),
+                        exit_code: ServiceExitCode::NO_ERROR,
+                        checkpoint: 1,
+                        wait_hint: Duration::from_secs(30),
+                        process_id: None,
+                    });
+                }
                 request_stop();
                 ServiceControlHandlerResult::NoError
             }
@@ -291,6 +316,9 @@ fn scm_loop() -> anyhow::Result<()> {
             _ => ServiceControlHandlerResult::NotImplemented,
         }
     })?;
+
+    // 把 handler 塞进槽，供 control handler 上报状态
+    *handle_slot.lock().unwrap() = Some(handler.clone());
 
     handler.set_service_status(ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -379,7 +407,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let logger = Logger::new(&config).unwrap();
@@ -408,7 +436,7 @@ mod tests {
         let config = StorageConfig {
             db_path: db_path.clone(),
             retention_days: 30,
-            event_retention_days: 30,
+            event_retention_days: 30, hot_retention_days: 0, // 测试关闭降采样，保持既有行为口径
         };
 
         let mut logger = Logger::new(&config).unwrap();

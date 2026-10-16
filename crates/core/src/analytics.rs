@@ -1378,7 +1378,8 @@ pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
         0.0
     };
     // 分页活动速率（真正的 swap 卡顿信号）；与实时判定共用同一证据方法，
-    // 需存在内存/磁盘压力证据（阶段 B 起为放大器口径，两处不漂移）。
+    // 需存在内存侧压力证据（阶段 B 起为放大器口径，两处不漂移；
+    // 2026-08-29 治理：磁盘忙不再作为证据，见方法注释）。
     if sample.page_reads_per_sec > cfg.page_reads_threshold
         && cfg.paging_has_pressure_evidence(commit_ratio, sample)
     {
@@ -1387,10 +1388,9 @@ pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
             sample.page_reads_per_sec, cfg.page_reads_threshold
         ));
     }
-    // 磁盘真繁忙度（% Disk Time 或 单次 IO 延迟，任一超阈值）
-    if sample.disk_busy_percent > cfg.disk_busy_threshold_percent
-        || sample.disk_avg_io_ms > cfg.disk_io_threshold_ms
-    {
+    // 磁盘真繁忙度（IO 延迟单独越线，或 % Disk Time 越线且延迟超确认线；
+    // 2026-08-29 治理起与实时判定共用 DetectionConfig::disk_busy_saturated，两处不漂移）
+    if cfg.disk_busy_saturated(sample) {
         causes.push(format!(
             "Disk busy {:.1}% (IO {:.1}ms)",
             sample.disk_busy_percent, sample.disk_avg_io_ms

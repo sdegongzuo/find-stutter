@@ -402,7 +402,7 @@ pub struct DetectionConfig {
     /// 阶段 E（误报治理）起**不再是独立卡顿 cause**：commit 高只是记账上限逼近，
     /// 本身对性能零影响（开发机常年 90%+ 而系统不卡）；真出问题时必然伴随
     /// 可用内存低 / 分页信号，由那些信号触发。本阈值保留作「分页压力证据」
-    /// 的判定线（见 detector.rs paging_has_pressure_evidence）。
+    /// 的判定线（见 DetectionConfig::paging_has_pressure_evidence）。
     pub commit_threshold_percent: f32,
     /// 分页活动速率阈值（/s）：\Memory\Page Reads/sec 超过该值即记为换页抖动
     /// （真正的 swap 卡顿信号，度量换页活动强度而非 swap 已用存量）。
@@ -462,9 +462,17 @@ pub struct DetectionConfig {
     #[serde(default = "default_disk_busy_threshold_percent")]
     pub disk_busy_threshold_percent: f32,
     /// 单次 IO 延迟阈值（ms，来自 Avg. Disk sec/Transfer）：超过即记为 `DiskBusy`。
-    /// 与 `disk_busy_threshold_percent` 为「或」关系：任一成立即磁盘繁忙。
+    /// IO 延迟是磁盘饱和的金标准，单指标越线即判繁忙（排队必然推高延迟）。
     #[serde(default = "default_disk_io_threshold_ms")]
     pub disk_io_threshold_ms: f32,
+    /// busy% 分支的 IO 延迟确认线（ms）：% Disk Time 越过 `disk_busy_threshold_percent`
+    /// 时，还须单次 IO 延迟 > 本值才判 `DiskBusy`（见 `disk_busy_saturated`）。
+    /// SSD/NVMe 队列并行读写可把 % Disk Time 打满 100% 而延迟仍亚毫秒（无排队、
+    /// 不饱和）——吞吐 ≠ 饱和，延迟才是排队证据（2026-08-29 治理：实测 NVMe
+    /// busy 100% + IO 0.3ms + 150MB/s 顺序读被误判磁盘饱和，与 paging 循环互证
+    /// 撑起两条 major 误报）。IO 延迟单独越过 `disk_io_threshold_ms` 仍直接判忙。
+    #[serde(default = "default_disk_busy_confirm_io_ms")]
+    pub disk_busy_confirm_io_ms: f32,
     /// `% DPC Time` 阈值（%）：超过即记为 `DpcInterrupt` cause（DPC 风暴）。
     #[serde(default = "default_dpc_threshold_percent")]
     pub dpc_threshold_percent: f32,
@@ -549,6 +557,7 @@ impl Default for DetectionConfig {
             win_event_backtrack_secs: default_win_event_backtrack_secs(),
             disk_busy_threshold_percent: 95.0,
             disk_io_threshold_ms: 50.0,
+            disk_busy_confirm_io_ms: default_disk_busy_confirm_io_ms(),
             dpc_threshold_percent: 10.0,
             interrupt_threshold_percent: 10.0,
             context_switch_threshold_per_core: 10_000.0,
@@ -566,17 +575,33 @@ impl Default for DetectionConfig {
 }
 
 impl DetectionConfig {
-    /// 分页（paging）的压力证据判定：任一成立即视为存在真实内存/磁盘压力。
-    /// 阶段 B 起 paging 是「放大器」，须与压力证据共存才记 cause；阶段 E 起
-    /// 提交电荷也降级为证据之一（不再独立成 cause）。
+    /// 分页（paging）的压力证据判定：任一**内存侧**信号成立即视为存在真实内存压力。
+    /// 阶段 B 起 paging 是「放大器」，须与压力证据共存才记 cause；阶段 E 起提交电荷
+    /// 也降级为证据之一（不再独立成 cause）。
+    /// 治理（2026-08-29）：压力证据收敛为仅内存侧信号（commit 高 / 使用率高 /
+    /// 可用内存不足），删除原「磁盘繁忙」分支——它是循环论证：分页读盘自身会把
+    /// % Disk Time 推过阈值，磁盘忙再反过来给分页提供压力证据。Page Reads/sec
+    /// 把大文件冷读/预读也计入（非仅页面文件换入），后台批处理（备份/索引/维护）
+    /// 即可凭「分页高 + 磁盘忙」连环误报成 MemLow 卡顿（实测：内存 74%、可用 8GB、
+    /// commit 41% 完全健康的机器凌晨连出两条 major「内存换页卡顿」）。磁盘真饱和
+    /// 由 `DiskBusy` cause 独立表达，不再为 paging 背书。
     /// 实时判定（detector.rs）与 what-if 单帧重算（analytics.rs detect_core）
     /// **共用本方法**，保证两处口径一致、不随阈值调整漂移。
     pub fn paging_has_pressure_evidence(&self, commit_ratio: f64, sample: &Sample) -> bool {
         commit_ratio > self.commit_threshold_percent as f64
             || sample.mem_usage_percent > self.mem_threshold_percent
             || sample.mem_available_mb < self.mem_threshold_mb
-            || sample.disk_busy_percent > self.disk_busy_threshold_percent
-            || sample.disk_avg_io_ms > self.disk_io_threshold_ms
+    }
+
+    /// 磁盘真繁忙度判定（实时判定与 what-if 单帧重算共用，两处不漂移）：
+    /// - IO 延迟 > `disk_io_threshold_ms`：延迟是饱和金标准，单指标即可判定；
+    /// - % Disk Time > `disk_busy_threshold_percent` **且** IO 延迟 >
+    ///   `disk_busy_confirm_io_ms`：busy% 只是并行活跃口径，须由延迟确认线佐证
+    ///   （2026-08-29 治理，理由见字段注释）。
+    pub fn disk_busy_saturated(&self, sample: &Sample) -> bool {
+        sample.disk_avg_io_ms > self.disk_io_threshold_ms
+            || (sample.disk_busy_percent > self.disk_busy_threshold_percent
+                && sample.disk_avg_io_ms > self.disk_busy_confirm_io_ms)
     }
 
     /// 上下文切换风暴的 CPU 侧压力证据（实时判定与 what-if 单帧重算共用，两处不漂移）：
@@ -647,6 +672,9 @@ fn default_disk_busy_threshold_percent() -> f32 {
 }
 fn default_disk_io_threshold_ms() -> f32 {
     50.0
+}
+fn default_disk_busy_confirm_io_ms() -> f32 {
+    10.0
 }
 fn default_dpc_threshold_percent() -> f32 {
     10.0
@@ -1079,6 +1107,7 @@ mod tests {
         // F-RC2 系统级信号阈值默认值
         assert_eq!(c.disk_busy_threshold_percent, 95.0);
         assert_eq!(c.disk_io_threshold_ms, 50.0);
+        assert_eq!(c.disk_busy_confirm_io_ms, 10.0);
         assert_eq!(c.dpc_threshold_percent, 10.0);
         assert_eq!(c.interrupt_threshold_percent, 10.0);
         assert_eq!(c.context_switch_threshold_per_core, 10_000.0);

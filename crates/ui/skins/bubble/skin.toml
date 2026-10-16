@@ -1,0 +1,22 @@
+# 气泡皮肤（bubble）：绿色完整指标三列布局
+# 布局：与 card 相同的三列三行——左列 CPU/内存/GPU、中列 上传/下载/今日卡顿、
+# 右列 服务状态/心跳/当日流量；鼠标悬浮显示完整明细 tooltip；
+# 窗口右侧为暂停/恢复悬浮区。
+#
+# 颜色格式 #RRGGBB。风格参考截图中的绿色圆角气泡网速悬浮窗：
+#   - 浅绿底 + 深绿描边 + 大圆角
+#   - 文字统一深灰绿（label_color），各项指标同色
+#
+# 布局模式：bubble（绿色气泡）；card 为默认三列白卡
+layout = "bubble"
+
+width = 380.0
+height = 78.0
+background_color = "#EAF6E8"
+border_color = "#BFE3B8"
+border_radius = 14.0
+font_size = 13.0
+label_color = "#3A4A36"
+
+# 可选吉祥物图片：把 PNG 放到本目录并填写文件名（如 "mascot.png"），留空不显示
+mascot = ""

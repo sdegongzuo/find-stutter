@@ -35,10 +35,20 @@ pub struct SkinConfig {
     pub disk_color: String,
     #[serde(default = "default_label_color")]
     pub label_color: String,
+    /// 布局模式："card"（默认三列白卡）/ "bubble"（2×2 绿色迷你气泡）
+    #[serde(default = "default_layout")]
+    pub layout: String,
+    /// 可选吉祥物图片文件名（相对皮肤目录，如 "mascot.png"）；空 = 不显示
+    #[serde(default)]
+    pub mascot: String,
+    /// mascot 解析后的绝对路径（load 时填充；仅文件存在时才 Some）
+    #[serde(skip)]
+    pub mascot_file: Option<PathBuf>,
 }
 
 fn default_width() -> f32 { 360.0 }
 fn default_height() -> f32 { 78.0 }
+fn default_layout() -> String { "card".into() }
 fn default_bg() -> String { "#FFFFFF".into() }
 fn default_border() -> String { "#C0C0C8".into() }
 fn default_radius() -> f32 { 8.0 }
@@ -67,45 +77,56 @@ impl Default for SkinConfig {
             gpu_color: "#00695C".into(),
             disk_color: "#AD1457".into(),
             label_color: "#546E7A".into(),
+            layout: "card".into(),
+            mascot: String::new(),
+            mascot_file: None,
         }
     }
 }
 
-/// 皮肤文件查找顺序（与 `Config::load` 的策略一致）：
-/// 1. CWD 下 `skins/<name>/skin.toml`（开发时直接 cargo run）
-/// 2. 可执行文件同目录 `skins/<name>/skin.toml`（发布后与 exe 一起分发）
-/// 3. workspace 源码布局 `crates/ui/skins/<name>/skin.toml`（测试 / 仓库内运行）
-fn find_skin_path(name: &str) -> Option<PathBuf> {
+/// 皮肤目录查找顺序（与 `Config::load` 的策略一致）：
+/// 1. CWD 下 `skins/<name>/`（开发时直接 cargo run）
+/// 2. 可执行文件同目录 `skins/<name>/`（发布后与 exe 一起分发）
+/// 3. workspace 源码布局 `crates/ui/skins/<name>/`（测试 / 仓库内运行）
+fn find_skin_dir(name: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
-    candidates.push(std::path::Path::new("skins").join(name).join("skin.toml"));
+    candidates.push(std::path::Path::new("skins").join(name));
 
     if let Ok(me) = std::env::current_exe() {
         if let Some(dir) = me.parent() {
-            candidates.push(dir.join("skins").join(name).join("skin.toml"));
+            candidates.push(dir.join("skins").join(name));
         }
     }
 
     // workspace 源码布局（cargo test 时 CWD 是 workspace 根）
-    candidates.push(
-        std::path::Path::new("crates")
-            .join("ui")
-            .join("skins")
-            .join(name)
-            .join("skin.toml"),
-    );
+    candidates.push(std::path::Path::new("crates").join("ui").join("skins").join(name));
 
     candidates.into_iter().find(|p| p.exists())
+}
+
+fn find_skin_path(name: &str) -> Option<PathBuf> {
+    find_skin_dir(name).map(|d| d.join("skin.toml"))
 }
 
 impl SkinConfig {
     /// 从 `skins/<name>/skin.toml` 加载，文件不存在或解析失败返回默认皮肤。
     ///
-    /// 查找顺序见 [`find_skin_path`]。
+    /// 查找顺序见 [`find_skin_dir`]；`mascot` 字段若配置了文件名且文件存在，
+    /// 会解析出绝对路径存入 `mascot_file`（UI 端据此加载图片）。
     pub fn load(name: &str) -> Self {
         if let Some(path) = find_skin_path(name) {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                return toml::from_str(&content).unwrap_or_default();
+                let mut skin: SkinConfig = toml::from_str(&content).unwrap_or_default();
+                if !skin.mascot.is_empty() {
+                    if let Some(dir) = find_skin_dir(name) {
+                        let p = dir.join(&skin.mascot);
+                        if p.is_file() {
+                            skin.mascot_file = Some(p);
+                        }
+                    }
+                }
+                return skin;
             }
         }
         Self::default()
@@ -132,6 +153,23 @@ mod tests {
         assert_eq!(skin.gpu_color, "#00695C");
         assert_eq!(skin.disk_color, "#AD1457");
         assert_eq!(skin.label_color, "#546E7A");
+        // 布局模式默认 card（三列白卡）
+        assert_eq!(skin.layout, "card");
+        assert_eq!(skin.mascot, "");
+        assert!(skin.mascot_file.is_none());
+    }
+
+    /// 仓库内自带 bubble 皮肤必须能加载且 layout = "bubble"
+    #[test]
+    fn load_bubble_skin_from_repo() {
+        let skin = SkinConfig::load("bubble");
+        assert_eq!(skin.layout, "bubble");
+        assert_eq!(skin.background_color, "#EAF6E8");
+        // bubble 现展示与 card 相同的完整指标集（三列三行），因此宽度与 card 相近，
+        // 不再是最初的窄条迷你气泡
+        assert!(skin.width >= 300.0, "bubble 完整指标集应需要更大宽度: {}", skin.width);
+        // 未配置 mascot 时不解析图片路径
+        assert!(skin.mascot_file.is_none());
     }
 
     #[test]

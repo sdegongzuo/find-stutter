@@ -284,6 +284,25 @@ pub fn run() -> anyhow::Result<()> {
     let taskbar_for_tick = taskbar.clone();
     let process_win_for_tick = process_win.clone();
     let analysis_win_for_tick = analysis_win.clone();
+
+    // 测试钩子：FIND_STUTTER_TEST_OPEN_PROCESS=1 时启动即打开进程详情窗口，
+    // 供自动化回归直连（绕开右键菜单的模拟点击不可靠问题）
+    if std::env::var("FIND_STUTTER_TEST_OPEN_PROCESS").as_deref() == Ok("1") {
+        log::info!("[TEST] 环境变量命中：自动打开进程详情窗口");
+        let mut guard = process_win.lock().unwrap();
+        if guard.is_none() {
+            match crate::process_list::ProcessListWindow::show(
+                proc_highlight_pct,
+                proc_refresh_ms,
+            ) {
+                Ok(w) => {
+                    log::info!("[TEST] 进程详情窗口已打开");
+                    *guard = Some(std::sync::Arc::new(w));
+                }
+                Err(e) => log::warn!("[TEST] 进程详情窗口打开失败: {}", e),
+            }
+        }
+    }
     timer.start(
         slint::TimerMode::Repeated,
         POLL_INTERVAL,
@@ -361,8 +380,8 @@ pub fn run() -> anyhow::Result<()> {
             // 2) 推到 Slint（窗口已关闭时不操作；暂停时冻结指标显示）
             if !paused {
                 if let Some(ui) = weak_ui.upgrade() {
-                    let s = state_for_tick.lock();
-                    overlay::apply_metrics(&ui, &s);
+                    let mut s = state_for_tick.lock();
+                    overlay::apply_metrics(&ui, &mut s);
                     // P2：任务栏窗口同步（若启用）
                     if let Some(tb) = &taskbar_for_tick {
                         tb.apply(&s);

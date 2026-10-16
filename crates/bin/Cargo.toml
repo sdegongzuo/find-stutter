@@ -21,3 +21,9 @@ find-stutter-cli = { path = "../cli" }
 anyhow = "1"
 log = "0.4"
 env_logger = "0.11"
+# A/B 实验：mimalloc 全局分配器（默认关，--features mimalloc 启用）。
+# 主要影响分配毛刺（趋势图整块 RGBA 缓冲、逐秒样本更新），常驻内存收益有限。
+mimalloc = { version = "0.1", optional = true }
+
+[features]
+mimalloc = ["dep:mimalloc"]

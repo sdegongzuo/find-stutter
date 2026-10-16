@@ -6,6 +6,11 @@
 //!
 //! Stats 子命令已按 ADR-0001 删除（被 `events --from <今天零点>` 覆盖）。
 
+// A/B 实验：mimalloc 全局分配器（--features mimalloc 启用，默认关）。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> anyhow::Result<()> {
     // 日志由 find_stutter_ui::run() 内部 init（用 try_init 容忍重复），
     // 这里不再 init，否则 lib.rs 二次 init 会 panic。

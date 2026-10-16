@@ -15,6 +15,12 @@
 //
 // 皮肤：所有颜色/字号/尺寸均为 in property（由 Rust 端按 skin.toml 注入），
 // 默认值与 skins/default/skin.toml 保持一致。
+//
+// 布局模式（皮肤 layout 字段，Rust 端注入 layout-mode）：
+//   - "card"（默认）：三列白卡布局
+//   - "bubble"：三列绿色气泡布局，与 card 同为完整指标集（上传/下载/CPU/内存/
+//     GPU/今日卡顿/服务状态/心跳/当日流量），仅配色与尺寸不同；见背板内第二个
+//     内容块。暂停区为右侧悬浮区（x: width-36..width-6），悬浮/暂停时显示图标
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
 // 卡顿分析页面组件（PRD M1）：直接作为顶层组件定义在本文件末尾（export component
@@ -69,6 +75,20 @@ export component Overlay inherits Window {
     in property <string> event-count: "今日卡顿: 0";
     in property <string> last-heartbeat: "";
 
+    // === 布局模式（皮肤 layout 字段，Rust 端注入）===
+    // "card"   = 三列白卡（默认，上方原有布局）
+    // "bubble" = 2×2 绿色迷你气泡（上传/下载/CPU/内存）
+    in property <string> layout-mode: "card";
+    // bubble 布局的 2×2 网格文本 + 悬浮 tooltip（服务状态/今日卡顿/心跳/当日流量）
+    in property <string> bubble-up: "上传: --";
+    in property <string> bubble-down: "下载: --";
+    in property <string> bubble-cpu: "CPU: --";
+    in property <string> bubble-mem: "内存: --";
+    in property <string> bubble-tip: "";
+    // 可选吉祥物图片（皮肤 mascot 字段；未配置/加载失败时隐藏）
+    in property <image> mascot-image;
+    in property <bool> mascot-visible: false;
+
     // === 暂停按钮（服务停止时禁用）===
     in property <bool> pause-enabled: true;
     in-out property <bool> paused: false;
@@ -84,7 +104,8 @@ export component Overlay inherits Window {
     // 在鼠标位置弹系统菜单（可超出悬浮窗区域，不受窗口大小限制）。
     callback drag-moved(length, length);
     callback menu-requested(length, length);
-    TouchArea {
+    // 命名 ta 供 bubble 暂停悬浮区引用（has-hover / mouse-x）
+    ta := TouchArea {
         z: 100;
         moved => {
             root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
@@ -94,18 +115,27 @@ export component Overlay inherits Window {
                 root.menu-requested(self.mouse-x, self.mouse-y);
             }
         }
-        // 暂停按钮：点击落在右列按钮区域（x = width-6-96 .. width-6；
-        // y = 52..68 = 列顶10 + 16 + 5 + 16 + 5）时切换暂停。
+        // 暂停按钮：点击落在右列按钮区域时切换暂停。
         // 用同一 TouchArea 坐标判断，不依赖 z 层级（多 TouchArea 叠层在
         // 本窗口实测点击不生效，统一到一个 TouchArea 最可靠）。
+        // - card 布局：x = width-6-96 .. width-6；y = 52..68（列顶10+16+5+16+5）
+        // - bubble 布局：右侧悬浮区 x = width-36 .. width-6；垂直居中 ±16px
         clicked => {
-            if (root.pause-enabled
-                && self.pressed-x >= root.width - 6px - 96px
-                && self.pressed-x <= root.width - 6px
-                && self.pressed-y >= 52px
-                && self.pressed-y <= 68px) {
-                root.paused = !root.paused;
-                root.toggle-pause();
+            if (root.pause-enabled) {
+                if (root.layout-mode == "bubble"
+                    && self.pressed-x >= root.width - 36px
+                    && self.pressed-x <= root.width - 6px
+                    && self.pressed-y >= (root.height - 32px) / 2
+                    && self.pressed-y <= (root.height + 32px) / 2) {
+                    root.paused = !root.paused;
+                    root.toggle-pause();
+                } else if (self.pressed-x >= root.width - 6px - 96px
+                    && self.pressed-x <= root.width - 6px
+                    && self.pressed-y >= 52px
+                    && self.pressed-y <= 68px) {
+                    root.paused = !root.paused;
+                    root.toggle-pause();
+                }
             }
         }
     }
@@ -121,7 +151,9 @@ export component Overlay inherits Window {
 
         // 指标网格：外层容器垂直居中（行高 16px×3 + 行距 5px×2 = 58px，
         // y=(高-58)/2 → 任意窗口高度下上下留白严格一致）
+        // 仅 card 布局显示（bubble 布局见下方内容块）
         VerticalLayout {
+            visible: root.layout-mode == "card";
             y: (parent.height - 58px) / 2;
             height: 58px;
             width: 100%;
@@ -213,6 +245,89 @@ export component Overlay inherits Window {
                     }
                 }
             }
+        }
+
+        // === bubble 布局（皮肤 layout = "bubble"）：绿色完整指标网格 ===
+        // 与 card 相同的三列三行结构，展示全部指标：
+        //   左列 CPU/内存/GPU、中列 上传/下载/今日卡顿、右列 服务状态/心跳/当日流量。
+        // 气泡配色（浅绿底 + 深灰绿字）由皮肤注入；悬浮任一指标弹出辅助 tooltip；
+        // 右侧为暂停/恢复悬浮区（图标为窗口级叠层，不占布局空间）。
+        HorizontalLayout {
+            visible: root.layout-mode == "bubble";
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 100%;
+            padding-left: 12px;
+            padding-right: 8px;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: 8px;
+
+            // 左列：CPU / 内存 / GPU
+            VerticalLayout {
+                spacing: 5px;
+                width: 24%;
+                Text {
+                    height: 16px;
+                    vertical-alignment: center;
+                    text: root.bubble-cpu;
+                    color: root.cpu-color;
+                    font-size: root.text-size;
+                    Tooltip { text: @markdown("\{root.bubble-tip}"); }
+                }
+                Text { height: 16px; vertical-alignment: center; text: root.bubble-mem; color: root.mem-color; font-size: root.text-size; }
+                Text { height: 16px; vertical-alignment: center; text: root.gpu-text; color: root.gpu-color; font-size: max(11px, root.text-size - 1px); }
+            }
+
+            // 中列：上传 / 下载 / 今日卡顿
+            VerticalLayout {
+                spacing: 5px;
+                horizontal-stretch: 1;
+                Text { height: 16px; vertical-alignment: center; text: root.bubble-up; color: root.net-color; font-size: root.text-size; }
+                Text { height: 16px; vertical-alignment: center; text: root.bubble-down; color: root.net-color; font-size: root.text-size; }
+                Text { height: 16px; vertical-alignment: center; text: root.event-count; color: root.event-color; font-size: max(11px, root.text-size - 2px); }
+            }
+
+            // 右列：服务状态 / 心跳 / 当日流量（↑ 上行 ↓ 下行；悬浮看当周明细）
+            VerticalLayout {
+                spacing: 5px;
+                width: 32%;
+                Text { height: 16px; vertical-alignment: center; text: root.service-status; color: root.service-status-color; font-size: max(10px, root.text-size - 3px); overflow: elide; }
+                Text { height: 16px; vertical-alignment: center; text: root.last-heartbeat; color: root.hb-color; font-size: max(10px, root.text-size - 4px); }
+                Text {
+                    height: 16px;
+                    vertical-alignment: center;
+                    text: root.net-today-up + " " + root.net-today-down;
+                    color: root.net-color;
+                    font-size: max(10px, root.text-size - 4px);
+                    Tooltip { text: @markdown("\{root.net-week-tip}"); }
+                }
+            }
+
+            // 可选吉祥物图片（皮肤 mascot 字段；未配置时隐藏、不占宽度）
+            Image {
+                visible: root.mascot-visible;
+                source: root.mascot-image;
+                width: root.mascot-visible ? 40px : 0px;
+                height: 100%;
+                image-fit: contain;
+            }
+        }
+
+        // 暂停/恢复图标：仅 bubble 布局显示；鼠标悬浮右侧区域或暂停中时可见。
+        // 作窗口级叠层（不参与 HorizontalLayout 排布，避免挤压三列文本）。
+        Text {
+            visible: root.layout-mode == "bubble"
+                && (root.paused || (ta.has-hover && ta.mouse-x >= root.width - 36px));
+            x: root.width - 24px;
+            y: (root.height - 16px) / 2;
+            width: 20px;
+            height: 16px;
+            vertical-alignment: center;
+            text: root.paused ? "▶" : "⏸";
+            color: root.paused ? root.event-color : #9aa89a;
+            font-size: root.text-size;
         }
     }
 }
@@ -780,7 +895,8 @@ export component ProcessList inherits Window {
 
     // === 窗口边缘 resize 热区（覆盖在主内容之上，详情面板之下）===
     // 按下 → resize-started 锁定基准矩形；拖动 → resize-requested 按基准 + 累计位移换算
-    property <length> resize-margin: 6px;
+    // 8px 取 Windows 原生可缩放窗口边框热区的通行宽度（6px 偏窄不好抓）
+    property <length> resize-margin: 8px;
 
     // 左边缘
     ResizeZone {
@@ -932,28 +1048,28 @@ export component ProcessList inherits Window {
         }
     }
 
-    // 右下角 resize 手柄（视觉指示 + 更大抓取热区；与边缘热区同一套基准机制）
-    Rectangle {
-        x: parent.width - 16px;
-        y: parent.height - 16px;
-        width: 16px;
-        height: 16px;
-        ResizeZone {
-            width: 100%;
-            height: 100%;
-            edge: ResizeEdge.BottomRight;
-            zone-cursor: nwse-resize;
-            request-start => { root.resize-started(); }
-            request-resize(e) => { root.resize-requested(e); }
-        }
-        // 斜纹指示
-        Text {
-            text: "╲";
-            color: #909090;
-            font-size: 12px;
-            x: 2px;
-            y: 0px;
-        }
+    // 右下角 resize 热区：必须与 8 个边缘热区同为「窗口直接子元素 + 显式几何」。
+    // 不可包进 Rectangle（原 16px 手柄 = Rectangle { ResizeZone + Text }）：
+    // 该嵌套结构在 200% 缩放下实测会让角落吞掉全部指针事件（resize-started
+    // 都不触发），且遮住右/下边缘热区靠角的尾部，表现为右下角无法缩放。
+    ResizeZone {
+        x: parent.width - 24px;
+        y: parent.height - 24px;
+        width: 24px;
+        height: 24px;
+        edge: ResizeEdge.BottomRight;
+        zone-cursor: nwse-resize;
+        request-start => { root.resize-started(); }
+        request-resize(e) => { root.resize-requested(e); }
+    }
+
+    // 斜纹视觉指示（纯 Text 不参与命中，作窗口级兄弟节点叠在热区之上）
+    Text {
+        text: "╲";
+        color: #909090;
+        font-size: 12px;
+        x: parent.width - 13px;
+        y: parent.height - 15px;
     }
 }
 

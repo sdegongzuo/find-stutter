@@ -29,6 +29,10 @@ pub struct OverlayState {
     pub paused: bool,
     /// 点击穿透模式（右键菜单切换；窗口鼠标事件完全穿透）
     pub click_through: bool,
+    /// bubble 布局可选吉祥物图片缓存（避免 1Hz tick 重复读盘）
+    pub mascot_image: Option<slint::Image>,
+    /// mascot 缓存键（解析后的文件路径；空 = 无图片）
+    pub mascot_key: String,
 }
 
 impl OverlayState {
@@ -45,6 +49,8 @@ impl OverlayState {
             week_net_bytes: (0, 0),
             paused: false,
             click_through: false,
+            mascot_image: None,
+            mascot_key: String::new(),
         }
     }
 
@@ -144,8 +150,50 @@ pub fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
+/// bubble 布局的 2×2 网格文本：`(上传, 下载, CPU, 内存)`。
+/// 速率复用 `format_bps`（trim 掉对齐空格）；无采样数据时显示 `--`。
+pub fn format_bubble_metrics(
+    summary: Option<&LatestSampleSummary>,
+) -> (String, String, String, String) {
+    match summary {
+        Some(s) => (
+            format!("上传: {}", format_bps(s.net_sent_bps).trim()),
+            format!("下载: {}", format_bps(s.net_recv_bps).trim()),
+            format!("CPU: {:.0} %", s.cpu_usage),
+            format!("内存: {:.0} %", s.mem_usage_percent),
+        ),
+        None => (
+            "上传: --".to_string(),
+            "下载: --".to_string(),
+            "CPU: --".to_string(),
+            "内存: --".to_string(),
+        ),
+    }
+}
+
+/// bubble 布局的悬浮 tooltip（多行）：服务状态 / 今日卡顿 / 心跳 / 当日流量。
+/// bubble 主区只显示网速与 CPU/内存（参考截图风格），辅助信息收敛到这里。
+pub fn format_bubble_tip(state: &OverlayState) -> String {
+    let (status, _) = format_service_status(state.service_health);
+    let hb = state
+        .last_heartbeat
+        .as_deref()
+        .map(|h| if h.len() >= 19 { &h[11..19] } else { h })
+        .unwrap_or("--");
+    format!(
+        "{}\n今日卡顿: {}\n心跳: {}\n当日流量 ↑{} / ↓{}",
+        status,
+        state.today_event_count,
+        hb,
+        format_today_up_traffic(state.today_net_bytes.0),
+        format_today_down_traffic(state.today_net_bytes.1)
+    )
+}
+
 /// 把 OverlayState 推到 Slint Overlay 实例。
-pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
+///
+/// 需要 `&mut`：bubble 布局的吉祥物图片缓存按皮肤配置惰性加载（路径变化才读盘）。
+pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
     // 0) 皮肤：颜色 / 字号 / 尺寸 / 边框 注入（修复：P3 后皮肤名存实亡，从未接线）
     //
     // 主窗口（Overlay）的视觉风格与进程详情页（ProcessList）对齐：
@@ -177,6 +225,40 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
     ui.set_gpu_color(text_color);
     ui.set_net_color(text_color);
     ui.set_hb_color(hb_gray);
+
+    // 0b) 布局模式（皮肤 layout 字段）："card"（默认三列白卡）/ "bubble"（2×2 气泡）。
+    // bubble 下文字统一用 label_color（深灰绿），保持气泡风格的整体感。
+    let is_bubble = skin.layout == "bubble";
+    ui.set_layout_mode(SharedString::from(if is_bubble { "bubble" } else { "card" }));
+    if is_bubble {
+        let tc = parse_color(&skin.label_color).unwrap_or(text_color);
+        ui.set_cpu_color(tc);
+        ui.set_mem_color(tc);
+        ui.set_net_color(tc);
+        ui.set_gpu_color(tc);
+    }
+
+    // 0c) 吉祥物图片（仅 bubble 布局的 in property；路径变化时才重新读盘）
+    let mascot_key = skin
+        .mascot_file
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    if state.mascot_key != mascot_key {
+        state.mascot_key = mascot_key.clone();
+        state.mascot_image = if mascot_key.is_empty() {
+            None
+        } else {
+            slint::Image::load_from_path(std::path::Path::new(&mascot_key)).ok()
+        };
+    }
+    match &state.mascot_image {
+        Some(img) => {
+            ui.set_mascot_visible(true);
+            ui.set_mascot_image(img.clone());
+        }
+        None => ui.set_mascot_visible(false),
+    }
 
     // 1) 服务健康条
     let (text, color) = format_service_status(state.service_health);
@@ -221,6 +303,14 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &OverlayState) {
         "今日卡顿: {}",
         state.today_event_count
     )));
+
+    // 4b) bubble 布局：2×2 网格文本 + 悬浮 tooltip（主区只显 4 项，辅助信息收敛到 tooltip）
+    let (b_up, b_down, b_cpu, b_mem) = format_bubble_metrics(state.last_summary.as_ref());
+    ui.set_bubble_up(SharedString::from(b_up));
+    ui.set_bubble_down(SharedString::from(b_down));
+    ui.set_bubble_cpu(SharedString::from(b_cpu));
+    ui.set_bubble_mem(SharedString::from(b_mem));
+    ui.set_bubble_tip(SharedString::from(format_bubble_tip(state)));
 
     // 5) 上次心跳时间（调试用）
     if let Some(hb) = &state.last_heartbeat {
@@ -451,5 +541,71 @@ mod tests {
     fn click_through_default_off() {
         let s = OverlayState::new(SkinConfig::load("default"));
         assert!(!s.click_through);
+    }
+
+    // ===== bubble 布局（2×2 迷你气泡）=====
+
+    /// bubble 主区文本：有采样 → 上传/下载/CPU/内存四项；无采样 → 全 "--"
+    #[test]
+    fn format_bubble_metrics_with_and_without_summary() {
+        let summary = LatestSampleSummary {
+            timestamp: "2026-10-01T00:00:00Z".to_string(),
+            cpu_usage: 17.4,
+            mem_usage_percent: 74.3,
+            mem_available_mb: 4096,
+            net_sent_bps: 598 * 1024, // ~584 KB/s
+            net_recv_bps: 11 * 1024,
+            disk_read_bps: 0,
+            disk_write_bps: 0,
+            gpu_usage: None,
+            cpu_temp: None,
+        };
+        let (up, down, cpu, mem) = format_bubble_metrics(Some(&summary));
+        assert!(up.starts_with("上传: "), "{up}");
+        assert!(up.contains("KB/s"), "{up}");
+        assert!(down.starts_with("下载: "), "{down}");
+        assert!(down.contains("KB/s"), "{down}");
+        assert_eq!(cpu, "CPU: 17 %");
+        assert_eq!(mem, "内存: 74 %");
+
+        let (up, down, cpu, mem) = format_bubble_metrics(None);
+        assert_eq!(up, "上传: --");
+        assert_eq!(down, "下载: --");
+        assert_eq!(cpu, "CPU: --");
+        assert_eq!(mem, "内存: --");
+    }
+
+    /// bubble tooltip：服务状态 / 今日卡顿 / 心跳 / 当日流量四行齐全
+    #[test]
+    fn format_bubble_tip_contains_parts() {
+        let mut s = OverlayState::new(SkinConfig::load("default"));
+        s.service_health = ServiceHealth::Running;
+        s.today_event_count = 52;
+        s.last_heartbeat = Some("2026-10-01T03:54:44Z".to_string());
+        s.today_net_bytes = (7 * 1024 * 1024, 4 * 1024 * 1024 * 1024_u64);
+        let tip = format_bubble_tip(&s);
+        assert!(tip.contains("服务运行中"), "{tip}");
+        assert!(tip.contains("今日卡顿: 52"), "{tip}");
+        assert!(tip.contains("心跳: 03:54:44"), "{tip}");
+        assert!(tip.contains("当日流量"), "{tip}");
+        assert_eq!(tip.lines().count(), 4, "{tip}");
+    }
+
+    /// bubble tooltip：无心跳时显示 "--" 而不是空行
+    #[test]
+    fn format_bubble_tip_without_heartbeat() {
+        let mut s = OverlayState::new(SkinConfig::load("default"));
+        s.service_health = ServiceHealth::NoDatabase;
+        let tip = format_bubble_tip(&s);
+        assert!(tip.contains("心跳: --"), "{tip}");
+        assert!(tip.contains("未注册"), "{tip}");
+    }
+
+    /// mascot 缓存初始为空（无皮肤图片时不读盘）
+    #[test]
+    fn mascot_cache_defaults_empty() {
+        let s = OverlayState::new(SkinConfig::load("default"));
+        assert!(s.mascot_image.is_none());
+        assert_eq!(s.mascot_key, "");
     }
 }
