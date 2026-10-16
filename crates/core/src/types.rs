@@ -908,6 +908,13 @@ pub struct UiConfig {
     /// 默认 false 保持 GPU 渲染。需重启 GUI 生效。
     #[serde(default)]
     pub software_render: bool,
+    /// 悬浮窗贴边：拖动松手时，窗口距所在显示器工作区边缘小于
+    /// `snap_threshold`（逻辑像素）则吸附到该边缘。默认开。
+    #[serde(default = "default_true")]
+    pub snap_enabled: bool,
+    /// 贴边吸附触发距离（逻辑像素）。默认 16。
+    #[serde(default = "default_snap_threshold")]
+    pub snap_threshold: f32,
 }
 
 fn default_true() -> bool { true }
@@ -915,6 +922,8 @@ fn default_true() -> bool { true }
 fn default_highlight_pct() -> f32 { 30.0 }
 
 fn default_process_refresh_ms() -> u64 { 30_000 }
+
+fn default_snap_threshold() -> f32 { 16.0 }
 
 impl Default for UiConfig {
     fn default() -> Self {
@@ -936,6 +945,8 @@ impl Default for UiConfig {
             process_highlight_pct: default_highlight_pct(),
             process_refresh_ms: default_process_refresh_ms(),
             software_render: false,
+            snap_enabled: true,
+            snap_threshold: default_snap_threshold(),
         }
     }
 }

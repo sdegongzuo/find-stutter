@@ -12,7 +12,7 @@
 use raw_window_handle::HasWindowHandle;
 use slint::ComponentHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW,
     GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED,
@@ -167,6 +167,73 @@ pub fn native_rect(_win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
     None
 }
 
+/// 单轴贴边吸附（纯函数，便于单测；单位均为物理像素）。
+///
+/// 窗口在该轴占用 `[pos, pos + size)`，工作区为 `[lo, hi)`：
+/// - 距近端 `lo` 小于等于 `threshold` → 贴到 `lo`；
+/// - 否则距远端 `hi - size` 小于等于 `threshold` → 贴到远端；
+/// - 都不满足 / 窗口比工作区还大 / 阈值非正 → 保持原位置。
+pub fn snap_axis(pos: i32, size: i32, lo: i32, hi: i32, threshold: i32) -> i32 {
+    if threshold <= 0 {
+        return pos;
+    }
+    if (pos - lo).abs() <= threshold {
+        return lo;
+    }
+    let far = hi - size;
+    if far >= lo && (far - pos).abs() <= threshold {
+        return far;
+    }
+    pos
+}
+
+/// 松手贴边：把窗口吸附到**所在显示器**工作区最近的边缘（多屏安全）。
+///
+/// `threshold_logical` 为触发距离（逻辑像素，按窗口缩放换算物理像素）。
+/// 返回是否发生了吸附（位置有变化）。
+#[cfg(windows)]
+pub fn snap_to_work_area(win: &slint::Window, threshold_logical: f32) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let Some(hwnd) = extract_hwnd_from(win) else {
+        return false;
+    };
+    let Some((x, y, w, h)) = native_rect(win) else {
+        return false;
+    };
+    let threshold = (threshold_logical * win.scale_factor()).round() as i32;
+    if threshold <= 0 {
+        return false;
+    }
+
+    let mut mi = MONITORINFO::default();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // SAFETY：hwnd 为当前进程窗口句柄；mi 为合法输出结构，cbSize 已置
+    let work = unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        if !GetMonitorInfoW(mon, &mut mi).as_bool() {
+            return false;
+        }
+        mi.rcWork
+    };
+
+    let nx = snap_axis(x, w, work.left, work.right, threshold);
+    let ny = snap_axis(y, h, work.top, work.bottom, threshold);
+    if nx == x && ny == y {
+        return false;
+    }
+    set_window_rect(win, nx, ny, w, h);
+    true
+}
+
+#[cfg(not(windows))]
+pub fn snap_to_work_area(_win: &slint::Window, _threshold_logical: f32) -> bool {
+    false
+}
+
+
 /// 比对 Slint 认知矩形与原生矩形是否脱节（纯函数，便于单测）。
 /// 任一边不相等即视为脱节：slint 侧是「热区锚定布局」的真相源，
 /// native 侧是「用户实际点到的窗口」，两者偏差 1px 都会让右/下热区错位。
@@ -230,6 +297,8 @@ pub enum NativeMenuCmd {
     ProcessList = 4,
     /// 打开卡顿分析窗口（PRD M1 F6）
     Analysis = 5,
+    /// 隐藏悬浮窗（恢复入口：左键单击托盘图标 / 托盘菜单「显示/隐藏悬浮窗」）
+    HideOverlay = 6,
 }
 
 /// 在鼠标位置弹出 Windows 原生右键菜单（`TrackPopupMenu`）。
@@ -248,6 +317,7 @@ pub fn show_context_menu(
     x_logical: f32,
     y_logical: f32,
     paused: bool,
+    allow_hide: bool,
 ) -> Option<NativeMenuCmd> {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_NONOTIFY,
@@ -286,6 +356,16 @@ pub fn show_context_menu(
             NativeMenuCmd::Analysis as usize,
             wide("卡顿分析"),
         );
+        // 「隐藏悬浮窗」：仅在托盘可用时提供——托盘（左键单击 / 托盘菜单）
+        // 是唯一的恢复入口，托盘创建失败时若还能隐藏窗口就再也找不回了。
+        if allow_hide {
+            let _ = AppendMenuW(
+                hmenu,
+                MF_STRING,
+                NativeMenuCmd::HideOverlay as usize,
+                wide("隐藏悬浮窗"),
+            );
+        }
         let _ = AppendMenuW(hmenu, MF_STRING, NativeMenuCmd::Quit as usize, wide("退出"));
 
         // 屏幕坐标 = 窗口物理位置 + 逻辑坐标 × 缩放
@@ -315,6 +395,7 @@ pub fn show_context_menu(
             3 => Some(NativeMenuCmd::Quit),
             4 => Some(NativeMenuCmd::ProcessList),
             5 => Some(NativeMenuCmd::Analysis),
+            6 => Some(NativeMenuCmd::HideOverlay),
             _ => None,
         }
     }
@@ -495,10 +576,6 @@ pub fn wait_rbutton_release() {
 
 // ===== 原生边缘缩放（WM_NCHITTEST 子类化，进程详情窗口专用）=====
 
-/// 详情面板是否打开。面板为全窗遮罩，打开期间边缘热区应让位（不接管命中测试），
-/// 由 process_list.rs 在 set_detail_visible 的两处调用点同步翻转。
-pub static DETAIL_PANEL_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// 子类化 ID（同一 HWND 上多个子类时区分用；本窗口只有一个）
 const NATIVE_RESIZE_SUBCLASS_ID: usize = 0x46_53; // "FS"
 
@@ -567,10 +644,6 @@ unsafe extern "system" fn native_resize_proc(
     unsafe {
         match msg {
         WM_NCHITTEST => {
-            // 详情面板为模态遮罩，打开期间不接管（热区让位给面板交互）
-            if DETAIL_PANEL_OPEN.load(std::sync::atomic::Ordering::SeqCst) {
-                return DefSubclassProc(hwnd, msg, wparam, lparam);
-            }
             // lParam = 屏幕物理坐标；多屏/负坐标按 i16 符号扩展
             let x = (lparam.0 & 0xFFFF) as u16 as i16 as i32;
             let y = ((lparam.0 >> 16) & 0xFFFF) as u16 as i16 as i32;
@@ -636,8 +709,34 @@ pub fn install_native_resize(win: &slint::Window) {
     }
 }
 
+/// 摘掉原生边缘缩放命中测试（详情面板打开期间：面板为全窗遮罩，边缘热区
+/// 应让位给面板交互）。与 [`install_native_resize`] 成对，且作用于**当前
+/// 窗口的 HWND**：
+///
+/// - 面板打开即摘、关闭即装，状态由子类的装/卸直接表达，天然按窗口隔离，
+///   不存在跨窗口串扰（历史实现用进程级 `AtomicBool`，任一窗口关窗时漏复位
+///   会让所有窗口的原生缩放永久失效）；
+/// - 无需在窗口销毁时额外复位——子类随 HWND 一并消失，不会泄漏。
+#[cfg(windows)]
+pub fn uninstall_native_resize(win: &slint::Window) {
+    if let Some(hwnd) = extract_hwnd_from(win) {
+        // SAFETY：hwnd 为当前线程上合法的 Slint 窗口；仅移除本模块以同 ID
+        // 注册的子类，不影响同一 HWND 上的其他子类
+        unsafe {
+            let _ = RemoveWindowSubclass(
+                hwnd,
+                Some(native_resize_proc),
+                NATIVE_RESIZE_SUBCLASS_ID,
+            );
+        }
+    }
+}
+
 #[cfg(not(windows))]
 pub fn install_native_resize(_win: &slint::Window) {}
+
+#[cfg(not(windows))]
+pub fn uninstall_native_resize(_win: &slint::Window) {}
 
 #[cfg(windows)]
 fn wide(s: &str) -> windows::core::PCWSTR {
@@ -762,7 +861,7 @@ mod tests {
 
     // ===== NativeMenuCmd（右键原生菜单命令）=====
 
-    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3/4）
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3/4/5/6）
     #[test]
     fn native_menu_cmd_ids_stable() {
         assert_eq!(NativeMenuCmd::TogglePause as u32, 1);
@@ -770,6 +869,7 @@ mod tests {
         assert_eq!(NativeMenuCmd::Quit as u32, 3);
         assert_eq!(NativeMenuCmd::ProcessList as u32, 4);
         assert_eq!(NativeMenuCmd::Analysis as u32, 5);
+        assert_eq!(NativeMenuCmd::HideOverlay as u32, 6);
     }
 
     #[test]
@@ -788,6 +888,7 @@ mod tests {
             3 => Some(NativeMenuCmd::Quit),
             4 => Some(NativeMenuCmd::ProcessList),
             5 => Some(NativeMenuCmd::Analysis),
+            6 => Some(NativeMenuCmd::HideOverlay),
             _ => None,
         };
         assert_eq!(map(1), Some(NativeMenuCmd::TogglePause));
@@ -795,8 +896,37 @@ mod tests {
         assert_eq!(map(3), Some(NativeMenuCmd::Quit));
         assert_eq!(map(4), Some(NativeMenuCmd::ProcessList));
         assert_eq!(map(5), Some(NativeMenuCmd::Analysis));
+        assert_eq!(map(6), Some(NativeMenuCmd::HideOverlay));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
+    }
+
+    // ===== 贴边吸附（snap_axis 纯函数）=====
+
+    /// 工作区横向 [0, 1920]，阈值 16：近端 / 远端 / 中间各自行为
+    #[test]
+    fn snap_axis_near_far_and_middle() {
+        // 近端：距左缘 10px → 贴 0
+        assert_eq!(snap_axis(10, 300, 0, 1920, 16), 0);
+        // 远端：右缘 1900 距 1920 差 20px（>16）→ 不动
+        assert_eq!(snap_axis(1600, 300, 0, 1920, 16), 1600);
+        // 远端：右缘 1910 距差 10px（<=16）→ 贴 1620
+        assert_eq!(snap_axis(1610, 300, 0, 1920, 16), 1620);
+        // 中间：两侧都远 → 不动
+        assert_eq!(snap_axis(500, 300, 0, 1920, 16), 500);
+    }
+
+    /// 窗口比工作区还宽时不启用远端吸附（否则算出越界坐标）
+    #[test]
+    fn snap_axis_skips_far_when_wider_than_work_area() {
+        assert_eq!(snap_axis(2, 2000, 0, 1920, 16), 0); // 近端仍吸
+        assert_eq!(snap_axis(1000, 2000, 0, 1920, 16), 1000); // 远端不吸
+    }
+
+    /// 阈值非正（吸附近似关闭）→ 原位置返回
+    #[test]
+    fn snap_axis_zero_threshold_is_noop() {
+        assert_eq!(snap_axis(3, 300, 0, 1920, 0), 3);
     }
 
     // ===== 几何对账（Slint 布局 vs 原生窗口矩形）=====

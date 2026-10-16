@@ -2612,8 +2612,9 @@ impl ProcessListWindow {
                 ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid_u32)));
                 ui.set_detail_text(SharedString::from(detail));
                 ui.set_detail_visible(true);
-                // 详情面板为全窗遮罩：打开期间暂停原生边缘缩放命中测试
-                crate::window::DETAIL_PANEL_OPEN.store(true, std::sync::atomic::Ordering::SeqCst);
+                // 详情面板为全窗遮罩：摘掉本窗口的原生边缘缩放子类，边缘热区
+                // 让位给面板交互（按窗口装/卸，无全局状态，关窗不会残留）
+                crate::window::uninstall_native_resize(ui.window());
                 log::info!("双击进程 {} 打开详情", pid_u32);
             }
         });
@@ -2623,7 +2624,8 @@ impl ProcessListWindow {
         ui.on_detail_close(move || {
             if let Some(ui) = weak_detail_ui.upgrade() {
                 ui.set_detail_visible(false);
-                crate::window::DETAIL_PANEL_OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+                // 面板关闭：重新装上本窗口的原生边缘缩放子类
+                crate::window::install_native_resize(ui.window());
             }
         });
 
@@ -2732,8 +2734,13 @@ impl ProcessListWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 crate::window::ensure_tool_window_for(ui.window());
-                // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）
-                crate::window::install_native_resize(ui.window());
+                // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）。
+                // 但详情面板打开期间本就应保持「未安装」（见 on_row_clicked 的
+                // uninstall）——重试若无条件重装，会击穿 show 后 500ms 内开面板
+                // 的卸载，让面板打开期间边缘命中又被接管。故按面板可见态决定是否补装。
+                if !ui.get_detail_visible() {
+                    crate::window::install_native_resize(ui.window());
+                }
             }
         });
 

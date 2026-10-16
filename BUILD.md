@@ -123,6 +123,8 @@ skin = "default"                # 皮肤名称
 taskbar = false                 # 伪任务栏窗口开关
 process_highlight_pct = 30.0    # 进程详情页 CPU/内存高亮阈值（%）
 process_refresh_ms = 30000      # 进程详情页自动刷新间隔（毫秒）
+snap_enabled = true             # 悬浮窗贴边开关（松手吸附）
+snap_threshold = 16.0           # 贴边吸附触发距离（逻辑像素）
 
 [storage]
 db_path = "stutter.db"          # 数据库路径

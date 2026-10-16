@@ -125,6 +125,11 @@ process_refresh_ms = 30000
 # 低内存模式：用 CPU 软件渲染替代 GPU(OpenGL) 渲染，省数十 MB 常驻内存
 #（悬浮窗 1Hz 刷新场景 CPU 开销可忽略）。需重启 GUI 生效。
 software_render = false
+# 悬浮窗贴边：拖动松手时，窗口距所在显示器工作区边缘小于 snap_threshold
+#（逻辑像素）则自动吸附到该边缘
+snap_enabled = true
+# 贴边吸附触发距离（逻辑像素）
+snap_threshold = 16.0
 
 [storage]
 # SQLite 数据库文件路径

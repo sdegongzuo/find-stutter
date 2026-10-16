@@ -125,9 +125,16 @@ pub fn run() -> anyhow::Result<()> {
     // 3a) 接管拖动：no-frame 模式下去掉了原生 HTCAPTION，
     //     必须把 TouchArea 的 dx/dy 转成 window.set_position()。
     //     on_drag_moved 要求 callback 是 'static，所以 clone Weak 拿进来。
+    // 拖动标记：区分「拖动过再松手」与「原地单击」——只有前者触发贴边吸附。
+    // 位移超过 ~3 逻辑像素才算真正拖动，抵消单击时的抖动。
+    let dragged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let dragged_for_move = dragged.clone();
     let weak_ui_for_drag = ui.as_weak();
     ui.on_drag_moved(move |dx, dy| {
         use slint::PhysicalPosition;
+        if dx.abs() + dy.abs() > 3.0 {
+            dragged_for_move.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Some(ui) = weak_ui_for_drag.upgrade() {
             let window = ui.window();
             let scale = window.scale_factor();
@@ -136,6 +143,25 @@ pub fn run() -> anyhow::Result<()> {
             let new_x = pos.x + (dx as f32 * scale) as i32;
             let new_y = pos.y + (dy as f32 * scale) as i32;
             window.set_position(PhysicalPosition::new(new_x, new_y));
+        }
+    });
+
+    // 松手贴边：拖动结束（左键松开）且确实拖动过时，把窗口吸附到所在
+    // 显示器工作区最近的边缘（阈值内才吸）。
+    let snap_enabled = config.ui.snap_enabled;
+    let snap_threshold = config.ui.snap_threshold;
+    let weak_ui_for_drag_end = ui.as_weak();
+    ui.on_drag_ended(move || {
+        if !dragged.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return; // 原地单击，不吸附
+        }
+        if !snap_enabled {
+            return;
+        }
+        if let Some(ui) = weak_ui_for_drag_end.upgrade() {
+            if crate::window::snap_to_work_area(&ui.window(), snap_threshold) {
+                log::info!("贴边吸附：已吸附到工作区边缘");
+            }
         }
     });
     ui.show()?;
@@ -149,6 +175,11 @@ pub fn run() -> anyhow::Result<()> {
     //      「进程详情」→ 按需创建进程列表窗口 + sysinfo 采集一次快照
     let weak_ui_for_menu = ui.as_weak();
     let state_for_menu = state.clone();
+    // 托盘可用标记：托盘线程在下方 3b 才启动，「隐藏悬浮窗」菜单项是条件显示
+    //（托盘是唯一恢复入口，托盘失败时不给该入口，避免窗口藏起来找不回）。
+    // 菜单回调与托盘启动共享这个原子标记，启动后置位即可。
+    let tray_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tray_ok_for_menu = tray_ok.clone();
     // 进程详情页配置（高亮阈值 + 刷新间隔；由菜单闭包捕获）
     let proc_highlight_pct = config.ui.process_highlight_pct;
     let proc_refresh_ms = config.ui.process_refresh_ms;
@@ -215,7 +246,8 @@ pub fn run() -> anyhow::Result<()> {
     ui.on_menu_requested(move |x: f32, y: f32| {
         let paused = state_for_menu.lock().paused;
         if let Some(ui) = weak_ui_for_menu.upgrade() {
-            let cmd = crate::window::show_context_menu(&ui, x, y, paused);
+            let allow_hide = tray_ok_for_menu.load(std::sync::atomic::Ordering::Relaxed);
+            let cmd = crate::window::show_context_menu(&ui, x, y, paused, allow_hide);
             match cmd {
                 Some(crate::window::NativeMenuCmd::TogglePause) => {
                     let mut s = state_for_menu.lock();
@@ -283,6 +315,14 @@ pub fn run() -> anyhow::Result<()> {
                         w.refresh(); // 立即查询 + 渲染
                     }
                 }
+                Some(crate::window::NativeMenuCmd::HideOverlay) => {
+                    // 隐藏悬浮窗：恢复入口是托盘（左键单击 / 托盘菜单）。
+                    // 该菜单项仅在托盘可用时出现（见 show_context_menu 的 allow_hide）。
+                    log::info!("右键菜单隐藏悬浮窗（托盘可恢复）");
+                    if let Err(e) = ui.hide() {
+                        log::warn!("隐藏悬浮窗失败: {}", e);
+                    }
+                }
                 None => {} // 用户取消（点空白 / Esc）
             }
         }
@@ -309,6 +349,10 @@ pub fn run() -> anyhow::Result<()> {
                 None
             }
         };
+    // 托盘就绪 → 允许右键菜单出现「隐藏悬浮窗」（否则窗口藏起来无法恢复）
+    if tray.is_some() {
+        tray_ok.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 
     // 3c) P2：任务栏嵌入（伪任务栏窗口，config.ui.taskbar = true 时启用）
     let taskbar: Option<std::sync::Arc<crate::taskbar::TaskbarWindow>> =

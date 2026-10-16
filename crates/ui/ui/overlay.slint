@@ -150,6 +150,9 @@ export component Overlay inherits Window {
     // 把窗口内坐标发给 Rust 端，由 Rust 用 Win32 原生 TrackPopupMenu
     // 在鼠标位置弹系统菜单（可超出悬浮窗区域，不受窗口大小限制）。
     callback drag-moved(length, length);
+    // 拖动结束（左键松开）：Rust 端据此做「松手贴边」——距工作区边缘足够近
+    // 则吸附到该边缘。仅当确实拖动过才生效（原地单击不吸附）。
+    callback drag-ended();
     callback menu-requested(length, length);
 
     // 资源区左键点击：点 CPU / 内存 / 网络文字区 → 打开按该维度排序的进程弹窗。
@@ -201,6 +204,10 @@ export component Overlay inherits Window {
         pointer-event(event) => {
             if (event.button == PointerEventButton.right && event.kind == PointerEventKind.down) {
                 root.menu-requested(self.mouse-x, self.mouse-y);
+            }
+            // 左键松开 → 拖动结束（贴边吸附时机）；原地单击由 Rust 端忽略
+            if (event.button == PointerEventButton.left && event.kind == PointerEventKind.up) {
+                root.drag-ended();
             }
         }
         // 暂停按钮：点击落在右列按钮区域时切换暂停。
@@ -644,18 +651,40 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 名称（聚合行显示 ▶/▼ + name (N)，缩进子行；左对齐）
-        Text {
+        // 名称（左侧独立「展开箭头」占位 + 名字；聚合行显示 ▼/▶，非聚合行留空，
+        // 使所有进程名首字与列头对齐。子行缩进仍由 Rust 端前导空格实现）
+        HorizontalLayout {
             min-width: 184px;
             max-width: 184px;
             height: 100%;
-            text: root.data.is-group ? (root.data.child-count > 0 ? "▼ " : "▶ ") + root.data.name : root.data.name;
-            color: root.data.is-group ? #1e88e5 : #1e1e2e;
-            font-size: 12px;
-            overflow: elide;
-            horizontal-alignment: left;
-            vertical-alignment: center;
-            Tooltip { text: @markdown("\{root.data.name-full}"); }
+            spacing: 0px;
+
+            // 展开箭头（固定 16px 占位：非聚合行为空，保证名字对齐）
+            Text {
+                min-width: 16px;
+                max-width: 16px;
+                height: 100%;
+                text: root.data.is-group ? (root.data.child-count > 0 ? "▼" : "▶") : "";
+                color: #1e88e5;
+                font-size: 12px;
+                overflow: elide;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+            }
+
+            // 进程名
+            Text {
+                min-width: 168px;
+                max-width: 168px;
+                height: 100%;
+                text: root.data.name;
+                color: root.data.is-group ? #1e88e5 : #1e1e2e;
+                font-size: 12px;
+                overflow: elide;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+                Tooltip { text: @markdown("\{root.data.name-full}"); }
+            }
         }
 
         // CPU（高占用标红加粗；右对齐贴近下一列）
@@ -933,7 +962,9 @@ export component ProcessList inherits Window {
                     height: 100%;
                     TouchArea { clicked => { root.sort-requested("name"); } }
                     Text {
-                        width: 100%;
+                        // 左移 16px 对齐名称列的箭头占位，使「名称」与进程名首字对齐
+                        x: 16px;
+                        width: 168px;
                         height: 100%;
                         text: "名称" + (root.sort-column == "name" ? (root.sort-ascending ? " ▲" : " ▼") : " ↕");
                         color: #606060;
