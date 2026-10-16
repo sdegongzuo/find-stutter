@@ -189,6 +189,8 @@ fn detector_cpu_threshold_triggers_event() {
     assert!(detector.analyze(&high_cpu).is_none());
     // Wait for sustained period
     std::thread::sleep(Duration::from_millis(1100));
+    // 越线帧累计真实持续时长（落库闸门按确认越线累计）
+    detector.analyze(&high_cpu);
     // Recovery should emit event
     let event = detector.analyze(&normal);
     assert!(event.is_some());
@@ -218,6 +220,8 @@ fn detector_low_memory_triggers() {
     };
     assert!(detector.analyze(&low_mem).is_none());
     std::thread::sleep(Duration::from_millis(1100));
+    // 越线帧累计真实持续时长（落库闸门按确认越线累计）
+    detector.analyze(&low_mem);
     let event = detector.analyze(&normal);
     assert!(event.is_some());
 }
@@ -238,6 +242,8 @@ fn detector_severity_levels() {
     };
     detector.analyze(&sample);
     std::thread::sleep(Duration::from_millis(1100));
+    // 越线帧累计真实持续时长（落库闸门按确认越线累计）
+    detector.analyze(&sample);
     let normal = Sample {
         cpu_usage: 30.0,
         mem_available_mb: 8000,

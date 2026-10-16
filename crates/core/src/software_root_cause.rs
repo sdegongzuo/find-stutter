@@ -192,6 +192,12 @@ pub fn merge_software_causes(mut ev: StutterEvent, sw: Vec<CauseKind>) -> Stutte
     // 只追加尚未出现过的软件级 cause
     let mut fresh: Vec<CauseKind> = Vec::new();
     for k in sw {
+        // HandleHigh（句柄数高但无增长趋势）是中性提示、非卡顿根因，不落库为
+        // cause（2026-10-16 治理；真泄漏 ProcessHandleLeak 不受影响）。避免
+        // 「System 12411 句柄（无增长趋势）」这类噪音污染事件根因列表。
+        if k == CauseKind::HandleHigh {
+            continue;
+        }
         if !ev.cause_kinds.contains(&k) && !fresh.contains(&k) {
             fresh.push(k);
         }
@@ -392,14 +398,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_handle_high_does_not_take_primary() {
+    fn merge_handle_high_is_filtered_out() {
         let mut ev = StutterEvent::default();
         ev.cause_kinds = vec![CauseKind::CpuHigh];
         ev.primary_cause = Some(CauseKind::CpuHigh);
         ev.culprits = vec![culprit(1, "a.exe", 20000, 0, 0)];
         let out = merge_software_causes(ev, vec![CauseKind::HandleHigh]);
-        // 中性提示不抢主因
+        // 中性提示（句柄高但无增长趋势）不落库为 cause，也不抢主因（2026-10-16 治理）
         assert_eq!(out.primary_cause, Some(CauseKind::CpuHigh));
-        assert!(out.causes.iter().any(|c| c.contains("句柄数偏高: a.exe")));
+        assert!(!out.cause_kinds.contains(&CauseKind::HandleHigh));
+        assert!(
+            out.causes.iter().all(|c| !c.contains("句柄数偏高")),
+            "HandleHigh 不应落库为 cause，got: {:?}",
+            out.causes
+        );
     }
 }

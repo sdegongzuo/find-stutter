@@ -19,6 +19,12 @@ const THERMAL_LOAD_MIN_USAGE: f32 = 50.0;
 const CTX_CONFIRM_WINDOW: usize = 10;
 const CTX_CONFIRM_MIN: usize = 6;
 
+/// cause 文案是否为「滞回保持」标记：数值已回落到进入线以下、仅靠滞回维持会话的
+/// 带内帧。此类帧不构成真实越线证据（不计确认累计、不覆盖真实越线文案）。
+fn is_hysteresis_hold(cause: &str) -> bool {
+    cause.contains("滞回保持")
+}
+
 pub struct Detector {
     config: DetectionConfig,
     history: Vec<Sample>,
@@ -83,6 +89,10 @@ pub struct Detector {
     /// 各 cause（按 `CauseKind`）首次出现的时刻（SystemTime），用于落库首触时刻
     /// 与 F-RC6 因果方向（触发者 vs 放大器）。随 `current_causes` 一起在卡顿结束时清空。
     current_cause_first_touch: HashMap<CauseKind, SystemTime>,
+    /// 各 cause 类型（按 `cause_key`）最近一次「真实越线」文案（非「滞回保持」）。
+    /// 落库时若 `current_causes` 中同类型只剩带内「滞回保持」文案，则优先取此处的
+    /// 真实触发证据，避免事件回读自相矛盾（2026-10-16 治理）。随会话一起清空。
+    current_cause_real_text: HashMap<String, String>,
     /// 下一帧 collect 是否需要构建 top_processes 快照。
     /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
     need_process_snapshot: bool,
@@ -126,6 +136,7 @@ impl Detector {
             session_confirmed_ms: 0,
             current_culprits: HashMap::new(),
             current_cause_first_touch: HashMap::new(),
+            current_cause_real_text: HashMap::new(),
             need_process_snapshot: false,
             freq_peak: None,
         }
@@ -202,7 +213,7 @@ impl Detector {
             // 累计，滞回带续命帧不算（DiskBusy 带内维持暂无带内文案标注，会按
             // 真实越线计，属可接受的高估方向）。
             let frame_confirmed = causes.iter().any(|c| {
-                !c.contains("滞回保持")
+                !is_hysteresis_hold(c)
                     && matches!(CauseKind::from_cause(c), Some(k) if k.is_pressure())
             });
             if self.stutter_start.is_none() {
@@ -238,10 +249,15 @@ impl Detector {
             if self.stutter_start.is_none() {
                 self.stutter_start = Some(now);
                 self.current_causes = causes;
-                // 记录每个 cause 的首触时刻（按 CauseKind 去重）
+                self.current_cause_real_text.clear();
+                // 记录每个 cause 的首触时刻（按 CauseKind 去重）与真实越线文案
                 for c in &self.current_causes {
                     if let Some(k) = CauseKind::from_cause(c) {
                         self.current_cause_first_touch.entry(k).or_insert(now);
+                    }
+                    if !is_hysteresis_hold(c) {
+                        self.current_cause_real_text
+                            .insert(cause_key(c).to_string(), c.clone());
                     }
                 }
             } else {
@@ -250,6 +266,13 @@ impl Detector {
                     // 避免滞回带内文案随数值变化导致字符串去重失效、cause 反复追加
                     // （一次卡顿中 current_causes 膨胀，还会虚高 severity）。
                     let key = cause_key(&c);
+                    // 记录该 cause 类型的「真实越线」文案（非滞回保持），供落库时优先
+                    // 展示真实触发证据（2026-10-16 治理）——否则事件落库后可能只剩
+                    // 「…（滞回保持，阈值 90%）」，与「因越线而触发」自相矛盾。活跃视图
+                    // `current_causes` 的口径不变（仍更新为最新文案，维持会话存活判定）。
+                    if !is_hysteresis_hold(&c) {
+                        self.current_cause_real_text.insert(key.to_string(), c.clone());
+                    }
                     if let Some(pos) =
                         self.current_causes.iter().position(|x| cause_key(x) == key)
                     {
@@ -269,7 +292,13 @@ impl Detector {
             let duration_ms = start.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
             self.stutter_start = None;
 
-            if duration_ms >= self.config.sustained_seconds as u64 * 1000 {
+            // 落库闸门（2026-10-16 治理）：改用「真实越线累计」而非墙钟时长。
+            // 墙钟 duration 会被滞回带保持帧拖长——瞬时尖峰（1~2 帧越线）+ 十余秒
+            // 带内保持即凑出一条跨 sustained 的流水事件（实测一台常年骑在 88~90%
+            // 边缘的机器 5 分钟内碎出 6 条 minor 内存事件，文案全是「滞回保持」）。
+            // session_confirmed_ms 只累计压力类 cause 的真实越线帧（带内「滞回保持」
+            // 帧不计），因此只有真实饱和持续 ≥ sustained_seconds 才落库。
+            if self.session_confirmed_ms >= self.config.sustained_seconds as u64 * 1000 {
                 // ===== v0.3.x 误报治理闸门 =====
                 // 纯吞吐类 spike（网络 / 磁盘写）只是异步 I/O 突发（下载 / 构建 / git / 备份），
                 // 不直接导致系统无响应。若整个卡顿窗口内**没有任何系统压力类 cause**
@@ -285,6 +314,7 @@ impl Detector {
                     self.current_causes.clear();
                     self.current_culprits.clear();
                     self.current_cause_first_touch.clear();
+                    self.current_cause_real_text.clear();
                     self.need_process_snapshot = false;
                     return None;
                 }
@@ -322,6 +352,23 @@ impl Detector {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
+                // 落库文案（2026-10-16 治理）：同类型若当前只剩带内「滞回保持」文案，
+                // 优先回填本轮记录的真实越线文案，保证事件自带「为何触发」的证据；
+                // 活跃视图 `current_causes` 不动（severity 判级口径不变）。
+                let stored_causes: Vec<String> = self
+                    .current_causes
+                    .iter()
+                    .map(|c| {
+                        if is_hysteresis_hold(c) {
+                            self.current_cause_real_text
+                                .get(cause_key(c))
+                                .cloned()
+                                .unwrap_or_else(|| c.clone())
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect();
                 let event = StutterEvent {
                     id: 0,
                     timestamp: Utc::now(),
@@ -332,7 +379,7 @@ impl Detector {
                         &self.current_causes,
                         self.session_confirmed_ms,
                     ),
-                    causes: self.current_causes.clone(),
+                    causes: stored_causes,
                     cause_kinds,
                     primary_cause,
                     cause_first_touch,
@@ -342,6 +389,7 @@ impl Detector {
                 };
                 self.current_causes.clear();
                 self.current_cause_first_touch.clear();
+                self.current_cause_real_text.clear();
                 self.session_confirmed_ms = 0;
                 // 卡顿已结束：下一帧 collect 不再需要进程快照。
                 // 时序权衡见上方 causes 分支：analyze 设置的标志影响下一帧。
@@ -351,6 +399,7 @@ impl Detector {
             self.current_causes.clear();
             self.current_culprits.clear();
             self.current_cause_first_touch.clear();
+            self.current_cause_real_text.clear();
             self.session_confirmed_ms = 0;
             // 卡顿不足 sustained 秒即结束：同样不再需要下一帧进程快照。
             self.need_process_snapshot = false;
@@ -367,6 +416,7 @@ impl Detector {
         self.current_causes.clear();
         self.current_culprits.clear();
         self.current_cause_first_touch.clear();
+        self.current_cause_real_text.clear();
         self.need_process_snapshot = false;
         self.cpu_active = false;
         self.cpu_spike_active = false;
@@ -1165,9 +1215,14 @@ mod tests {
             "单次会话应覆盖整段震荡期，实际 {}ms",
             events[0].duration_ms
         );
+        // 落库文案应保留「真实越线」触发证据（非带内「滞回保持」）——带内帧只负责
+        // 维持会话存活（否则会碎裂成多条），不应覆盖真实越线证据（2026-10-16 治理）。
         assert!(
-            events[0].causes.iter().any(|c| c.contains("滞回保持")),
-            "带内帧应发射「滞回保持」文案，got: {:?}",
+            events[0]
+                .causes
+                .iter()
+                .any(|c| c.contains("Memory usage") && c.contains('>')),
+            "落库文案应保留真实越线证据，got: {:?}",
             events[0].causes
         );
     }
@@ -1223,6 +1278,7 @@ mod tests {
         let mut s2 = s1.clone();
         s2.disk_busy_percent = 96.0;
         s2.disk_avg_io_ms = 12.0;
+        std::thread::sleep(std::time::Duration::from_millis(1200)); // 越线帧累计真实时长
         d.analyze(&s2);
         // f3：可用内存跌破绝对下限（第二条 MemLow 文案，触达晚于 DiskBusy）
         let mut s3 = s2.clone();
@@ -1348,6 +1404,7 @@ mod tests {
             d.analyze(&s);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::DiskBusy),
@@ -1414,6 +1471,7 @@ mod tests {
             d.analyze(&s);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::DpcInterrupt),
@@ -1441,6 +1499,7 @@ mod tests {
             d.analyze(&s);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::InterruptStorm),
@@ -1476,6 +1535,7 @@ mod tests {
             d.analyze(&s);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::ContextSwitchStorm),
@@ -1557,6 +1617,9 @@ mod tests {
             "风暴样本应产出越线文案，got: {:?}",
             d.current_causes
         );
+        // 隔一晚再喂一帧越线样本：累计真实越线时长，满足落库闸门（确认越线累计）
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&storm);
 
         // 带内保持：100k/s ≈ 7.1k/core（低于进入线、高于退出线），CPU 回落也不解除
         let mut band = make_sample(60.0, 2000, 10.0);
@@ -1659,6 +1722,7 @@ mod tests {
             d.analyze(&hot);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&hot); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample_thermal(20.0, 2000, Some(95.0), Some(2000.0))).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::ThermalThrottle),
@@ -1765,6 +1829,7 @@ mod tests {
 
         // Wait for sustained period
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
 
         // Push normal sample to end stutter → should generate event
         let normal = make_sample(20.0, 2000, 10.0);
@@ -1850,6 +1915,7 @@ mod tests {
             d.analyze(&make_sample_net(95.0, 2000, 10.0, 5_000_000));
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&make_sample_net(95.0, 2000, 10.0, 5_000_000)); // 累计真实越线时长
         // 卡顿会在某次正常样本中结束并生成事件（闸门因含 CpuHigh 放行），
         // 需在循环内捕获该事件，而非只看最后一次 analyze（那时卡顿已结束、返回 None）。
         let mut captured = None;
@@ -1893,6 +1959,7 @@ mod tests {
             d.analyze(&high);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 越线帧累计真实持续时长（落库闸门按确认越线累计）
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
 
         // 结构化根因应含 CpuHigh，且 primary_cause 为 CpuHigh（首个检测到的 cause）
@@ -1930,6 +1997,7 @@ mod tests {
             d.analyze(&high);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 累计真实越线时长，满足落库闸门
 
         let normal = make_sample(20.0, 2000, 10.0);
         let event = d.analyze(&normal).unwrap();
@@ -1948,6 +2016,7 @@ mod tests {
             d.analyze(&bad);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&bad); // 累计真实越线时长，满足落库闸门
 
         let normal = make_sample(20.0, 2000, 10.0);
         let event = d.analyze(&normal).unwrap();
@@ -1971,6 +2040,7 @@ mod tests {
             d.analyze(&bad);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&bad); // 累计真实越线时长，满足落库闸门
 
         let normal = make_sample(20.0, 2000, 10.0);
         let event = d.analyze(&normal).unwrap();
@@ -2249,6 +2319,10 @@ mod tests {
         let mut high = make_sample(30.0, 2000, 10.0);
         high.mem_usage_percent = 92.0;
 
+        // 预热：先喂一帧中性样本，使首帧越线样本带非零帧间隔（落库闸门按确认越线累计）
+        d.analyze(&make_sample(30.0, 2000, 10.0));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
         // 会话开始
         d.analyze(&high);
         assert!(d.stutter_start.is_some());
@@ -2298,6 +2372,10 @@ mod tests {
         config.sustained_seconds = 1;
         config.mem_chronic_seconds = 1; // 测试用：1s 即判定稳态
         let mut d = Detector::new(&config);
+
+        // 预热：先喂一帧中性样本，使首帧越线样本带非零帧间隔（落库闸门按确认越线累计）
+        d.analyze(&make_sample(30.0, 2000, 10.0));
+        std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // 水位 92% + 分页 400/s（证据：使用率越线）→ 会话开始
         let mut high = make_sample(30.0, 2000, 10.0);
@@ -2353,10 +2431,16 @@ mod tests {
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // 首帧真越线，随后长期带内「滞回保持」把墙钟时长撑过 Major 线（10s）
-        d.analyze(&make_sample(95.0, 2000, 10.0));
+        // 先喂 3 帧真越线（确认累计≈3s，满足落库闸门），再长期带内「滞回保持」
+        // 把墙钟时长撑过 Major 线（10s）——severity 应只认确认累计，保持 Minor。
+        let hot = make_sample(95.0, 2000, 10.0);
+        d.analyze(&hot);
+        for _ in 0..3 {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            d.analyze(&hot);
+        }
         let band = make_sample(85.0, 2000, 10.0); // 80~90 带内：滞回保持
-        for _ in 0..13 {
+        for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             d.analyze(&band);
         }
@@ -2371,7 +2455,7 @@ mod tests {
         assert_eq!(
             event.severity,
             Severity::Minor,
-            "仅首帧真越线（确认累计≈1 帧）不得凭墙钟时长升级 Major，got {:?}，causes={:?}",
+            "确认累计≈3s（<10s）不得凭墙钟时长（>10s）升级 Major，got {:?}，causes={:?}",
             event.severity,
             event.causes
         );
@@ -2386,6 +2470,38 @@ mod tests {
             "真饱和帧的确认累计应增长，实际 {}ms",
             d2.session_confirmed_ms
         );
+    }
+
+    /// 回归（2026-10-16 治理）：落库闸门按「真实越线累计」——瞬时尖峰（仅 1~2 帧
+    /// 越线）+ 长时间滞回带保持，即使墙钟时长远超 sustained 也不得落库（否则一台
+    /// 常年骑在 88~90% 边缘的机器会碎出大量「滞回保持」minor 事件）。
+    #[test]
+    fn analyze_brief_blip_within_hysteresis_is_not_stored() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 2 帧真越线：首帧 dt≈0，次帧 dt≈300ms → 确认累计≈300ms < 1s
+        let hot = make_sample(95.0, 2000, 10.0);
+        d.analyze(&hot);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        d.analyze(&hot);
+
+        // 带内「滞回保持」把墙钟时长拖到 >1s（确认累计不增长）
+        let band = make_sample(85.0, 2000, 10.0);
+        for _ in 0..5 {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            d.analyze(&band);
+        }
+
+        // 正常帧结束会话：墙钟≈2.3s > 1s，但确认累计仅≈300ms → 闸门丢弃
+        let ev = d.analyze(&make_sample(20.0, 2000, 10.0));
+        assert!(
+            ev.is_none(),
+            "瞬时尖峰（确认越线累计 < sustained）不得落库，got: {:?}",
+            ev
+        );
+        assert!(d.stutter_start.is_none(), "会话应已结束");
     }
 
     /// 阶段 E3：滞回带最长保持——CPU 进入后在带内（80~90）仅靠滞回维持超过
@@ -2665,6 +2781,7 @@ mod tests {
             d.analyze(&s);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&s); // 累计真实越线时长，满足落库闸门
 
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(!event.culprits.is_empty(), "应记录 culprit 进程");
@@ -2684,6 +2801,7 @@ mod tests {
             d.analyze(&high);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 累计真实越线时长，满足落库闸门
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(event.culprits.is_empty());
     }
@@ -2719,6 +2837,7 @@ mod tests {
 
         // 正常样本结束卡顿 → 生成事件，标志复位为 false
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 累计真实越线时长，满足落库闸门
         assert!(d.analyze(&make_sample(20.0, 2000, 10.0)).is_some());
         assert!(
             !d.needs_process_snapshot(),
@@ -2749,6 +2868,7 @@ mod tests {
             d.analyze(&high);
         }
         std::thread::sleep(std::time::Duration::from_millis(1200));
+        d.analyze(&high); // 累计真实越线时长，满足落库闸门
         let event = d.analyze(&make_sample(20.0, 2000, 10.0)).unwrap();
         assert!(
             event.cause_kinds.contains(&CauseKind::UiFrozen),

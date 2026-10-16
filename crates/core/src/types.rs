@@ -336,14 +336,23 @@ impl CauseKind {
     /// 不直接导致系统无响应，**单凭它们不应记录一次卡顿事件**；必须与至少一个本方法
     /// 返回 true 的压力类 cause 共存，才记为一次真实卡顿。
     ///
-    /// 返回 false 的仅限纯吞吐 / 异步信号：`NetSpike`、`DiskSpike`、`GpuHigh`
-    /// （GPU 占用高同样不直接阻塞系统调度，且当前检测器未真正产出 GPU cause）。
+    /// 返回 false 的为纯吞吐 / 异步信号与中性提示：`NetSpike`、`DiskSpike`、`GpuHigh`
+    /// （GPU 占用高同样不直接阻塞系统调度，且当前检测器未真正产出 GPU cause）、
+    /// `HandleHigh`（句柄数高但无增长趋势，只是中性提示，不构成卡顿根因，2026-10-16
+    /// 治理：不计 severity、不过落库闸门、不落库为 cause）。
     /// 其余一律视为压力：CPU（`CpuHigh`/`CpuSpike`）、内存（`MemLow` 含可用/使用率/提交/分页）、
     /// 磁盘繁忙（`DiskBusy`）、DPC/中断/上下文切换风暴、温度降频（`ThermalThrottle`）、
     /// 前台冻结（`UiFrozen`）；软件/驱动/硬件级 cause（F-RC14）虽非 PDH 阈值，
-    /// 但属于用户可行动的真根因，同样参与主因、不会被闸门丢弃。
+    /// 但属于用户可行动的真根因（真泄漏 `ProcessHandleLeak` 等），同样参与主因、
+    /// 不会被闸门丢弃。
     pub fn is_pressure(self) -> bool {
-        !matches!(self, CauseKind::NetSpike | CauseKind::DiskSpike | CauseKind::GpuHigh)
+        !matches!(
+            self,
+            CauseKind::NetSpike
+                | CauseKind::DiskSpike
+                | CauseKind::GpuHigh
+                | CauseKind::HandleHigh
+        )
     }
 }
 
