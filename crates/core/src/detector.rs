@@ -239,8 +239,8 @@ impl Detector {
         if !causes.is_empty() {
             // 「真实越线」判定（2026-08-30 治理）：压力类 cause 且文案非「滞回保持」。
             // 「滞回保持」是 §4 明文约定的带内标记——severity 时长判级只认真饱和
-            // 累计，滞回带续命帧不算（DiskBusy 带内维持暂无带内文案标注，会按
-            // 真实越线计，属可接受的高估方向）。
+            // 累计，滞回带续命帧不算（2026-10-28 治理：DiskBusy 带内帧补上「滞回
+            // 保持」标注，与 CPU/内存/DPC/中断/切换信号同语义，不再高估）。
             let frame_confirmed = causes.iter().any(|c| {
                 !is_hysteresis_hold(c)
                     && matches!(CauseKind::from_cause(c), Some(k) if k.is_pressure())
@@ -701,10 +701,18 @@ impl Detector {
             self.config.hysteresis_hold_max_secs,
         );
         if self.disk_busy_active {
-            causes.push(format!(
-                "Disk busy {:.1}% (IO {:.1}ms)",
-                sample.disk_busy_percent, sample.disk_avg_io_ms
-            ));
+            if disk_busy {
+                causes.push(format!(
+                    "Disk busy {:.1}% (IO {:.1}ms)",
+                    sample.disk_busy_percent, sample.disk_avg_io_ms
+                ));
+            } else {
+                causes.push(format!(
+                    "Disk busy {:.1}% (IO {:.1}ms)（滞回保持，阈值 {}% / {}ms）",
+                    sample.disk_busy_percent, sample.disk_avg_io_ms,
+                    self.config.disk_busy_threshold_percent, self.config.disk_io_threshold_ms
+                ));
+            }
         }
 
         // % DPC Time：DPC 长时间占用 CPU 会挤占普通线程（「CPU 不忙但系统卡」）。
@@ -1459,6 +1467,62 @@ mod tests {
             "cause_kinds 应含 DiskBusy，got: {:?}",
             event.cause_kinds
         );
+    }
+
+    /// 2026-10-28 治理：DiskBusy 滞回带内帧必须带「滞回保持」标注。
+    ///
+    /// 旧口径带内帧与真实越线同格式——实测一次升级构建（busy 100% + IO 13.6ms
+    /// 真实越线一帧）后，带内帧（IO 3.2ms）把落库文案覆盖成「IO 3.2ms」，
+    /// 与「因越线而触发」自相矛盾，还被当真实越线计入确认累计虚高判级。
+    #[test]
+    fn disk_busy_hysteresis_band_is_marked_and_not_counted() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        let mut d = Detector::new(&config);
+
+        // 真实越线帧：busy 100% + IO 13.6ms（busy>95 且延迟>10ms 确认线）
+        let mut hot = make_sample(30.0, 2000, 10.0);
+        hot.disk_busy_percent = 100.0;
+        hot.disk_avg_io_ms = 13.6;
+        d.analyze(&hot);
+        assert!(d.disk_busy_active, "busy+延迟双越线应激活 DiskBusy");
+        assert!(
+            d.current_causes
+                .iter()
+                .any(|c| c.contains("Disk busy 100.0% (IO 13.6ms)")),
+            "真实越线帧应带原始数值，got: {:?}",
+            d.current_causes
+        );
+
+        // 确认累计：sleep 后再喂一帧真实越线，使 confirmed 非零
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        d.analyze(&hot);
+        let confirmed = d.session_confirmed_ms;
+        assert!(confirmed >= 1000, "真实越线帧应累计确认时长，got {}", confirmed);
+
+        // 带内帧：busy 仍 100%（> 退出线 47.5）但 IO 3.2ms（< 确认线 10）
+        // → 滞回维持激活，但文案带「滞回保持」且不计确认累计
+        let mut band = make_sample(30.0, 2000, 10.0);
+        band.disk_busy_percent = 100.0;
+        band.disk_avg_io_ms = 3.2;
+        d.analyze(&band);
+        assert!(d.disk_busy_active, "带内应维持激活（滞回防抖）");
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("滞回保持")),
+            "带内帧必须标注滞回保持，got: {:?}",
+            d.current_causes
+        );
+        assert_eq!(
+            d.session_confirmed_ms, confirmed,
+            "带内帧不得计入确认累计（否则凭滞回带虚高判级）"
+        );
+
+        // 回落到退出线以下（busy 40% ≤ 47.5 且延迟 1ms ≤ 25）→ 解除
+        let mut exit_s = make_sample(30.0, 2000, 10.0);
+        exit_s.disk_busy_percent = 40.0;
+        exit_s.disk_avg_io_ms = 1.0;
+        d.analyze(&exit_s);
+        assert!(!d.disk_busy_active, "低于退出线应解除 DiskBusy 激活");
     }
 
     /// 回归（2026-08-29 误报治理，凌晨 2329/2330 实测数据）：NVMe/SSD 并行读写
