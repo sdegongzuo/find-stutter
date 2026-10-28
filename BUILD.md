@@ -168,3 +168,8 @@ label_color = "#BAC2DE"
    页口径），「物理内存」列为工作集（Working Set），两者并存展示。
 3. **进程详情页首次打开**：窗口立即出现，数据在 1~2 秒内由快速 tick 补齐（服务端
    sysinfo 首轮初始化较慢）。
+4. **release 是 GUI 子系统**（`crates/bin/src/main.rs` 的 `windows_subsystem`）：
+   进程创建时不分配控制台，所以双击/启动 GUI **不闪黑框**。代价是 CLI 子命令要靠
+   `AttachConsole(ATTACH_PARENT_PROCESS)` 挂回父控制台才能打印；cmd 不会等待
+   GUI 子系统进程退出，交互式跑会出现「提示符先回来、输出后到」，脚本里请用
+   `start /wait` 或直接重定向。debug 构建仍是控制台子系统（开发看日志/panic）。
