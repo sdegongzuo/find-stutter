@@ -99,6 +99,10 @@ pub struct Detector {
     /// 下一帧 collect 是否需要构建 top_processes 快照。
     /// 非卡顿时为 false，主循环据此跳过全进程遍历（collect_with(false)）。
     need_process_snapshot: bool,
+    /// 上一次落库的时刻与主因：落库冷却用（同一主因在冷却窗口内不重复落库，
+    /// 2026-10-28 治理——一次内存爬升中途回落一帧就会碎成多条首尾相接的事件）。
+    last_event_at: Option<SystemTime>,
+    last_event_primary: Option<CauseKind>,
     /// F-RC4 近期观测到的 CPU 频率峰值（MHz），作为「频率掉档」判定基线。
     /// 仅当 sample.cpu_freq_mhz 为 Some 时更新为 max(当前读数, 峰值×衰减系数)——
     /// 阶段 E 起带慢衰减（`thermal_freq_peak_decay`），让陈旧的短时睿频峰值
@@ -141,6 +145,8 @@ impl Detector {
             current_cause_first_touch: HashMap::new(),
             current_cause_real_text: HashMap::new(),
             need_process_snapshot: false,
+            last_event_at: None,
+            last_event_primary: None,
             freq_peak: None,
         }
     }
@@ -148,6 +154,26 @@ impl Detector {
     /// 下一帧 collect 是否需要构建 top_processes（卡顿进行中或刚结束一帧）
     pub fn needs_process_snapshot(&self) -> bool {
         self.need_process_snapshot
+    }
+
+    /// 同一主因是否仍处于落库冷却窗口内（`event_cooldown_secs`，0 = 关闭冷却）。
+    ///
+    /// 只比较 `primary_cause`（首触最早的压力类 cause）：同源碎片合并，
+    /// 不同性质的压力（如本轮内存、下轮 CPU）仍各自落库，不会互相吞掉。
+    /// 时钟回拨（NTP）时 `elapsed()` 报错，按「不在冷却内」处理——
+    /// 宁可多落一条，也不要因时钟问题长期静默。
+    fn in_event_cooldown(&self, primary: Option<CauseKind>) -> bool {
+        let secs = self.config.event_cooldown_secs as u64;
+        if secs == 0 {
+            return false;
+        }
+        match (self.last_event_at, self.last_event_primary, primary) {
+            (Some(at), Some(prev), Some(cur)) if prev == cur => at
+                .elapsed()
+                .map(|d| d < Duration::from_secs(secs))
+                .unwrap_or(false),
+            _ => false,
+        }
     }
 
     /// F-RC3 前台窗口冻结探测的默认实现（依赖注入点，见 `ui_probe` 字段）。
@@ -321,7 +347,6 @@ impl Detector {
                     self.need_process_snapshot = false;
                     return None;
                 }
-                let culprits = self.extract_culprits();
                 // 首触时刻：相对 onset（卡顿起点）的偏移毫秒
                 let cause_first_touch: HashMap<CauseKind, i64> = self
                     .current_cause_first_touch
@@ -351,6 +376,22 @@ impl Detector {
                 // F-RC5 将在此基础上按信号强度×持续细化加权。
                 cause_kinds.sort_by_key(|k| cause_first_touch.get(k).copied().unwrap_or(0));
                 let primary_cause = cause_kinds.first().copied();
+                // 落库冷却（2026-10-28 治理）：同一主因在冷却窗口内不再重复落库。
+                // 水位类信号进出滞回带极频繁——实测 12:20:43→12:22:26 一次内存爬升
+                // （89%→98%，可用 2.1GB→564MB）中途回落一帧即被切成 3 条首尾相接的
+                // 事件（8.9s / 22.9s / 60.8s，最后一条按墙钟判 critical）。
+                // 冷却把同源碎片合并为一条；不同主因（如内存 vs CPU）仍各自落库。
+                if self.in_event_cooldown(primary_cause) {
+                    self.current_causes.clear();
+                    self.current_culprits.clear();
+                    self.current_cause_first_touch.clear();
+                    self.current_cause_real_text.clear();
+                    self.session_confirmed_ms = 0;
+                    self.need_process_snapshot = false;
+                    return None;
+                }
+                // 元凶提取放在冷却判定之后：被冷却丢弃的碎片不必再排序克隆一次。
+                let culprits = self.extract_culprits();
                 let onset_ts = start
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
@@ -405,6 +446,9 @@ impl Detector {
                 self.current_cause_first_touch.clear();
                 self.current_cause_real_text.clear();
                 self.session_confirmed_ms = 0;
+                // 记录本次落库的主因与时刻，供冷却窗口判定（见 in_event_cooldown）。
+                self.last_event_at = Some(SystemTime::now());
+                self.last_event_primary = primary_cause;
                 // 卡顿已结束：下一帧 collect 不再需要进程快照。
                 // 时序权衡见上方 causes 分支：analyze 设置的标志影响下一帧。
                 self.need_process_snapshot = false;
@@ -593,20 +637,10 @@ impl Detector {
             }
         }
 
-        // 提交电荷（commit charge）：已提交虚拟内存 / 提交上限（= 物理内存 +
-        // 页面文件）。阶段 E（误报治理）起**降级为「压力证据」**，不再作为独立
-        // cause 发射：commit 高只是记账上限逼近，本身对性能零影响（浏览器/IDE/
-        // 模拟器大量 commit，开发机常年 90%+ 而系统不卡）；真出问题（分配失败、
-        // 强制分页）时必然伴随可用内存低/分页信号，由那些信号触发。对齐阶段 A
-        // （swap 存量降为仅展示）/ 阶段 B（paging 降为放大器）的治理先例。
-        // commit_ratio 保留计算：仍作为 paging 压力证据之一（见下方判定）。
-        let commit_ratio = if sample.commit_limit > 0 {
-            // 用 f64 计算：大内存机 commit_limit 达数十 GB，超出 f32 的 24 位精确整数范围，
-            // 在 90% 边界附近会因精度丢失而误判。
-            sample.commit_bytes as f64 / sample.commit_limit as f64 * 100.0
-        } else {
-            0.0
-        };
+        // 提交电荷（commit charge）：阶段 E（误报治理）起**不再是独立 cause**，
+        // 也不再给分页供证（2026-10-28 治理）。commit 只是记账上限逼近，本身对
+        // 性能零影响——开发机常年 90%+ 而系统不卡（实测 32G 机器 29.8% 的帧 >90%），
+        // 拿它当分页证据等于让 Page Reads/sec 单指标定案。
 
         // 分页活动速率（阶段 C）：\Memory\Page Reads/sec 是「真正的 swap 卡顿信号」。
         // 物理内存耗尽时 OS 被迫把页从 pagefile 换入，每次换页注入一次磁盘 I/O 延迟 → 卡顿。
@@ -614,14 +648,14 @@ impl Detector {
         // severity，已降级为仅展示。
         // 修正（用户实测反馈）：Page Reads/sec 是瞬时抖动极大的计数器，开发机/模拟器场景
         // （Android Studio / qemu / IDE 等）正常负载也频繁超阈值，但磁盘空闲、提交电荷不高时
-        // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「内存侧压力
-        // 证据」（commit 高 / 内存使用率高 / 可用内存不足）才记为卡顿 cause——
-        // paging 退化为真卡顿的「放大器」，避免孤立分页尖峰连环误报。
+        // 系统并不卡顿（用户无感）。故 paging 不再单指标硬触发，必须同时存在「真实内存压力」
+        // 证据（可用内存 < 1GB 或使用率 ≥ 95%）才记为卡顿 cause——paging 退化为真卡顿的
+        // 「放大器」，避免孤立分页尖峰连环误报。
         // 2026-08-29 治理：压力证据不再包含「磁盘繁忙」——分页读盘会把磁盘打忙、
         // 磁盘忙再给分页供证（循环论证），大文件冷读（Page Reads 计入预读）即可
         // 凭「分页高 + 磁盘忙」误报成 MemLow；详见 DetectionConfig 方法注释。
-        let paging_has_pressure_evidence =
-            self.config.paging_has_pressure_evidence(commit_ratio, sample);
+        // 2026-10-28 治理：证据里的 commit 高同样被删除（原因见上方注释）。
+        let paging_has_pressure_evidence = self.config.paging_has_pressure_evidence(sample);
         // 2026-08-30 治理：分页与水位共用稳态抑制锁存。内存高压机器上分页
         // 2000~4000/s 可常态越线（水位 90%+ 连续活跃时几乎全程在场），旧口径
         // 「分页不受抑制影响」让分页给整个会话无限续命——实测 121s 的事件里
@@ -2245,31 +2279,91 @@ mod tests {
         );
     }
 
-    /// 阶段 E2a（证据角色保留）：commit 高 + 分页速率高（真实换页场景）→
-    /// 经「Memory paging」cause 触发（commit 作为压力证据），且不再出现
-    /// 「Commit charge」独立 cause。
+    /// 2026-10-28 治理：commit 高**不再**给分页供证。
+    ///
+    /// 开发机 commit 常年 90%+（实测 32G 机器 29.8% 的帧 >90%）而系统不卡，
+    /// 旧口径让「commit 95% + 分页 400/s」直接触发 MemLow——实测 7 条无感事件里
+    /// 有 2 条（12:14、12:20）内存只有 86~87%、可用 3.6GB，全靠 commit 供证。
+    /// 现在只有可用内存 <1GB 或使用率 ≥95% 才算真内存压力。
     #[test]
-    fn commit_charge_still_serves_as_paging_evidence() {
+    fn commit_high_alone_no_longer_serves_as_paging_evidence() {
         let mut config = DetectionConfig::default();
         config.sustained_seconds = 1;
         let mut d = Detector::new(&config);
 
-        // commit 95%（唯一压力证据）+ paging 400/s > 300 → 触发 Memory paging
-        let mut s = make_sample(30.0, 2000, 10.0);
+        // commit 95% + 内存 88% + 可用 3.6GB（实测事件形态）+ 分页 400/s
+        let mut s = make_sample(30.0, 3600, 10.0);
+        s.mem_usage_percent = 88.0;
         s.commit_limit = 1_000_000;
         s.commit_bytes = 950_000;
         s.page_reads_per_sec = 400.0;
         d.analyze(&s);
         assert!(
-            d.current_causes.iter().any(|c| c.contains("Memory paging")),
-            "commit 作为证据应放行 paging cause，got: {:?}",
+            d.current_causes.iter().all(|c| !c.contains("Memory paging")),
+            "commit 高不再给分页供证，got: {:?}",
             d.current_causes
         );
         assert!(
             d.current_causes.iter().all(|c| !c.contains("Commit charge")),
-            "提交电荷不应再作为独立 cause，got: {:?}",
+            "提交电荷不应作为独立 cause，got: {:?}",
             d.current_causes
         );
+
+        // 可用内存 <1GB 的真压力场景 → 分页仍作放大器
+        let mut low = make_sample(30.0, 600, 10.0);
+        low.mem_usage_percent = 88.0;
+        low.commit_limit = 1_000_000;
+        low.commit_bytes = 950_000;
+        low.page_reads_per_sec = 400.0;
+        d.analyze(&low);
+        assert!(
+            d.current_causes.iter().any(|c| c.contains("Memory paging")),
+            "可用内存 <1GB 时 paging 应记 cause，got: {:?}",
+            d.current_causes
+        );
+    }
+
+    /// 2026-10-28 治理：同一主因的落库冷却——同一波水位压力中途回落一帧会被切成
+    /// 多条首尾相接的事件（实测 12:20:43→12:22:26 碎成 3 条，其中一条按墙钟
+    /// 60s 判 critical）。冷却窗口内同主因不再落库；不同主因不受影响。
+    #[test]
+    fn event_cooldown_merges_same_primary_cause() {
+        let mut config = DetectionConfig::default();
+        config.sustained_seconds = 1;
+        config.event_cooldown_secs = 60;
+        let mut d = Detector::new(&config);
+
+        // 第一轮：可用 400MB + 水位 96% → 确认累计后落库
+        let mut high = make_sample(30.0, 400, 10.0);
+        high.mem_usage_percent = 96.0;
+        d.analyze(&high);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        d.analyze(&high);
+        let ev = d
+            .analyze(&make_sample(30.0, 3000, 10.0))
+            .expect("首轮应落库");
+        assert_eq!(ev.primary_cause, Some(CauseKind::MemLow));
+
+        // 第二轮：同样的内存压力，冷却窗口内 → 丢弃
+        let mut high2 = make_sample(30.0, 400, 10.0);
+        high2.mem_usage_percent = 96.0;
+        d.analyze(&high2);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        d.analyze(&high2);
+        assert!(
+            d.analyze(&make_sample(30.0, 3000, 10.0)).is_none(),
+            "冷却窗口内同主因不得重复落库"
+        );
+
+        // 不同主因（CPU 饱和）不受冷却影响
+        let hot = make_sample(95.0, 3000, 10.0);
+        d.analyze(&hot);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        d.analyze(&hot);
+        let ev2 = d
+            .analyze(&make_sample(20.0, 3000, 10.0))
+            .expect("不同主因应正常落库");
+        assert_eq!(ev2.primary_cause, Some(CauseKind::CpuHigh));
     }
 
     /// 阶段 E2b：内存水位滞回——使用率 92% 进入后回落 87%（带内 85~90）状态保持
@@ -2391,8 +2485,8 @@ mod tests {
         d.analyze(&make_sample(30.0, 2000, 10.0));
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
-        // 水位 92% + 分页 400/s（证据：使用率越线）→ 会话开始
-        let mut high = make_sample(30.0, 2000, 10.0);
+        // 水位 92% + 分页 400/s（分页证据：可用 800MB < 1024MB，2026-10-28 口径）→ 会话开始
+        let mut high = make_sample(30.0, 800, 10.0);
         high.mem_usage_percent = 92.0;
         high.page_reads_per_sec = 400.0;
         d.analyze(&high);

@@ -505,12 +505,25 @@ pub struct DetectionConfig {
     pub cpu_hysteresis: f32,
     pub mem_threshold_percent: f32,
     pub mem_threshold_mb: u64,
-    /// 提交电荷阈值（%）：已提交虚拟内存 / 提交上限（= 物理内存 + 页面文件）。
-    /// 阶段 E（误报治理）起**不再是独立卡顿 cause**：commit 高只是记账上限逼近，
-    /// 本身对性能零影响（开发机常年 90%+ 而系统不卡）；真出问题时必然伴随
-    /// 可用内存低 / 分页信号，由那些信号触发。本阈值保留作「分页压力证据」
-    /// 的判定线（见 DetectionConfig::paging_has_pressure_evidence）。
-    pub commit_threshold_percent: f32,
+    /// 分页成为卡顿证据的最低可用内存（MB，默认 1024）：
+    /// 可用内存高于该值时，`Page Reads/sec` 高只是文件缓存未命中/预读
+    /// （NVMe 上亚毫秒完成），不是内存压力（2026-10-28 治理）。
+    /// 与该值同时生效的还有 `paging_mem_critical_percent`，两者为「或」关系。
+    #[serde(default = "default_paging_min_available_mb")]
+    pub paging_min_available_mb: u64,
+    /// 分页成为卡顿证据的内存使用率线（%，默认 95）：接近耗尽才算真压力。
+    ///
+    /// 2026-10-28 治理：原证据之一「提交电荷 >90%」被删除——开发机常年 90%+
+    /// （实测 32G 机器 29.8% 的帧 commit >90%）而对性能零影响，让它给分页供证
+    /// 等于把 `Page Reads/sec` 变成单指标触发，一天碎出 6 条无感 MemLow。
+    #[serde(default = "default_paging_mem_critical_percent")]
+    pub paging_mem_critical_percent: f32,
+    /// 同一主因的落库冷却秒数（默认 90）：冷却窗口内重复会话不再落库。
+    ///
+    /// 水位类信号进出滞回带很频繁（实测一次内存爬升中途回落一帧即碎成 3 条，
+    /// 首尾相接约 92s），冷却把同一波压力的碎片合并成一条事件。
+    #[serde(default = "default_event_cooldown_secs")]
+    pub event_cooldown_secs: u32,
     /// 分页活动速率阈值（/s）：\Memory\Page Reads/sec 超过该值即记为换页抖动
     /// （真正的 swap 卡顿信号，度量换页活动强度而非 swap 已用存量）。
     /// 正常负载通常 < 10/s，抖动（thrashing）时飙升到数百/数千 /s。
@@ -649,7 +662,9 @@ impl Default for DetectionConfig {
             cpu_hysteresis: 10.0,
             mem_threshold_percent: 90.0,
             mem_threshold_mb: 500,
-            commit_threshold_percent: 90.0,
+            paging_min_available_mb: default_paging_min_available_mb(),
+            paging_mem_critical_percent: default_paging_mem_critical_percent(),
+            event_cooldown_secs: default_event_cooldown_secs(),
             page_reads_threshold: 300.0,
             disk_rate_spike_ratio: 10.0,
             spike_ratio: 3.0,
@@ -682,22 +697,22 @@ impl Default for DetectionConfig {
 }
 
 impl DetectionConfig {
-    /// 分页（paging）的压力证据判定：任一**内存侧**信号成立即视为存在真实内存压力。
-    /// 阶段 B 起 paging 是「放大器」，须与压力证据共存才记 cause；阶段 E 起提交电荷
-    /// 也降级为证据之一（不再独立成 cause）。
-    /// 治理（2026-08-29）：压力证据收敛为仅内存侧信号（commit 高 / 使用率高 /
-    /// 可用内存不足），删除原「磁盘繁忙」分支——它是循环论证：分页读盘自身会把
-    /// % Disk Time 推过阈值，磁盘忙再反过来给分页提供压力证据。Page Reads/sec
-    /// 把大文件冷读/预读也计入（非仅页面文件换入），后台批处理（备份/索引/维护）
-    /// 即可凭「分页高 + 磁盘忙」连环误报成 MemLow 卡顿（实测：内存 74%、可用 8GB、
-    /// commit 41% 完全健康的机器凌晨连出两条 major「内存换页卡顿」）。磁盘真饱和
-    /// 由 `DiskBusy` cause 独立表达，不再为 paging 背书。
+    /// 分页（paging）的压力证据判定：必须存在**真实内存压力**才算。
+    ///
+    /// 阶段 B 起 paging 是「放大器」，须与压力证据共存才记 cause。
+    /// 2026-08-29 治理删除了「磁盘繁忙」分支（循环论证：分页读盘自己会把
+    /// % Disk Time 推高，再反过来给分页供证）。
+    /// 2026-10-28 治理删除「提交电荷 > 阈值」分支：commit 是记账上限，
+    /// 开发机常年 90%+ 而系统不卡（实测 32G 机器 29.8% 的帧 >90%），
+    /// 用它供证等于让 `Page Reads/sec` 单指标定案——实测一天 6 条 MemLow
+    /// 全是内存 86~93%、可用 2~4GB、磁盘延迟 <21ms 的无感事件。
+    /// 现在只认两种「真压力」：可用内存 < `paging_min_available_mb`（默认 1GB），
+    /// 或使用率 ≥ `paging_mem_critical_percent`（默认 95%，接近耗尽）。
     /// 实时判定（detector.rs）与 what-if 单帧重算（analytics.rs detect_core）
     /// **共用本方法**，保证两处口径一致、不随阈值调整漂移。
-    pub fn paging_has_pressure_evidence(&self, commit_ratio: f64, sample: &Sample) -> bool {
-        commit_ratio > self.commit_threshold_percent as f64
-            || sample.mem_usage_percent > self.mem_threshold_percent
-            || sample.mem_available_mb < self.mem_threshold_mb
+    pub fn paging_has_pressure_evidence(&self, sample: &Sample) -> bool {
+        sample.mem_available_mb < self.paging_min_available_mb
+            || sample.mem_usage_percent >= self.paging_mem_critical_percent
     }
 
     /// 磁盘真繁忙度判定（实时判定与 what-if 单帧重算共用，两处不漂移）：
@@ -771,6 +786,16 @@ fn default_win_event_backtrack_secs() -> u32 {
 }
 fn default_thermal_freq_peak_decay() -> f32 {
     0.995
+}
+// 2026-10-28 分页证据 / 落库冷却默认值
+fn default_paging_min_available_mb() -> u64 {
+    1024
+}
+fn default_paging_mem_critical_percent() -> f32 {
+    95.0
+}
+fn default_event_cooldown_secs() -> u32 {
+    90
 }
 
 // F-RC2 系统级信号阈值默认值
@@ -1258,7 +1283,10 @@ mod tests {
         assert_eq!(c.cpu_threshold, 90.0);
         assert_eq!(c.mem_threshold_percent, 90.0);
         assert_eq!(c.mem_threshold_mb, 500);
-        assert_eq!(c.commit_threshold_percent, 90.0);
+        // 2026-10-28：commit 阈值不再参与判定，改为分页证据线 + 落库冷却
+        assert_eq!(c.paging_min_available_mb, 1024);
+        assert_eq!(c.paging_mem_critical_percent, 95.0);
+        assert_eq!(c.event_cooldown_secs, 90);
         assert_eq!(c.page_reads_threshold, 300.0);
         assert_eq!(c.disk_rate_spike_ratio, 10.0);
         assert_eq!(c.spike_ratio, 3.0);

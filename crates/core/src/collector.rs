@@ -250,9 +250,9 @@ impl ProcessFingerprintSampler {
 /// Windows PDH-based commit-charge sampler.
 ///
 /// 采集 `\Memory\Committed Bytes` 与 `\Memory\Commit Limit`（均为瞬时计数，
-/// 非速率计数器），用于判断「提交电荷压力」——已提交虚拟内存接近提交上限
-/// （物理内存 + 页面文件）时系统会弹「内存不足」并强制分页，是比「可用物理
-/// 内存归零」更早的卡顿预警信号。详见 `DetectionConfig::commit_threshold_percent`。
+/// 非速率计数器）。这两个值落库后只作展示与事后分析：2026-10-28 治理起 commit
+/// 高不再参与任何卡顿判定（dev 机常年 90%+ 而系统不卡），分页的压力证据改看
+/// 可用内存与使用率，见 `DetectionConfig::paging_has_pressure_evidence`。
 struct CommitPdh {
     query: PDH_HQUERY,
     committed_counter: PDH_HCOUNTER,

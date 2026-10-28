@@ -1385,19 +1385,12 @@ pub fn detect_core(sample: &Sample, cfg: &DetectionConfig) -> Vec<String> {
             sample.mem_usage_percent, cfg.mem_threshold_percent
         ));
     }
-    // 提交电荷（commit charge）：阶段 E 起降级为「压力证据」，不再作为独立
-    // cause（与实时判定 detector.rs 保持一致）——commit 高只是记账上限逼近，
-    // 本身对性能零影响；真出问题时由可用内存低/分页信号触发。
-    let commit_ratio = if sample.commit_limit > 0 {
-        sample.commit_bytes as f64 / sample.commit_limit as f64 * 100.0
-    } else {
-        0.0
-    };
     // 分页活动速率（真正的 swap 卡顿信号）；与实时判定共用同一证据方法，
-    // 需存在内存侧压力证据（阶段 B 起为放大器口径，两处不漂移；
-    // 2026-08-29 治理：磁盘忙不再作为证据，见方法注释）。
+    // 需存在真实内存压力（可用 <1GB 或使用率 ≥95%）才成立，两处不漂移；
+    // 2026-08-29 治理：磁盘忙不再作为证据；2026-10-28 治理：commit 高同样删除，
+    // 见 DetectionConfig::paging_has_pressure_evidence 注释。
     if sample.page_reads_per_sec > cfg.page_reads_threshold
-        && cfg.paging_has_pressure_evidence(commit_ratio, sample)
+        && cfg.paging_has_pressure_evidence(sample)
     {
         causes.push(format!(
             "Memory paging {:.1}/s > {}/s",
@@ -3027,14 +3020,25 @@ mod tests {
             out3
         );
 
-        // 阶段 E2a 证据角色：commit 高 + 分页速率高 → 经 "Memory paging" 触发
+        // 2026-10-28 治理：commit 高不再给分页供证——commit 95% + 分页 400/s
+        // 但可用内存 8GB / 使用率 30% → 不产出 paging（旧口径会误报成 MemLow）
         let mut thrash = commit_only.clone();
         thrash.page_reads_per_sec = 400.0;
         let out4 = detect_core(&thrash, &cfg);
         assert!(
-            out4.iter().any(|c| c.contains("Memory paging")),
-            "commit 作为证据应放行 paging: {:?}",
+            !out4.iter().any(|c| c.contains("Memory paging")),
+            "commit 高不再给分页供证: {:?}",
             out4
+        );
+
+        // 真内存压力（可用 600MB < 1024MB）时 paging 恢复为放大器
+        let mut real_thrash = thrash.clone();
+        real_thrash.mem_available_mb = 600;
+        let out5 = detect_core(&real_thrash, &cfg);
+        assert!(
+            out5.iter().any(|c| c.contains("Memory paging")),
+            "可用内存 <1GB 时应放行 paging: {:?}",
+            out5
         );
     }
 
