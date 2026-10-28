@@ -29,6 +29,7 @@ build_gui.log
 build_release.log
 check_ws.log
 gui_run.log
+gui.log
 stutter.db-shm
 stutter.db-wal
 *.diag.log
@@ -40,3 +41,4 @@ upgrade-transcript.log
 
 # ZCode session data
 .zcode/
+debug.log

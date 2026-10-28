@@ -27,6 +27,7 @@ pub mod auto_start;
 pub mod chart;
 pub mod elevate;
 pub mod hotreload;
+pub mod logging;
 pub mod notify;
 pub mod overlay;
 pub mod process_list;
@@ -64,7 +65,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// 日志：用 `try_init` 容忍重复（bin crate 也可能 init 一次），
 ///       重复时静默忽略，不影响主流程。
 pub fn run() -> anyhow::Result<()> {
-    let _ = env_logger::try_init();
+    // 日志 stderr + gui.log 双写，并装 panic 钩子：release 下 GUI 会 FreeConsole，
+    // 没有落盘日志的话「进程突然消失」将无从取证（panic 也不会进 WER）。
+    logging::init();
+    logging::install_panic_hook();
 
     let mut config = find_stutter_core::Config::load("config.toml").unwrap_or_else(|e| {
         log::warn!("config load failed ({}), using defaults", e);
