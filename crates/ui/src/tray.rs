@@ -225,13 +225,22 @@ pub fn apply_command(
     match cmd {
         TrayCommand::ShowHide => {
             if ui.window().is_visible() {
+                log::info!("托盘：隐藏悬浮窗");
                 ui.hide().ok();
             } else {
+                log::info!("托盘：显示悬浮窗");
                 ui.show().ok();
             }
         }
         TrayCommand::TogglePause => {
             state.paused = !state.paused;
+            // 必须同步到悬浮窗：按钮文案与第二行提示由 slint 的 `paused` 驱动，
+            // 只翻 state 会让界面继续显示「暂停」（P1-1）。恢复时同理回到心跳行。
+            ui.set_paused(state.paused);
+            log::info!(
+                "托盘暂停监控: {}",
+                if state.paused { "暂停" } else { "恢复" }
+            );
         }
         TrayCommand::Analysis => {
             // 复用「首次创建 + 复用」模式（与右键菜单一致）
@@ -252,6 +261,8 @@ pub fn apply_command(
             }
         }
         TrayCommand::Quit => {
+            // 这条路径此前完全不打日志，是「窗口突然消失」最可疑的无声出口之一
+            log::info!("托盘：退出程序");
             let _ = slint::quit_event_loop();
         }
     }

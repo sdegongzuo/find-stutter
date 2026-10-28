@@ -378,6 +378,23 @@ pub fn run() -> anyhow::Result<()> {
         tray_ok.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    // 3b2) 悬浮窗关闭请求（Alt+F4 / 外部 WM_CLOSE）：
+    //      托盘可用时改成「隐藏」（与右键菜单「隐藏悬浮窗」一致，常驻监控不该被
+    //      误按 Alt+F4 杀掉）；托盘不可用时按退出处理。
+    //      **必须记日志**：这条路径此前无声退出，13:44 那次「窗口突然消失」就查不出原因。
+    let tray_ok_for_close = tray_ok.clone();
+    // 注：Overlay 的 .slint 没有声明 close-requested 回调，这里用窗口级 API。
+    ui.window().on_close_requested(move || {
+        if tray_ok_for_close.load(std::sync::atomic::Ordering::Relaxed) {
+            log::info!("悬浮窗收到关闭请求 → 隐藏（托盘可恢复），进程继续运行");
+            slint::CloseRequestResponse::HideWindow
+        } else {
+            log::info!("悬浮窗收到关闭请求 → 托盘不可用，按退出处理");
+            let _ = slint::quit_event_loop();
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
+
     // 3c) P2：任务栏嵌入（伪任务栏窗口，config.ui.taskbar = true 时启用）
     let taskbar: Option<std::sync::Arc<crate::taskbar::TaskbarWindow>> =
         if config.ui.taskbar {
@@ -528,8 +545,15 @@ pub fn run() -> anyhow::Result<()> {
                 }
             } else { match weak_ui.upgrade() { Some(ui) => {
                 // 暂停中：指标冻结，但服务状态行明确显示「已暂停」，
-                // 恢复后由 apply_metrics 恢复为真实服务状态
-                ui.set_service_status(slint::SharedString::from("⏸ 已暂停"));
+                // 恢复后由 apply_metrics 恢复为真实服务状态。
+                //
+                // `set_paused(true)` 必须在这里补：`apply_metrics` 只在 `!paused`
+                // 分支调用，而按钮文案、第二行提示都由 slint 的 `paused` 驱动。
+                // 漏掉的后果（P1-1）：从托盘暂停后首行写「已暂停」，按钮仍写
+                // 「暂停」、第二行仍显示心跳——同一窗口三个互相矛盾的信号，
+                // 且此时点「暂停」实际是恢复，用户被反向操作。
+                ui.set_paused(true);
+                ui.set_service_status(slint::SharedString::from("已暂停"));
                 ui.set_service_status_color(slint::Brush::SolidColor(
                     slint::Color::from_rgb_u8(0x8a, 0x8a, 0x92),
                 ));
@@ -539,5 +563,8 @@ pub fn run() -> anyhow::Result<()> {
 
     // 5) 启动 Slint 事件循环（阻塞）
     slint::run_event_loop_until_quit()?;
+    // 走到这里 = 事件循环正常结束（quit_event_loop 或最后一个窗口关闭）。
+    // 这一行是「正常退出」与「进程被杀 / 崩溃」的分界线：没有它就没有收尾机会。
+    log::info!("事件循环已退出，GUI 进程正常结束");
     Ok(())
 }

@@ -102,7 +102,7 @@ fn spawn_elevated_and_wait_impl(
     use windows::Win32::UI::Shell::{
         ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
     };
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     use windows::Win32::System::Threading::{
         GetExitCodeProcess, WaitForSingleObject,
     };
@@ -141,7 +141,9 @@ fn spawn_elevated_and_wait_impl(
         lpFile: PCWSTR(lp_file.as_ptr()),
         lpParameters: PCWSTR(cmd_line.as_ptr()),
         lpDirectory: PCWSTR::null(),
-        nShow: SW_SHOWNORMAL.0,
+        // SW_HIDE：提权目标是控制台程序（install / start / install-start），
+        // SW_SHOWNORMAL 会在 UAC 之后再亮一个黑框；这里不需要任何窗口。
+        nShow: SW_HIDE.0,
         lpClass: PCWSTR::null(),
         ..Default::default()
     };

@@ -88,6 +88,9 @@ export component Overlay inherits Window {
     in property <color> net-color: #1e1e2e;
     in property <color> hb-color: #8a8a92;
     in property <color> label-color: #7b7b85;
+    // 暂停态专用色：不能借用 event-color——后者在「今日卡顿 0」时是中性灰、
+    // 非 0 时是琥珀，会让同一个「已暂停」状态随卡顿数变色。
+    in property <color> paused-color: #5b6b7f;
     in property <length> text-size: 13px;
 
     // === P3: 服务健康状态（角标模式：● + 文字，融进主区）===
@@ -103,9 +106,11 @@ export component Overlay inherits Window {
     in property <string> mem-value: "--";
     in property <string> gpu-label: "GPU";
     in property <string> gpu-value: "--";
-    in property <string> net-send-label: "上传";
+    // 标签用箭头而非「上传/下载」：中列在 360 宽下只有约 100px，
+    // 两个汉字（约 20px）会把「1023.9 KB/s」挤出列外压到右列文字上。
+    in property <string> net-send-label: "↑";
     in property <string> net-send-value: "--";
-    in property <string> net-recv-label: "下载";
+    in property <string> net-recv-label: "↓";
     in property <string> net-recv-value: "--";
     // 当日累计网络流量（默认显示；↑ 上行 / ↓ 下行分开，统计口径见 reader / sum_network_traffic）
     in property <string> net-today-up: "↑ --";
@@ -116,7 +121,6 @@ export component Overlay inherits Window {
     in property <string> last-heartbeat: "最近心跳 --";
 
     // card 与 bubble 共用同一三列网格，皮肤只改变配色、尺寸和可选吉祥物。
-    in property <string> layout-mode: "card";
     in property <string> bubble-tip: "";
     // 可选吉祥物图片（皮肤 mascot 字段；未配置/加载失败时隐藏）
     in property <image> mascot-image;
@@ -125,7 +129,8 @@ export component Overlay inherits Window {
     // === 暂停界面刷新（后台服务仍采集；服务停止时禁用）===
     in property <bool> pause-enabled: true;
     in-out property <bool> paused: false;
-    out property <string> pause-text: root.paused ? "恢复刷新" : "暂停刷新";
+    // 暂停按钮文字（34px 宽只放得下两个字；是否"只暂停界面"由 tooltip 说明）
+    out property <string> pause-text: root.paused ? "恢复" : "暂停";
     out property <string> pause-tooltip: root.paused
         ? "点击恢复界面刷新；暂停期间后台服务仍持续采集"
         : "仅暂停界面刷新与卡顿通知，后台服务仍持续采集";
@@ -160,15 +165,25 @@ export component Overlay inherits Window {
     function in-elem(px: length, py: length, rx: length, ry: length, rw: length, rh: length) -> bool {
         return px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
     }
+    // 命中区必须先落在所属列内：数值文字宽于列宽时（如「1023.9 KB/s」），
+    // 元素矩形会溢出到相邻列，若只按元素矩形判定，点右列文字会误开网络进程窗。
+    function in-col(px: length, cx: length, cw: length) -> bool {
+        return px >= cx && px <= cx + cw;
+    }
     function resource-kind(x: length, y: length) -> string {
-        if (root.in-elem(x, y, main-cpu-value.absolute-position.x, main-cpu-value.absolute-position.y, main-cpu-value.width, main-cpu-value.height)) { return "cpu"; }
-        if (root.in-elem(x, y, main-mem-value.absolute-position.x, main-mem-value.absolute-position.y, main-mem-value.width, main-mem-value.height)) { return "mem"; }
-        if (root.in-elem(x, y, main-net-send-value.absolute-position.x, main-net-send-value.absolute-position.y, main-net-send-value.width, main-net-send-value.height)
-            || root.in-elem(x, y, main-net-recv-value.absolute-position.x, main-net-recv-value.absolute-position.y, main-net-recv-value.width, main-net-recv-value.height)) { return "net"; }
+        if (root.in-col(x, main-col1.absolute-position.x, main-col1.width)) {
+            if (root.in-elem(x, y, main-cpu-value.absolute-position.x, main-cpu-value.absolute-position.y, main-cpu-value.width, main-cpu-value.height)) { return "cpu"; }
+            if (root.in-elem(x, y, main-mem-value.absolute-position.x, main-mem-value.absolute-position.y, main-mem-value.width, main-mem-value.height)) { return "mem"; }
+        }
+        if (root.in-col(x, main-col2.absolute-position.x, main-col2.width)) {
+            if (root.in-elem(x, y, main-net-send-value.absolute-position.x, main-net-send-value.absolute-position.y, main-net-send-value.width, main-net-send-value.height)
+                || root.in-elem(x, y, main-net-recv-value.absolute-position.x, main-net-recv-value.absolute-position.y, main-net-recv-value.width, main-net-recv-value.height)) { return "net"; }
+        }
         return "";
     }
     function event-count-hit(x: length, y: length) -> bool {
-        return root.in-elem(x, y, main-event-text.absolute-position.x, main-event-text.absolute-position.y, main-event-text.width, main-event-text.height);
+        return root.in-col(x, main-col2.absolute-position.x, main-col2.width)
+            && root.in-elem(x, y, main-event-text.absolute-position.x, main-event-text.absolute-position.y, main-event-text.width, main-event-text.height);
     }
     // 数字悬浮高亮：元素自身矩形内
     function hovering(el-x: length, el-y: length, el-w: length, el-h: length) -> bool {
@@ -236,8 +251,10 @@ export component Overlay inherits Window {
             spacing: 8px;
 
             // 左列：CPU / 内存 / GPU
-            VerticalLayout {
-                width: 30%;
+            // 24%（原 30%）：标签最宽只有「内存」两字 + 三位数百分比，
+            // 空出来的宽度必须让给中列的网络速率，否则「1023.9 KB/s」会压到右列。
+            main-col1 := VerticalLayout {
+                width: 24%;
                 spacing: 4px;
                 Rectangle {
                     height: 18px;
@@ -305,9 +322,12 @@ export component Overlay inherits Window {
                 }
             }
 
-            // 中列：上传 / 下载 / 今日卡顿
-            VerticalLayout {
+            // 中列：↑ 上传 / ↓ 下载 / 今日卡顿
+            // min-width 保证「↑ 1023.9 KB/s」放得下：宽度被左右列与吉祥物挤压时，
+            // 宁可让右列（有 overflow: elide）收缩，也不让数值横穿到右列文字上。
+            main-col2 := VerticalLayout {
                 horizontal-stretch: 1;
+                min-width: 104px;
                 spacing: 4px;
                 Rectangle {
                     height: 18px;
@@ -360,8 +380,10 @@ export component Overlay inherits Window {
             }
 
             // 右列：服务状态 / 最近心跳 / 今日累计流量
+            // 吉祥物可见时（32px + 8px 间距）从右列扣，否则中列会被挤到 min-width 以下，
+            // 网络速率又回到「压右列」的老问题。
             VerticalLayout {
-                width: 38%;
+                width: root.mascot-visible ? 30% : 38%;
                 spacing: 4px;
                 Text {
                     height: 18px;
@@ -376,7 +398,7 @@ export component Overlay inherits Window {
                     height: 18px;
                     vertical-alignment: center;
                     text: root.paused ? "显示已暂停 · 后台采集" : root.last-heartbeat;
-                    color: root.paused ? root.event-color : root.hb-color;
+                    color: root.paused ? root.paused-color : root.hb-color;
                     font-size: max(9px, root.text-size - 4px);
                     overflow: elide;
                     Tooltip { text: @markdown("\{root.heartbeat-tooltip}"); }
@@ -415,16 +437,16 @@ export component Overlay inherits Window {
                 ? root.skin-border-color.with-alpha(0.75)
                 : root.skin-border-color.with-alpha(0.35);
             background: root.paused
-                ? root.event-color.with-alpha(0.12)
+                ? root.paused-color.with-alpha(0.12)
                 : root.label-color.with-alpha(0.07);
             Text {
                 width: 100%;
                 height: 100%;
                 horizontal-alignment: center;
                 vertical-alignment: center;
-                text: root.paused ? "恢复" : "暂停";
+                text: root.pause-text;
                 color: root.pause-enabled
-                    ? (root.paused ? root.event-color : root.label-color)
+                    ? (root.paused ? root.paused-color : root.label-color)
                     : root.hb-color.with-alpha(0.55);
                 font-size: max(9px, root.text-size - 4px);
                 Tooltip { text: @markdown("\{root.pause-tooltip}"); }

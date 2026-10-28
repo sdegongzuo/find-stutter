@@ -300,9 +300,8 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
     ui.set_net_color(text_color);
     ui.set_hb_color(hb_gray);
 
-    // 0b) 布局模式仍保留在皮肤协议中；Slint 侧 card / bubble 已统一网格，
-    // 仅由皮肤配色、尺寸和可选吉祥物区分。
-    ui.set_layout_mode(SharedString::from(if is_bubble { "bubble" } else { "card" }));
+    // 0b) 布局模式不进 Slint：card / bubble 已统一网格，仅由皮肤配色、尺寸和
+    // 可选吉祥物区分（旧的 layout-mode 属性没有任何消费方，已删除）。
 
     // 0c) 吉祥物图片（皮肤可选；路径变化时才重新读盘）
     let mascot_key = skin

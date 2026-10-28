@@ -67,6 +67,42 @@ pub fn hide_console_for_gui() {
 #[cfg(not(windows))]
 pub fn hide_console_for_gui() {}
 
+/// 把 CLI 子命令的输出接回**父进程的控制台**（仅 GUI 子系统构建需要）。
+///
+/// release 编成 GUI 子系统后，进程启动时不会分配控制台，标准输出句柄是无效的，
+/// 直接 `println!` 什么都不会出现。从 cmd / PowerShell 里跑子命令时，控制台属于
+/// 父进程，因此 `AttachConsole(ATTACH_PARENT_PROCESS)` 就能把输出接上去。
+///
+/// **已被重定向时不动作**：stdout/stderr 若是有效的管道或文件句柄（脚本 `> out.txt`、
+/// agent 抓取输出、CI），说明父进程已经安排好了落点，再去 Attach 反而会把日志写错地方。
+///
+/// 已知副作用：cmd 不会等待 GUI 子系统进程退出，交互式跑会出现"提示符先回来、
+/// 输出后到"的错位观感；脚本里用 `start /wait` 或直接重定向即可。
+#[cfg(windows)]
+pub fn attach_parent_console_for_cli() {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    fn ok(h: windows::core::Result<HANDLE>) -> bool {
+        match h {
+            Ok(h) => !h.is_invalid(),
+            Err(_) => false,
+        }
+    }
+
+    unsafe {
+        if ok(GetStdHandle(STD_OUTPUT_HANDLE)) || ok(GetStdHandle(STD_ERROR_HANDLE)) {
+            return; // 已重定向（管道/文件），保持原样
+        }
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn attach_parent_console_for_cli() {}
+
 /// 让窗口不出现在 **Windows 系统任务栏**（工具窗口样式 `WS_EX_TOOLWINDOW`）。
 ///
 /// 悬浮窗 / 进程详情页 / 任务栏窗口都适用：设置后窗口不占系统任务栏按钮，
@@ -414,6 +450,23 @@ pub enum RowMenuCmd {
     Detail = 4,
 }
 
+impl RowMenuCmd {
+    /// 命令码 → 命令（`TrackPopupMenu` 的返回值）。
+    ///
+    /// 生产分支与单测共用这一份映射：此前单测里另写了一份同样的 `match`，
+    /// 于是「加了新菜单项但忘了改生产分支」照样全绿（假阳性）。
+    /// 返回 `None` 表示 `0`（点标题行/取消）或未知命令码。
+    pub fn from_id(id: u32) -> Option<Self> {
+        match id {
+            1 => Some(Self::OpenLocation),
+            2 => Some(Self::Kill),
+            3 => Some(Self::KillTree),
+            4 => Some(Self::Detail),
+            _ => None,
+        }
+    }
+}
+
 /// 鼠标右键虚拟键码（`GetAsyncKeyState` 检测右键按下 / 释放用）。
 /// 模块级常量：`show_row_menu_once` 与 `wait_rbutton_release` 共用。
 pub const VK_RBUTTON: i32 = 0x02;
@@ -479,25 +532,33 @@ pub fn show_row_menu_once(
         let _ = AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 0, wide(&title));
         // 分隔线
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, windows::core::PCWSTR(std::ptr::null()));
+        // 服务明细行（pid=0）不是真实进程：详情/定位/终止全部置灰。
+        // 「查看详情」此前无条件可点，点了会在 cache 里查不到 pid=0 的行，
+        // 弹出标题为「PID 0 (PID 0)」、字段全空的空壳面板。
+        let item_flags = if pid > 0 { MF_STRING } else { MF_GRAYED };
         // 查看详情（与双击行等价：弹出全窗详情面板）
         let _ = AppendMenuW(
             hmenu,
-            MF_STRING,
+            item_flags,
             RowMenuCmd::Detail as usize,
             wide("查看详情"),
         );
         // 服务条目（pid<=0）没有可定位的可执行文件 → 置灰「打开文件所在的位置」
-        let locate_flags = if pid <= 0 { MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(
             hmenu,
-            locate_flags,
+            item_flags,
             RowMenuCmd::OpenLocation as usize,
             wide("打开文件所在的位置"),
         );
-        let _ = AppendMenuW(hmenu, MF_STRING, RowMenuCmd::Kill as usize, wide("停止进程"));
+        let _ = AppendMenuW(
+            hmenu,
+            item_flags,
+            RowMenuCmd::Kill as usize,
+            wide("停止进程"),
+        );
         // 结束进程树：连子进程一起终止（任务管理器同款入口）。
         // 仅当该进程确实有后代时才显示——无可杀子树时该入口无意义。
-        if kill_tree_enabled {
+        if kill_tree_enabled && pid > 0 {
             let _ = AppendMenuW(
                 hmenu,
                 MF_STRING,
@@ -527,13 +588,10 @@ pub fn show_row_menu_once(
         // TrackPopupMenu 的模态循环会"吞掉"up 事件 → 复位 winit/Slint 鼠标状态机
         reset_mouse_state_after_menu(hwnd);
 
-        match cmd.0 as u32 {
-            1 => RowMenuOutcome::Command(RowMenuCmd::OpenLocation),
-            2 => RowMenuOutcome::Command(RowMenuCmd::Kill),
-            3 => RowMenuOutcome::Command(RowMenuCmd::KillTree),
-            4 => RowMenuOutcome::Command(RowMenuCmd::Detail),
-            _ if right_clicked_away => RowMenuOutcome::Switch,
-            _ => RowMenuOutcome::Cancelled,
+        match RowMenuCmd::from_id(cmd.0 as u32) {
+            Some(c) => RowMenuOutcome::Command(c),
+            None if right_clicked_away => RowMenuOutcome::Switch,
+            None => RowMenuOutcome::Cancelled,
         }
     }
 }
@@ -1034,21 +1092,33 @@ mod tests {
         assert_eq!(RowMenuCmd::Detail as u32, 4);
     }
 
-    /// 验证：命令码到枚举的映射（show_row_menu 的返回逻辑）
+    /// 验证：命令码到枚举的映射（生产分支与单测共用 `RowMenuCmd::from_id`）
     #[test]
     fn row_menu_cmd_from_trackpopup_value() {
-        let map = |v: u32| match v {
-            1 => Some(RowMenuCmd::OpenLocation),
-            2 => Some(RowMenuCmd::Kill),
-            3 => Some(RowMenuCmd::KillTree),
-            4 => Some(RowMenuCmd::Detail),
-            _ => None,
-        };
-        assert_eq!(map(1), Some(RowMenuCmd::OpenLocation));
-        assert_eq!(map(2), Some(RowMenuCmd::Kill));
-        assert_eq!(map(3), Some(RowMenuCmd::KillTree));
-        assert_eq!(map(4), Some(RowMenuCmd::Detail));
-        assert_eq!(map(0), None); // 用户取消
-        assert_eq!(map(99), None);
+        assert_eq!(RowMenuCmd::from_id(1), Some(RowMenuCmd::OpenLocation));
+        assert_eq!(RowMenuCmd::from_id(2), Some(RowMenuCmd::Kill));
+        assert_eq!(RowMenuCmd::from_id(3), Some(RowMenuCmd::KillTree));
+        assert_eq!(RowMenuCmd::from_id(4), Some(RowMenuCmd::Detail));
+        assert_eq!(RowMenuCmd::from_id(0), None); // 用户取消 / 点标题行
+        assert_eq!(RowMenuCmd::from_id(99), None);
+    }
+
+    /// 命令码与枚举取值必须处处一致：`from_id(cmd as u32) == Some(cmd)`。
+    /// 新增菜单项时这条会先红，避免「加了变体忘了进 from_id」。
+    #[test]
+    fn row_menu_cmd_round_trips_through_from_id() {
+        for cmd in [
+            RowMenuCmd::OpenLocation,
+            RowMenuCmd::Kill,
+            RowMenuCmd::KillTree,
+            RowMenuCmd::Detail,
+        ] {
+            assert_eq!(
+                RowMenuCmd::from_id(cmd as u32),
+                Some(cmd),
+                "命令码 {} 在 from_id 里缺失或映射错位",
+                cmd as u32
+            );
+        }
     }
 }

@@ -374,9 +374,27 @@ fn collect_exe_candidates() -> Vec<PathBuf> {
     out
 }
 
+/// 构造一个**不弹控制台窗口**的子进程。
+///
+/// GUI 自身是 GUI 子系统（没有控制台），此时 spawn 任何控制台程序
+/// （`where` / `find-stutter-service.exe`），Windows 都会给子进程新建一个
+/// 控制台窗口 —— 就是启动时"黑框闪一下"的来源之一。`CREATE_NO_WINDOW`
+/// 让子进程在无窗口的新控制台里跑，从源头掐掉。
+fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 #[cfg(windows)]
 fn which_service_exe() -> Option<PathBuf> {
-    let output = std::process::Command::new("where")
+    let output = hidden_command("where")
         .arg("find-stutter-service")
         .output()
         .ok()?;
@@ -389,7 +407,7 @@ fn which_service_exe() -> Option<PathBuf> {
 
 #[cfg(not(windows))]
 fn which_service_exe() -> Option<PathBuf> {
-    let output = std::process::Command::new("which")
+    let output = hidden_command("which")
         .arg("find-stutter-service")
         .output()
         .ok()?;
@@ -402,7 +420,7 @@ fn which_service_exe() -> Option<PathBuf> {
 
 /// 同步执行 service 子命令，返回退出码。
 fn run_service_cmd(exe: &Path, args: &[&str]) -> std::io::Result<i32> {
-    let output = std::process::Command::new(exe)
+    let output = hidden_command(exe)
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
