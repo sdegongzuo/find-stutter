@@ -1086,6 +1086,31 @@ pub fn process_detail(pid: u32, name: &str, row: Option<&ProcessRow>, nb_cpus: u
     lines.join("\n")
 }
 
+/// 打开进程详情面板（双击行 / 行右键「查看详情」共用）：
+/// 按 pid 从当前快照取行 → 生成详情文本 → 显示全窗面板，
+/// 并摘掉本窗口的原生边缘缩放子类让位给面板交互。
+fn open_process_detail(
+    ui: &crate::ProcessList,
+    pid: u32,
+    cache: &Mutex<Vec<ProcessRow>>,
+    nb_cpus: &Mutex<usize>,
+    detail_text: &Mutex<String>,
+) {
+    let row = cache.lock().unwrap().iter().find(|r| r.pid == pid).cloned();
+    let name = row
+        .as_ref()
+        .map(|r| r.name.clone())
+        .unwrap_or_else(|| format!("PID {}", pid));
+    let detail = process_detail(pid, &name, row.as_ref(), *nb_cpus.lock().unwrap());
+    *detail_text.lock().unwrap() = detail.clone(); // 供「复制」按钮使用
+    ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid)));
+    ui.set_detail_text(SharedString::from(detail));
+    ui.set_detail_visible(true);
+    // 详情面板为全窗遮罩：摘掉本窗口的原生边缘缩放子类，边缘热区
+    // 让位给面板交互（按窗口装/卸，无全局状态，关窗不会残留）
+    crate::window::uninstall_native_resize(ui.window());
+}
+
 /// 进程命令行（sysinfo `cmd()`；失败返回 None）。
 #[cfg(windows)]
 fn process_cmdline(pid: u32) -> Option<String> {
@@ -2438,7 +2463,8 @@ impl ProcessListWindow {
             }
         });
 
-        // 行右键菜单 → 顶部标题 + 「打开文件所在的位置」/「停止进程」（原生菜单）
+        // 行右键菜单 → 顶部标题 + 「查看详情」/「打开文件所在的位置」/「停止进程」
+        // （原生菜单；有子进程时追加「结束进程树」）
         // 弹出位置：show_row_menu_once 内部用 GetCursorPos() 取鼠标屏幕坐标。
         // 连续右键切换：菜单被右键点击外部关闭时，命中测试鼠标新位置，
         // 若落在另一行则立即重弹该行菜单（无需先关闭再右键）。
@@ -2449,6 +2475,8 @@ impl ProcessListWindow {
         let expanded_rowmenu = expanded.clone();
         let shared_rowmenu = shared.clone();
         let sample_now_rowmenu = sample_now.clone();
+        let nb_cpus_rowmenu = nb_cpus.clone();
+        let detail_text_rowmenu = detail_text.clone();
         ui.on_row_context_menu(move |pid: i32, name: slint::SharedString| {
             use crate::window::{RowMenuCmd, RowMenuOutcome};
             log::info!("row-context-menu: pid={} name={}", pid, name);
@@ -2525,6 +2553,18 @@ impl ProcessListWindow {
                             }
                             break;
                         }
+                        RowMenuOutcome::Command(RowMenuCmd::Detail) => {
+                            // 查看详情（与双击行等价）：弹全窗详情面板后结束菜单流程
+                            open_process_detail(
+                                &ui,
+                                cur_pid as u32,
+                                &cache_rowmenu,
+                                &nb_cpus_rowmenu,
+                                &detail_text_rowmenu,
+                            );
+                            log::info!("右键菜单查看进程 {} 详情", cur_pid);
+                            break;
+                        }
                         RowMenuOutcome::Switch => {
                             // 右键点击菜单外关闭 → 尝试切换到新位置的行
                             // 等右键释放（若用户按住右键移动）
@@ -2592,29 +2632,13 @@ impl ProcessListWindow {
                 return; // 单击无动作（等第二次点击判定双击）
             }
             if let Some(ui) = weak_click_ui.upgrade() {
-                let row = cache_click
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .find(|r| r.pid == pid_u32)
-                    .cloned();
-                let name = row
-                    .as_ref()
-                    .map(|r| r.name.clone())
-                    .unwrap_or_else(|| format!("PID {}", pid_u32));
-                let detail = process_detail(
+                open_process_detail(
+                    &ui,
                     pid_u32,
-                    &name,
-                    row.as_ref(),
-                    *nb_cpus_click.lock().unwrap(),
+                    &cache_click,
+                    &nb_cpus_click,
+                    &detail_text_click,
                 );
-                *detail_text_click.lock().unwrap() = detail.clone(); // 供「复制」按钮使用
-                ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid_u32)));
-                ui.set_detail_text(SharedString::from(detail));
-                ui.set_detail_visible(true);
-                // 详情面板为全窗遮罩：摘掉本窗口的原生边缘缩放子类，边缘热区
-                // 让位给面板交互（按窗口装/卸，无全局状态，关窗不会残留）
-                crate::window::uninstall_native_resize(ui.window());
                 log::info!("双击进程 {} 打开详情", pid_u32);
             }
         });

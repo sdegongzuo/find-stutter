@@ -410,6 +410,8 @@ pub enum RowMenuCmd {
     Kill = 2,
     /// 结束进程树（连子进程一起终止）
     KillTree = 3,
+    /// 查看进程详情（打开详情面板；与双击行等价）
+    Detail = 4,
 }
 
 /// 鼠标右键虚拟键码（`GetAsyncKeyState` 检测右键按下 / 释放用）。
@@ -420,7 +422,7 @@ pub const VK_RBUTTON: i32 = 0x02;
 /// 编译器保证不出现 `(None, Command)` 这类非法组合）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowMenuOutcome {
-    /// 用户选择了命令（打开位置 / 停止进程）
+    /// 用户选择了命令（查看详情 / 打开位置 / 停止进程 / 结束进程树）
     Command(RowMenuCmd),
     /// 菜单被**右键**点击外部关闭（用户在别处又按了右键 → 可能想切换进程，
     /// 调用方应命中测试鼠标新位置，若在另一行则重新弹出）
@@ -429,8 +431,8 @@ pub enum RowMenuOutcome {
     Cancelled,
 }
 
-/// 弹一次行右键菜单（顶部标题行 + 「打开文件所在的位置」+「停止进程」，有子进程时
-/// 追加「结束进程树」），**不循环**。返回 [`RowMenuOutcome`]：
+/// 弹一次行右键菜单（顶部标题行 + 「查看详情」+「打开文件所在的位置」+「停止进程」，
+/// 有子进程时追加「结束进程树」），**不循环**。返回 [`RowMenuOutcome`]：
 ///
 /// - `Command(cmd)`：用户选择了菜单项
 /// - `Switch`：菜单被**右键**点击外部关闭 → 连续右键切换流程
@@ -477,6 +479,13 @@ pub fn show_row_menu_once(
         let _ = AppendMenuW(hmenu, MF_GRAYED | MF_STRING, 0, wide(&title));
         // 分隔线
         let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, windows::core::PCWSTR(std::ptr::null()));
+        // 查看详情（与双击行等价：弹出全窗详情面板）
+        let _ = AppendMenuW(
+            hmenu,
+            MF_STRING,
+            RowMenuCmd::Detail as usize,
+            wide("查看详情"),
+        );
         // 服务条目（pid<=0）没有可定位的可执行文件 → 置灰「打开文件所在的位置」
         let locate_flags = if pid <= 0 { MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(
@@ -522,6 +531,7 @@ pub fn show_row_menu_once(
             1 => RowMenuOutcome::Command(RowMenuCmd::OpenLocation),
             2 => RowMenuOutcome::Command(RowMenuCmd::Kill),
             3 => RowMenuOutcome::Command(RowMenuCmd::KillTree),
+            4 => RowMenuOutcome::Command(RowMenuCmd::Detail),
             _ if right_clicked_away => RowMenuOutcome::Switch,
             _ => RowMenuOutcome::Cancelled,
         }
@@ -1015,12 +1025,13 @@ mod tests {
 
     // ===== RowMenuCmd（进程详情行右键菜单命令）=====
 
-    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3）
+    /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3/4）
     #[test]
     fn row_menu_cmd_ids_stable() {
         assert_eq!(RowMenuCmd::OpenLocation as u32, 1);
         assert_eq!(RowMenuCmd::Kill as u32, 2);
         assert_eq!(RowMenuCmd::KillTree as u32, 3);
+        assert_eq!(RowMenuCmd::Detail as u32, 4);
     }
 
     /// 验证：命令码到枚举的映射（show_row_menu 的返回逻辑）
@@ -1030,11 +1041,13 @@ mod tests {
             1 => Some(RowMenuCmd::OpenLocation),
             2 => Some(RowMenuCmd::Kill),
             3 => Some(RowMenuCmd::KillTree),
+            4 => Some(RowMenuCmd::Detail),
             _ => None,
         };
         assert_eq!(map(1), Some(RowMenuCmd::OpenLocation));
         assert_eq!(map(2), Some(RowMenuCmd::Kill));
         assert_eq!(map(3), Some(RowMenuCmd::KillTree));
+        assert_eq!(map(4), Some(RowMenuCmd::Detail));
         assert_eq!(map(0), None); // 用户取消
         assert_eq!(map(99), None);
     }
