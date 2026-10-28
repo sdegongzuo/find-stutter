@@ -30,6 +30,8 @@ component ClickableValue inherits Rectangle {
     in property <string> text;
     in property <color> text-color: #1e1e2e;
     in property <length> font-size: 14px;
+    // 资源数值强调（600）；「今日卡顿」是入口而非指标，用 400 保持弱化
+    in property <int> font-weight: 600;
     in property <bool> hovered: false;
     in property <string> tooltip-text: "点击查看进程详情";
     property <length> pad-x: 3px;
@@ -47,7 +49,7 @@ component ClickableValue inherits Rectangle {
         text: root.text;
         color: root.text-color;
         font-size: root.font-size;
-        font-weight: 600;
+        font-weight: root.font-weight;
         overflow: elide;
     }
     // 保留下划线作为详情入口提示，但降低常态视觉噪声。
@@ -369,13 +371,16 @@ export component Overlay inherits Window {
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
-                main-event-text := Text {
-                    height: 18px;
-                    vertical-alignment: center;
+                // 「今日卡顿 N」也是入口（点开卡顿分析），必须和资源数值一样有
+                // 下划线与 hover 底色——否则同一窗口里三个数字两个可点提示、
+                // 一个没有，用户根本不知道它能点。字重 400：它是入口不是指标。
+                main-event-text := ClickableValue {
                     text: root.event-count;
-                    color: root.event-color;
+                    text-color: root.event-color;
                     font-size: max(11px, root.text-size - 2px);
-                    Tooltip { text: @markdown("今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析"); }
+                    font-weight: 400;
+                    tooltip-text: "今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析";
+                    hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
 
