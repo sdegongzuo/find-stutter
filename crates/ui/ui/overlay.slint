@@ -1,26 +1,20 @@
-// find-stutter overlay (沉浸模式)
+// find-stutter overlay（沉浸式三列网格）
 //
-// 布局（P3+）：
-//   ┌────────────────────────────────────────┐
-//   │  CPU  XX%       GPU  XX%        ● 绿    │  ← 指标 + 服务角标（无独立状态条）
-//   │  MEM  XX%       ↑  XX/s  ↑ X.XG        │  ← 网速/当日流量各两行：上行、下行
-//   │  今日卡顿: 0     ↓  XX/s  ↓ X.XG（悬浮=本周）│  ← 操作收敛到右下
-//   └────────────────────────────────────────┘
+//   ┌──────────────────────────────────────────────┐
+//   │ CPU 23%     上传 2.7 KB/s   ● 服务运行中  暂停 │
+//   │ 内存 94%    下载 2.4 KB/s   最近心跳 12:49:57   │
+//   │ GPU --      今日卡顿 1      今日 ↑439M ↓2.7G    │
+//   └──────────────────────────────────────────────┘
 //
-// 沉浸感要点：
-//   - 整窗无 border / 无分割 Rectangle，所有元素共享统一半透背景
-//   - 服务健康状态缩成右上角小角标（● + 状态文字），不占独立高度
-//   - 暂停按钮也下移到底部，不顶在指标中段
-//   - 窗口高度从 90px 收到 78px（去掉独立状态条）
+// 设计要点：
+//   - card / bubble 共用同一三列三行网格，仅由皮肤改变配色、尺寸和吉祥物；
+//     避免两套布局的基线、命中区和文案各自漂移。
+//   - 标签弱化、数值加粗；CPU / 内存按 80% 预警、90%/95% 严重分级着色。
+//   - 今日卡顿 0 时弱化，非 0 才用琥珀色强调，不与真实资源危险抢注意力。
+//   - 暂停按钮固定在右侧垂直居中，文案明确为“暂停/恢复”；后台服务继续采集。
+//   - 心跳由 Rust 转为本地时区后显示，避免 UTC 直出导致慢 8 小时。
 //
-// 皮肤：所有颜色/字号/尺寸均为 in property（由 Rust 端按 skin.toml 注入），
-// 默认值与 skins/default/skin.toml 保持一致。
-//
-// 布局模式（皮肤 layout 字段，Rust 端注入 layout-mode）：
-//   - "card"（默认）：三列白卡布局
-//   - "bubble"：三列绿色气泡布局，与 card 同为完整指标集（上传/下载/CPU/内存/
-//     GPU/今日卡顿/服务状态/心跳/当日流量），仅配色与尺寸不同；见背板内第二个
-//     内容块。暂停区为右侧常驻图标（x: width-24..width-4），始终显示
+// 皮肤：颜色/字号/尺寸均由 Rust 端按 skin.toml 注入。
 
 import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from "std-widgets.slint";
 // 卡顿分析页面组件（PRD M1）：直接作为顶层组件定义在本文件末尾（export component
@@ -35,13 +29,13 @@ import { Button, CheckBox, ComboBox, LineEdit, ListView, StandardListView } from
 component ClickableValue inherits Rectangle {
     in property <string> text;
     in property <color> text-color: #1e1e2e;
-    in property <length> font-size: 13px;
+    in property <length> font-size: 14px;
     in property <bool> hovered: false;
-    property <length> pad-x: 4px;
-    height: 16px;
+    in property <string> tooltip-text: "点击查看进程详情";
+    property <length> pad-x: 3px;
+    height: 18px;
     width: value-text.preferred-width + 2 * self.pad-x;
-    // 悬浮浅色底：用文字色低透明度，白卡 / 绿气泡都能适配
-    background: root.hovered ? root.text-color.with-alpha(0.15) : transparent;
+    background: root.hovered ? root.text-color.with-alpha(0.12) : transparent;
     border-radius: 3px;
 
     value-text := Text {
@@ -53,17 +47,19 @@ component ClickableValue inherits Rectangle {
         text: root.text;
         color: root.text-color;
         font-size: root.font-size;
+        font-weight: 600;
         overflow: elide;
     }
-    // 下划线：常驻（标示可点击），悬浮加深
+    // 保留下划线作为详情入口提示，但降低常态视觉噪声。
     Rectangle {
         x: root.pad-x;
         y: root.height - 2px;
         width: root.width - 2 * root.pad-x;
         height: 1px;
         background: root.text-color;
-        opacity: root.hovered ? 0.95 : 0.4;
+        opacity: root.hovered ? 0.9 : 0.25;
     }
+    Tooltip { text: @markdown("\{root.tooltip-text}"); }
 }
 
 export component Overlay inherits Window {
@@ -91,12 +87,12 @@ export component Overlay inherits Window {
     in property <color> gpu-color: #1e1e2e;
     in property <color> net-color: #1e1e2e;
     in property <color> hb-color: #8a8a92;
+    in property <color> label-color: #7b7b85;
     in property <length> text-size: 13px;
 
     // === P3: 服务健康状态（角标模式：● + 文字，融进主区）===
     in property <string> service-status: "● 检测中";
     in property <brush> service-status-color: #888;
-    in property <float> service-bar-height: 0.0;
 
     // === 指标 ===
     // 标签与数字拆开：只有数字（ClickableValue）可点击弹出进程弹窗，
@@ -105,40 +101,37 @@ export component Overlay inherits Window {
     in property <string> cpu-value: "--";
     in property <string> mem-label: "内存";
     in property <string> mem-value: "--";
-    in property <string> gpu-text: "GPU  --";
-    in property <string> net-send-label: "↑";
+    in property <string> gpu-label: "GPU";
+    in property <string> gpu-value: "--";
+    in property <string> net-send-label: "上传";
     in property <string> net-send-value: "--";
-    in property <string> net-recv-label: "↓";
+    in property <string> net-recv-label: "下载";
     in property <string> net-recv-value: "--";
     // 当日累计网络流量（默认显示；↑ 上行 / ↓ 下行分开，统计口径见 reader / sum_network_traffic）
     in property <string> net-today-up: "↑ --";
     in property <string> net-today-down: "↓ --";
     // 当周（周一起）流量明细 tooltip 文本（多行；鼠标悬浮任一流量文本时显示）
     in property <string> net-week-tip: "";
-    in property <string> event-count: "今日卡顿: 0";
-    in property <string> last-heartbeat: "";
+    in property <string> event-count: "今日卡顿 0";
+    in property <string> last-heartbeat: "最近心跳 --";
 
-    // === 布局模式（皮肤 layout 字段，Rust 端注入）===
-    // "card"   = 三列白卡（默认，上方原有布局）
-    // "bubble" = 2×2 绿色迷你气泡（上传/下载/CPU/内存）
+    // card 与 bubble 共用同一三列网格，皮肤只改变配色、尺寸和可选吉祥物。
     in property <string> layout-mode: "card";
-    // bubble 布局的 2×2 网格：标签与数字拆开（数字可点击）
-    in property <string> bubble-up-label: "上传:";
-    in property <string> bubble-up-value: "--";
-    in property <string> bubble-down-label: "下载:";
-    in property <string> bubble-down-value: "--";
-    in property <string> bubble-cpu-label: "CPU:";
-    in property <string> bubble-cpu-value: "--";
-    in property <string> bubble-mem-label: "内存:";
-    in property <string> bubble-mem-value: "--";
     in property <string> bubble-tip: "";
     // 可选吉祥物图片（皮肤 mascot 字段；未配置/加载失败时隐藏）
     in property <image> mascot-image;
     in property <bool> mascot-visible: false;
 
-    // === 暂停按钮（服务停止时禁用）===
+    // === 暂停界面刷新（后台服务仍采集；服务停止时禁用）===
     in property <bool> pause-enabled: true;
     in-out property <bool> paused: false;
+    out property <string> pause-text: root.paused ? "恢复刷新" : "暂停刷新";
+    out property <string> pause-tooltip: root.paused
+        ? "点击恢复界面刷新；暂停期间后台服务仍持续采集"
+        : "仅暂停界面刷新与卡顿通知，后台服务仍持续采集";
+    out property <string> heartbeat-tooltip: root.paused
+        ? root.pause-tooltip
+        : "最近一次服务心跳时间（已转为本地时区）";
     callback toggle-pause();
 
     // === 拖动 + 右键菜单 ===
@@ -158,41 +151,34 @@ export component Overlay inherits Window {
     // 资源区左键点击：点 CPU / 内存 / 网络文字区 → 打开按该维度排序的进程弹窗。
     // 参数 "cpu" / "mem" / "net"；未命中返回 ""（Rust 端忽略）。
     callback resource-clicked(string);
+    // 点「今日卡顿」→ 打开卡顿分析窗口（默认今日范围）。
+    callback event-count-clicked();
 
     // === 资源区命中判定（全窗口 TouchArea 用坐标判定，见 ta.clicked）===
-    // 只命中数字（ClickableValue）的矩形：用元素 absolute-position + 宽高精确判定，
-    // 点标签 / GPU / 空白都不触发。card 与 bubble 各自一套。
+    // card / bubble 共用同一网格，只有数字（ClickableValue）矩形可点；
+    // 标签 / GPU / 空白都不触发，避免布局调整后两套坐标漂移。
     function in-elem(px: length, py: length, rx: length, ry: length, rw: length, rh: length) -> bool {
         return px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
     }
-    function card-hit(x: length, y: length) -> string {
-        if (root.in-elem(x, y, card-cpu-value.absolute-position.x, card-cpu-value.absolute-position.y, card-cpu-value.width, card-cpu-value.height)) { return "cpu"; }
-        if (root.in-elem(x, y, card-mem-value.absolute-position.x, card-mem-value.absolute-position.y, card-mem-value.width, card-mem-value.height)) { return "mem"; }
-        if (root.in-elem(x, y, card-net-send-value.absolute-position.x, card-net-send-value.absolute-position.y, card-net-send-value.width, card-net-send-value.height)
-            || root.in-elem(x, y, card-net-recv-value.absolute-position.x, card-net-recv-value.absolute-position.y, card-net-recv-value.width, card-net-recv-value.height)) { return "net"; }
-        return "";
-    }
-    function bubble-hit(x: length, y: length) -> string {
-        if (root.in-elem(x, y, bubble-cpu-value.absolute-position.x, bubble-cpu-value.absolute-position.y, bubble-cpu-value.width, bubble-cpu-value.height)) { return "cpu"; }
-        if (root.in-elem(x, y, bubble-mem-value.absolute-position.x, bubble-mem-value.absolute-position.y, bubble-mem-value.width, bubble-mem-value.height)) { return "mem"; }
-        if (root.in-elem(x, y, bubble-up-value.absolute-position.x, bubble-up-value.absolute-position.y, bubble-up-value.width, bubble-up-value.height)
-            || root.in-elem(x, y, bubble-down-value.absolute-position.x, bubble-down-value.absolute-position.y, bubble-down-value.width, bubble-down-value.height)) { return "net"; }
-        return "";
-    }
     function resource-kind(x: length, y: length) -> string {
-        return root.layout-mode == "bubble" ? root.bubble-hit(x, y) : root.card-hit(x, y);
+        if (root.in-elem(x, y, main-cpu-value.absolute-position.x, main-cpu-value.absolute-position.y, main-cpu-value.width, main-cpu-value.height)) { return "cpu"; }
+        if (root.in-elem(x, y, main-mem-value.absolute-position.x, main-mem-value.absolute-position.y, main-mem-value.width, main-mem-value.height)) { return "mem"; }
+        if (root.in-elem(x, y, main-net-send-value.absolute-position.x, main-net-send-value.absolute-position.y, main-net-send-value.width, main-net-send-value.height)
+            || root.in-elem(x, y, main-net-recv-value.absolute-position.x, main-net-recv-value.absolute-position.y, main-net-recv-value.width, main-net-recv-value.height)) { return "net"; }
+        return "";
+    }
+    function event-count-hit(x: length, y: length) -> bool {
+        return root.in-elem(x, y, main-event-text.absolute-position.x, main-event-text.absolute-position.y, main-event-text.width, main-event-text.height);
     }
     // 数字悬浮高亮：元素自身矩形内
     function hovering(el-x: length, el-y: length, el-w: length, el-h: length) -> bool {
         return ta.has-hover && root.in-elem(ta.mouse-x, ta.mouse-y, el-x, el-y, el-w, el-h);
     }
-    // 暂停按钮热区（与 ta.clicked 原判定一致，抽出复用）
+    // 暂停按钮热区：card / bubble 均固定在右侧垂直居中。
+    // 热区略大于视觉按钮（34×24），保证高 DPI 下仍容易点中。
     function pause-hit(x: length, y: length) -> bool {
-        if (root.layout-mode == "bubble") {
-            return x >= root.width - 36px && x <= root.width - 6px
-                && y >= (root.height - 32px) / 2 && y <= (root.height + 32px) / 2;
-        }
-        return x >= root.width - 6px - 96px && x <= root.width - 6px && y >= 52px && y <= 68px;
+        return x >= root.width - 46px && x <= root.width - 4px
+            && y >= (root.height - 32px) / 2 && y <= (root.height + 32px) / 2;
     }
 
     // 命名 ta 供 bubble 暂停悬浮区引用（has-hover / mouse-x）
@@ -218,6 +204,8 @@ export component Overlay inherits Window {
             if (root.pause-enabled && root.pause-hit(self.pressed-x, self.pressed-y)) {
                 root.paused = !root.paused;
                 root.toggle-pause();
+            } else if (root.event-count-hit(self.pressed-x, self.pressed-y)) {
+                root.event-count-clicked();
             } else {
                 // 仅命中资源区（CPU/内存/网络）才发回调，其余空白/GPU 区忽略
                 if (root.resource-kind(self.pressed-x, self.pressed-y) != "") {
@@ -236,267 +224,211 @@ export component Overlay inherits Window {
         border-color: root.skin-border-color;
         border-radius: root.skin-border-radius;
 
-        // 指标网格：外层容器垂直居中（行高 16px×3 + 行距 5px×2 = 58px，
-        // y=(高-58)/2 → 任意窗口高度下上下留白严格一致）
-        // 仅 card 布局显示（bubble 布局见下方内容块）
-        VerticalLayout {
-            visible: root.layout-mode == "card";
-            y: (parent.height - 58px) / 2;
-            height: 58px;
-            width: 100%;
-            HorizontalLayout {
-                // 只留左右 padding（上下由外层容器控制，避免二次留白导致偏移）
-                padding-left: 6px;
-                padding-right: 6px;
-                spacing: 5.6px; // 列间距（原 8px，缩小 30%）
-
-                // 左列（28%）：三行固定高 16px，与中/右列严格对齐
-                VerticalLayout {
-                    spacing: 5px;
-                    width: 28%;
-                    // 行内用容器 + 显式定位（不用 HorizontalLayout：标签会被拉伸，
-                    // 把数字推到右侧）。标签紧贴，数字紧跟其后。
-                    Rectangle {
-                        height: 16px;
-                        card-cpu-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.cpu-label; color: root.cpu-color; font-size: root.text-size; }
-                        card-cpu-value := ClickableValue {
-                            x: card-cpu-lbl.preferred-width + 2px;
-                            text: root.cpu-value;
-                            text-color: root.cpu-color;
-                            font-size: root.text-size;
-                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                        }
-                    }
-                    Rectangle {
-                        height: 16px;
-                        card-mem-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.mem-label; color: root.mem-color; font-size: root.text-size; }
-                        card-mem-value := ClickableValue {
-                            x: card-mem-lbl.preferred-width + 2px;
-                            text: root.mem-value;
-                            text-color: root.mem-color;
-                            font-size: root.text-size;
-                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                        }
-                    }
-                    Text { height: 16px; vertical-alignment: center; text: event-count; color: root.event-color; font-size: max(10px, root.text-size - 3px); }
-                }
-
-                // 中列（占剩余空间）：GPU / 网速+当日上行 / 网速+当日下行
-                VerticalLayout {
-                    spacing: 5px;
-                    Text { height: 16px; vertical-alignment: center; text: gpu-text; color: root.gpu-color; font-size: max(12px, root.text-size - 1px); }
-                    // 网速左、当日累计流量右：↑ 行=上传，↓ 行=下载（替代原「磁盘读写速率」位）；
-                    // 鼠标悬浮任一流量文本弹出当周明细 tooltip
-                    Rectangle {
-                        height: 16px;
-                        card-net-send-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.net-send-label; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
-                        card-net-send-value := ClickableValue {
-                            x: card-net-send-lbl.preferred-width + 2px;
-                            text: root.net-send-value;
-                            text-color: root.net-color;
-                            font-size: max(12px, root.text-size - 1px);
-                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                        }
-                        Text {
-                            x: card-net-send-value.x + card-net-send-value.width + 4px;
-                            width: self.preferred-width;
-                            height: 100%;
-                            vertical-alignment: center;
-                            text: net-today-up;
-                            color: root.net-color;
-                            font-size: max(10px, root.text-size - 3px);
-                            Tooltip { text: @markdown("\{net-week-tip}"); }
-                        }
-                    }
-                    Rectangle {
-                        height: 16px;
-                        card-net-recv-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.net-recv-label; color: root.net-color; font-size: max(12px, root.text-size - 1px); }
-                        card-net-recv-value := ClickableValue {
-                            x: card-net-recv-lbl.preferred-width + 2px;
-                            text: root.net-recv-value;
-                            text-color: root.net-color;
-                            font-size: max(12px, root.text-size - 1px);
-                            hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
-                        }
-                        Text {
-                            x: card-net-recv-value.x + card-net-recv-value.width + 4px;
-                            width: self.preferred-width;
-                            height: 100%;
-                            vertical-alignment: center;
-                            text: net-today-down;
-                            color: root.net-color;
-                            font-size: max(10px, root.text-size - 3px);
-                            Tooltip { text: @markdown("\{net-week-tip}"); }
-                        }
-                    }
-                }
-
-                // 右列（固定 96px）：服务运行中状态 / 心跳 / 暂停按钮（与前两列三行对齐）。
-                // 按钮点击由全窗口 TouchArea 用坐标判断处理（不依赖 z 层级）。
-                VerticalLayout {
-                    spacing: 5px;
-                    width: 96px;
-                    Text {
-                        height: 16px;
-                        vertical-alignment: center;
-                        text: service-status;
-                        color: service-status-color;
-                        font-size: max(10px, root.text-size - 3px);
-                    }
-                    Text {
-                        height: 16px;
-                        vertical-alignment: center;
-                        text: last-heartbeat;
-                        color: root.hb-color;
-                        font-size: max(9px, root.text-size - 4px);
-                    }
-                    Rectangle {
-                        height: 16px;
-                        border-width: 1px;
-                        border-color: root.skin-border-color;
-                        border-radius: 3px;
-                        background: transparent;
-                        Text {
-                            x: 0;
-                            y: 0;
-                            width: 100%;
-                            height: 100%;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            text: root.paused ? "▶" : "⏸";
-                            color: root.pause-enabled ? root.hb-color : #c0c0c0;
-                            font-size: max(10px, root.text-size - 3px);
-                        }
-                    }
-                }
-            }
-        }
-
-        // === bubble 布局（皮肤 layout = "bubble"）：绿色完整指标网格 ===
-        // 与 card 相同的三列三行结构，展示全部指标：
-        //   左列 CPU/内存/GPU、中列 上传/下载/今日卡顿、右列 服务状态/心跳/当日流量。
-        // 气泡配色（浅绿底 + 深灰绿字）由皮肤注入；悬浮任一指标弹出辅助 tooltip；
-        // 右侧为暂停/恢复按钮（图标为窗口级叠层、常驻显示，不占布局空间）。
+        // 统一三列三行网格：card / bubble 共用，仅皮肤配色与尺寸不同。
+        // 行高 18px×3 + 行距 4px×2 = 62px；外层垂直居中，任意高度上下留白一致。
+        // 右侧预留 46px 给暂停按钮，避免文字与操作区重叠。
         HorizontalLayout {
-            visible: root.layout-mode == "bubble";
-            x: 0;
-            y: 0;
+            y: (parent.height - 62px) / 2;
+            height: 62px;
             width: 100%;
-            height: 100%;
             padding-left: 12px;
-            // 预留右侧暂停/恢复图标区（常驻显示，见文件末窗口级叠层），避免压住右列文字
-            padding-right: 30px;
-            padding-top: 10px;
-            padding-bottom: 10px;
+            padding-right: 46px;
             spacing: 8px;
 
             // 左列：CPU / 内存 / GPU
-            // 三列均 horizontal-stretch:1：按各自内容宽度 + 等分剩余空间，
-            // 列间距均匀（原先左列固定 24%、右列固定 32%，中列吃掉剩余 → 中列过宽）。
             VerticalLayout {
-                spacing: 5px;
-                horizontal-stretch: 1;
+                width: 30%;
+                spacing: 4px;
                 Rectangle {
-                    height: 16px;
-                    bubble-cpu-lbl := Text {
+                    height: 18px;
+                    main-cpu-lbl := Text {
                         x: 0;
                         width: self.preferred-width;
                         height: 100%;
                         vertical-alignment: center;
-                        text: root.bubble-cpu-label;
-                        color: root.cpu-color;
-                        font-size: root.text-size;
+                        text: root.cpu-label;
+                        color: root.label-color;
+                        font-size: max(10px, root.text-size - 3px);
                         Tooltip { text: @markdown("\{root.bubble-tip}"); }
                     }
-                    bubble-cpu-value := ClickableValue {
-                        x: bubble-cpu-lbl.preferred-width + 2px;
-                        text: root.bubble-cpu-value;
+                    main-cpu-value := ClickableValue {
+                        x: main-cpu-lbl.preferred-width + 3px;
+                        text: root.cpu-value;
                         text-color: root.cpu-color;
                         font-size: root.text-size;
+                        tooltip-text: "点击查看占用 CPU 最高的进程";
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
                 Rectangle {
-                    height: 16px;
-                    bubble-mem-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-mem-label; color: root.mem-color; font-size: root.text-size; }
-                    bubble-mem-value := ClickableValue {
-                        x: bubble-mem-lbl.preferred-width + 2px;
-                        text: root.bubble-mem-value;
+                    height: 18px;
+                    main-mem-lbl := Text {
+                        x: 0;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.mem-label;
+                        color: root.label-color;
+                        font-size: max(10px, root.text-size - 3px);
+                    }
+                    main-mem-value := ClickableValue {
+                        x: main-mem-lbl.preferred-width + 3px;
+                        text: root.mem-value;
                         text-color: root.mem-color;
                         font-size: root.text-size;
+                        tooltip-text: "点击查看占用内存最高的进程";
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
-                Text { height: 16px; vertical-alignment: center; text: root.gpu-text; color: root.gpu-color; font-size: max(11px, root.text-size - 1px); }
+                Rectangle {
+                    height: 18px;
+                    main-gpu-lbl := Text {
+                        x: 0;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.gpu-label;
+                        color: root.label-color;
+                        font-size: max(10px, root.text-size - 3px);
+                    }
+                    Text {
+                        // 与 CPU / 内存数值同一左基线，避免 GPU 单独右对齐造成参差。
+                        x: main-gpu-lbl.preferred-width + 3px;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.gpu-value;
+                        color: root.gpu-color;
+                        font-size: max(12px, root.text-size - 1px);
+                        font-weight: 600;
+                    }
+                }
             }
 
             // 中列：上传 / 下载 / 今日卡顿
             VerticalLayout {
-                spacing: 5px;
                 horizontal-stretch: 1;
+                spacing: 4px;
                 Rectangle {
-                    height: 16px;
-                    bubble-up-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-up-label; color: root.net-color; font-size: root.text-size; }
-                    bubble-up-value := ClickableValue {
-                        x: bubble-up-lbl.preferred-width + 2px;
-                        text: root.bubble-up-value;
+                    height: 18px;
+                    main-net-send-lbl := Text {
+                        x: 0;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.net-send-label;
+                        color: root.label-color;
+                        font-size: max(10px, root.text-size - 3px);
+                    }
+                    main-net-send-value := ClickableValue {
+                        x: main-net-send-lbl.preferred-width + 3px;
+                        text: root.net-send-value;
                         text-color: root.net-color;
-                        font-size: root.text-size;
+                        font-size: max(12px, root.text-size - 1px);
+                        tooltip-text: "点击查看网络占用最高的进程";
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
                 Rectangle {
-                    height: 16px;
-                    bubble-down-lbl := Text { x: 0; width: self.preferred-width; height: 100%; vertical-alignment: center; text: root.bubble-down-label; color: root.net-color; font-size: root.text-size; }
-                    bubble-down-value := ClickableValue {
-                        x: bubble-down-lbl.preferred-width + 2px;
-                        text: root.bubble-down-value;
+                    height: 18px;
+                    main-net-recv-lbl := Text {
+                        x: 0;
+                        width: self.preferred-width;
+                        height: 100%;
+                        vertical-alignment: center;
+                        text: root.net-recv-label;
+                        color: root.label-color;
+                        font-size: max(10px, root.text-size - 3px);
+                    }
+                    main-net-recv-value := ClickableValue {
+                        x: main-net-recv-lbl.preferred-width + 3px;
+                        text: root.net-recv-value;
                         text-color: root.net-color;
-                        font-size: root.text-size;
+                        font-size: max(12px, root.text-size - 1px);
+                        tooltip-text: "点击查看网络占用最高的进程";
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
-                Text { height: 16px; vertical-alignment: center; text: root.event-count; color: root.event-color; font-size: max(11px, root.text-size - 2px); }
+                main-event-text := Text {
+                    height: 18px;
+                    vertical-alignment: center;
+                    text: root.event-count;
+                    color: root.event-color;
+                    font-size: max(11px, root.text-size - 2px);
+                    Tooltip { text: @markdown("今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析"); }
+                }
             }
 
-            // 右列：服务状态 / 心跳 / 当日流量（↑ 上行 ↓ 下行；悬浮看当周明细）
+            // 右列：服务状态 / 最近心跳 / 今日累计流量
             VerticalLayout {
-                spacing: 5px;
-                horizontal-stretch: 1;
-                Text { height: 16px; vertical-alignment: center; text: root.service-status; color: root.service-status-color; font-size: max(10px, root.text-size - 3px); overflow: elide; }
-                Text { height: 16px; vertical-alignment: center; text: root.last-heartbeat; color: root.hb-color; font-size: max(10px, root.text-size - 4px); }
+                width: 38%;
+                spacing: 4px;
                 Text {
-                    height: 16px;
+                    height: 18px;
                     vertical-alignment: center;
-                    text: root.net-today-up + " " + root.net-today-down;
+                    text: root.service-status;
+                    color: root.service-status-color;
+                    font-size: max(9px, root.text-size - 4px);
+                    overflow: elide;
+                    Tooltip { text: @markdown("\{root.bubble-tip}"); }
+                }
+                Text {
+                    height: 18px;
+                    vertical-alignment: center;
+                    text: root.paused ? "显示已暂停 · 后台采集" : root.last-heartbeat;
+                    color: root.paused ? root.event-color : root.hb-color;
+                    font-size: max(9px, root.text-size - 4px);
+                    overflow: elide;
+                    Tooltip { text: @markdown("\{root.heartbeat-tooltip}"); }
+                }
+                Text {
+                    height: 18px;
+                    vertical-alignment: center;
+                    text: "今日 " + root.net-today-up + " " + root.net-today-down;
                     color: root.net-color;
-                    font-size: max(10px, root.text-size - 4px);
+                    font-size: max(9px, root.text-size - 4px);
+                    overflow: elide;
                     Tooltip { text: @markdown("\{root.net-week-tip}"); }
                 }
             }
 
-            // 可选吉祥物图片（皮肤 mascot 字段；未配置时隐藏、不占宽度）
+            // 可选吉祥物（皮肤 mascot；未配置时不占宽度）
             Image {
                 visible: root.mascot-visible;
                 source: root.mascot-image;
-                width: root.mascot-visible ? 40px : 0px;
+                width: root.mascot-visible ? 32px : 0px;
                 height: 100%;
                 image-fit: contain;
             }
         }
 
-        // 暂停/恢复图标：仅 bubble 布局显示；常驻可见（不再依赖鼠标悬浮）。
-        // 作窗口级叠层（不参与 HorizontalLayout 排布，避免挤压三列文本）。
-        Text {
-            visible: root.layout-mode == "bubble";
-            x: root.width - 24px;
-            y: (root.height - 16px) / 2;
-            width: 20px;
-            height: 16px;
-            vertical-alignment: center;
-            text: root.paused ? "▶" : "⏸";
-            color: root.paused ? root.event-color : #9aa89a;
-            font-size: root.text-size;
+        // 暂停/恢复：card / bubble 共用，固定在右侧垂直居中。
+        // 用文字而非 “⏸” Emoji，避免 Windows 渲染成亮蓝色 Emoji 方块。
+        Rectangle {
+            x: root.width - 42px;
+            y: (root.height - 24px) / 2;
+            width: 34px;
+            height: 24px;
+            border-width: 1px;
+            border-radius: 5px;
+            border-color: root.pause-enabled
+                ? root.skin-border-color.with-alpha(0.75)
+                : root.skin-border-color.with-alpha(0.35);
+            background: root.paused
+                ? root.event-color.with-alpha(0.12)
+                : root.label-color.with-alpha(0.07);
+            Text {
+                width: 100%;
+                height: 100%;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: root.paused ? "恢复" : "暂停";
+                color: root.pause-enabled
+                    ? (root.paused ? root.event-color : root.label-color)
+                    : root.hb-color.with-alpha(0.55);
+                font-size: max(9px, root.text-size - 4px);
+                Tooltip { text: @markdown("\{root.pause-tooltip}"); }
+            }
         }
     }
 }

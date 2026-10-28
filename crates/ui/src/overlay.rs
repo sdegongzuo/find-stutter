@@ -8,9 +8,6 @@ use slint::{Brush, Color, SharedString};
 use crate::reader::ServiceHealth;
 use crate::skin::SkinConfig;
 
-/// 状态条配置
-pub const HEALTH_BAR_HEIGHT: f32 = 22.0;
-
 #[derive(Debug, Clone)]
 pub struct OverlayState {
     pub skin: SkinConfig,
@@ -81,7 +78,7 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
     });
     let text = match health {
         ServiceHealth::Running => SharedString::from("● 服务运行中"),
-        ServiceHealth::Stale => SharedString::from("● 服务卡顿"),
+        ServiceHealth::Stale => SharedString::from("● 数据延迟"),
         ServiceHealth::Stopped => SharedString::from("● 服务已停止"),
         ServiceHealth::NoDatabase => {
             SharedString::from("● 服务未注册（请运行 find-stutter-service install）")
@@ -90,15 +87,109 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
     (text, color)
 }
 
-/// 「当日上行累计流量」短文本（↑ 前缀与网速行一致）。
-/// 字节量格式化复用进程详情页累计列的紧凑口径（`format_bytes`）。
-pub fn format_today_up_traffic(sent: u64) -> String {
-    format!("↑ {}", crate::process_list::format_bytes(sent))
+/// 资源水位分档。用于悬浮窗数值着色，阈值与告警文案集中在此，避免
+/// Slint 侧散落魔法数字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceLevel {
+    Normal,
+    Warning,
+    Critical,
 }
 
-/// 「当日下行累计流量」短文本（↓ 前缀与网速行一致）。
+/// CPU 预警 / 严重阈值（%）。
+pub const CPU_WARNING_PERCENT: f32 = 80.0;
+pub const CPU_CRITICAL_PERCENT: f32 = 95.0;
+/// 内存预警 / 严重阈值（%）。严重线与采集侧 `mem_threshold_percent` 对齐。
+pub const MEM_WARNING_PERCENT: f32 = 80.0;
+pub const MEM_CRITICAL_PERCENT: f32 = 90.0;
+
+pub fn resource_level(value: f32, warning: f32, critical: f32) -> ResourceLevel {
+    if value >= critical {
+        ResourceLevel::Critical
+    } else if value >= warning {
+        ResourceLevel::Warning
+    } else {
+        ResourceLevel::Normal
+    }
+}
+
+/// 按水位返回数值颜色；正常值沿用皮肤注入的正文色。
+pub fn resource_level_color(level: ResourceLevel, normal: Color) -> Color {
+    match level {
+        ResourceLevel::Normal => normal,
+        ResourceLevel::Warning => Color::from_rgb_u8(0xb2, 0x6a, 0x00),
+        ResourceLevel::Critical => Color::from_rgb_u8(0xc4, 0x3c, 0x3c),
+    }
+}
+
+pub fn cpu_usage_color(value: f32, normal: Color) -> Color {
+    resource_level_color(
+        resource_level(value, CPU_WARNING_PERCENT, CPU_CRITICAL_PERCENT),
+        normal,
+    )
+}
+
+pub fn memory_usage_color(value: f32, normal: Color) -> Color {
+    resource_level_color(
+        resource_level(value, MEM_WARNING_PERCENT, MEM_CRITICAL_PERCENT),
+        normal,
+    )
+}
+
+/// 今日卡顿数：0 时弱化，非 0 才适度强调（不再恒定抢走内存告警的注意力）。
+pub fn event_count_color(count: u32, neutral: Color) -> Color {
+    if count == 0 {
+        neutral
+    } else {
+        Color::from_rgb_u8(0xb2, 0x6a, 0x00)
+    }
+}
+
+/// 百分比统一为无空格、零位小数；非有限值降级为 `--`。
+pub fn format_percent(value: f32) -> String {
+    if value.is_finite() {
+        format!("{value:.0}%")
+    } else {
+        "--".to_string()
+    }
+}
+
+/// GPU 数值（标签 GPU 由 Slint 侧固定）。无采样/不可用时稳定显示 `--`，
+/// 避免上一帧有值、这一帧采集失败时残留旧读数。
+pub fn format_gpu_value(usage: Option<f32>) -> String {
+    match usage {
+        Some(v) if v.is_finite() => format!("{v:.1}%"),
+        _ => "--".to_string(),
+    }
+}
+
+pub fn format_event_count(count: u32) -> String {
+    format!("今日卡顿 {count}")
+}
+
+/// 心跳显示为用户本地时间，避免把数据库里的 UTC 直接截成 HH:MM:SS
+/// （东八区会凭空慢 8 小时，截图中的 03:54:29 即此问题）。
+pub fn format_heartbeat_text(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "最近心跳 --".to_string();
+    };
+    match chrono::DateTime::parse_from_rfc3339(raw) {
+        Ok(ts) => format!(
+            "最近心跳 {}",
+            ts.with_timezone(&chrono::Local).format("%H:%M:%S")
+        ),
+        Err(_) => "最近心跳 --".to_string(),
+    }
+}
+
+/// 「当日上行累计流量」短文本（紧凑单位，无额外空格）。
+pub fn format_today_up_traffic(sent: u64) -> String {
+    format!("↑{}", crate::process_list::format_bytes(sent))
+}
+
+/// 「当日下行累计流量」短文本（紧凑单位，无额外空格）。
 pub fn format_today_down_traffic(recv: u64) -> String {
-    format!("↓ {}", crate::process_list::format_bytes(recv))
+    format!("↓{}", crate::process_list::format_bytes(recv))
 }
 
 /// 「当周累计网络流量」tooltip 明细（鼠标悬浮任一当日流量文本时显示；多行）。
@@ -150,41 +241,15 @@ pub fn parse_color(s: &str) -> Option<Color> {
     }
 }
 
-/// bubble 布局的 2×2 网格数字值：`(上传, 下载, CPU, 内存)`（仅数字，标签在 slint 侧）。
-/// 速率复用 `format_bps`（trim 掉对齐空格）；无采样数据时显示 `--`。
-pub fn format_bubble_metrics(
-    summary: Option<&LatestSampleSummary>,
-) -> (String, String, String, String) {
-    match summary {
-        Some(s) => (
-            format_bps(s.net_sent_bps).trim().to_string(),
-            format_bps(s.net_recv_bps).trim().to_string(),
-            format!("{:.0} %", s.cpu_usage),
-            format!("{:.0} %", s.mem_usage_percent),
-        ),
-        None => (
-            "--".to_string(),
-            "--".to_string(),
-            "--".to_string(),
-            "--".to_string(),
-        ),
-    }
-}
-
-/// bubble 布局的悬浮 tooltip（多行）：服务状态 / 今日卡顿 / 心跳 / 当日流量。
-/// bubble 主区只显示网速与 CPU/内存（参考截图风格），辅助信息收敛到这里。
+/// 悬浮窗 tooltip（多行）：服务状态 / 今日卡顿 / 最近心跳 / 当日流量。
+/// 主区空间有限，完整状态（含服务未注册时的修复命令）收敛到这里。
 pub fn format_bubble_tip(state: &OverlayState) -> String {
     let (status, _) = format_service_status(state.service_health);
-    let hb = state
-        .last_heartbeat
-        .as_deref()
-        .map(|h| if h.len() >= 19 { &h[11..19] } else { h })
-        .unwrap_or("--");
     format!(
-        "{}\n今日卡顿: {}\n心跳: {}\n当日流量 ↑{} / ↓{}",
+        "{}\n{}\n{}\n今日流量 {} / {}",
         status,
-        state.today_event_count,
-        hb,
+        format_event_count(state.today_event_count),
+        format_heartbeat_text(state.last_heartbeat.as_deref()),
         format_today_up_traffic(state.today_net_bytes.0),
         format_today_down_traffic(state.today_net_bytes.1)
     )
@@ -194,20 +259,28 @@ pub fn format_bubble_tip(state: &OverlayState) -> String {
 ///
 /// 需要 `&mut`：bubble 布局的吉祥物图片缓存按皮肤配置惰性加载（路径变化才读盘）。
 pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
-    // 0) 皮肤：颜色 / 字号 / 尺寸 / 边框 注入（修复：P3 后皮肤名存实亡，从未接线）
-    //
-    // 主窗口（Overlay）的视觉风格与进程详情页（ProcessList）对齐：
-    //   - 背景色：白底（skin.background_color，默认 #F5F5F7 的 skin.toml 已统一为 #ffffff）
-    //   - 边框：1px，颜色由 skin.border_color 注入（默认 #C0C0C8 ≈ ProcessList 的 #c0c0c0）
-    //   - 圆角：由 skin.border_radius 注入（默认 8px，与 ProcessList 一致）
-    //   - 指标文字：统一深色 #1e1e2e（与 ProcessList 文本色一致；不再用 skin 字段的
-    //     Material 800 彩色 — skin 字段保留供将来扩展，不破坏皮肤系统）
-    //   - 卡顿计数：保留红色 #c44c4c 作为视觉重点（今日卡顿:N）
-    //   - 心跳时间：灰色 #8a8a92（弱化的辅助信息）
+    // 0) 皮肤：颜色 / 字号 / 尺寸 / 边框 注入。
+    // 标签比数值弱、数值按水位着色；卡顿数只在非 0 时用琥珀色强调，
+    // 让“内存 94%”这类真实危险比“今日卡顿 1”更先被看见。
     let skin = &state.skin;
-    let text_color = Color::from_rgb_u8(0x1e, 0x1e, 0x2e); // 与 ProcessList 文本色一致
-    let event_red = Color::from_rgb_u8(0xc4, 0x4c, 0x4c); // 卡顿计数红色（醒目）
-    let hb_gray = Color::from_rgb_u8(0x8a, 0x8a, 0x92); // 心跳时间灰色（弱化）
+    let is_bubble = skin.layout == "bubble";
+    let skin_label = parse_color(&skin.label_color).unwrap_or(Color::from_rgb_u8(0x3a, 0x4a, 0x36));
+    let text_color = if is_bubble {
+        skin_label
+    } else {
+        Color::from_rgb_u8(0x1e, 0x1e, 0x2e)
+    };
+    let label_color = if is_bubble {
+        skin_label.with_alpha(0.72)
+    } else {
+        Color::from_rgb_u8(0x6e, 0x6e, 0x78)
+    };
+    let hb_gray = if is_bubble {
+        skin_label.with_alpha(0.62)
+    } else {
+        Color::from_rgb_u8(0x8a, 0x8a, 0x92)
+    };
+    let event_neutral = hb_gray;
 
     ui.set_skin_width(skin.width as f32);
     ui.set_skin_height(skin.height as f32);
@@ -219,26 +292,19 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
         parse_color(&skin.border_color).unwrap_or(Color::from_rgb_u8(0xc0, 0xc0, 0xc0)),
     );
     ui.set_skin_border_radius(skin.border_radius as f32);
+    ui.set_label_color(label_color);
     ui.set_cpu_color(text_color);
     ui.set_mem_color(text_color);
-    ui.set_event_color(event_red);
+    ui.set_event_color(event_count_color(state.today_event_count, event_neutral));
     ui.set_gpu_color(text_color);
     ui.set_net_color(text_color);
     ui.set_hb_color(hb_gray);
 
-    // 0b) 布局模式（皮肤 layout 字段）："card"（默认三列白卡）/ "bubble"（2×2 气泡）。
-    // bubble 下文字统一用 label_color（深灰绿），保持气泡风格的整体感。
-    let is_bubble = skin.layout == "bubble";
+    // 0b) 布局模式仍保留在皮肤协议中；Slint 侧 card / bubble 已统一网格，
+    // 仅由皮肤配色、尺寸和可选吉祥物区分。
     ui.set_layout_mode(SharedString::from(if is_bubble { "bubble" } else { "card" }));
-    if is_bubble {
-        let tc = parse_color(&skin.label_color).unwrap_or(text_color);
-        ui.set_cpu_color(tc);
-        ui.set_mem_color(tc);
-        ui.set_net_color(tc);
-        ui.set_gpu_color(tc);
-    }
 
-    // 0c) 吉祥物图片（仅 bubble 布局的 in property；路径变化时才重新读盘）
+    // 0c) 吉祥物图片（皮肤可选；路径变化时才重新读盘）
     let mascot_key = skin
         .mascot_file
         .as_ref()
@@ -260,31 +326,51 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
         None => ui.set_mascot_visible(false),
     }
 
-    // 1) 服务健康条
+    // 1) 服务状态（右列首行）
     let (text, color) = format_service_status(state.service_health);
     ui.set_service_status(text);
     ui.set_service_status_color(color);
-    ui.set_service_bar_height(HEALTH_BAR_HEIGHT);
 
     // 2) 暂停按钮在服务停止时禁用
     let pause_enabled = matches!(state.service_health, ServiceHealth::Running);
     ui.set_pause_enabled(pause_enabled);
 
-    // 3) 指标（仅在 Running 时更新，Stale/Stopped 时保留最后值）
-    if let Some(s) = &state.last_summary {
-        // 只有数字（value）可点击弹出进程弹窗；标签（label）在 slint 侧为静态默认值
-        ui.set_cpu_value(SharedString::from(format!("{:.1}%", s.cpu_usage)));
-        ui.set_mem_value(SharedString::from(format!("{:.1}%", s.mem_usage_percent)));
-        ui.set_net_send_value(SharedString::from(format_bps(s.net_sent_bps).trim().to_string()));
-        ui.set_net_recv_value(SharedString::from(format_bps(s.net_recv_bps).trim().to_string()));
-        if let Some(g) = s.gpu_usage {
-            ui.set_gpu_text(SharedString::from(format!("GPU {:5.1}%", g)));
+    // 3) 指标：每 tick 显式覆盖，避免 GPU 等可选信号在采集失败后残留旧读数。
+    // 无 summary 时统一回落到 `--`，不把不可信的历史值伪装成实时数据。
+    match &state.last_summary {
+        Some(s) => {
+            ui.set_cpu_value(SharedString::from(format_percent(s.cpu_usage)));
+            ui.set_mem_value(SharedString::from(format_percent(s.mem_usage_percent)));
+            ui.set_cpu_color(cpu_usage_color(s.cpu_usage, text_color));
+            ui.set_mem_color(memory_usage_color(s.mem_usage_percent, text_color));
+            ui.set_net_send_value(SharedString::from(
+                format_bps(s.net_sent_bps).trim().to_string(),
+            ));
+            ui.set_net_recv_value(SharedString::from(
+                format_bps(s.net_recv_bps).trim().to_string(),
+            ));
+            ui.set_gpu_value(SharedString::from(format_gpu_value(s.gpu_usage)));
+            ui.set_gpu_color(if s.gpu_usage.is_some_and(f32::is_finite) {
+                text_color
+            } else {
+                hb_gray
+            });
+            // 温度已从悬浮窗移除（采集/入库保留，仅不显示）
         }
-        // 温度已从悬浮窗移除（采集/入库保留，仅不显示）
+        None => {
+            ui.set_cpu_value(SharedString::from("--"));
+            ui.set_mem_value(SharedString::from("--"));
+            ui.set_net_send_value(SharedString::from("--"));
+            ui.set_net_recv_value(SharedString::from("--"));
+            ui.set_gpu_value(SharedString::from("--"));
+            ui.set_cpu_color(text_color);
+            ui.set_mem_color(text_color);
+            ui.set_gpu_color(hb_gray);
+        }
     }
 
-    // 3b) 当日累计网络流量（替代原「磁盘读写速率」位；↑ 上行 / ↓ 下行分开显示）+
-    //     当周明细 tooltip 文本。不依赖 summary 存在，db 打不开时也显示缓存值。
+    // 3b) 当日累计网络流量 + 当周明细 tooltip。
+    // 不依赖 summary 存在，db 暂时打不开时仍显示 reader 缓存的最近值。
     ui.set_net_today_up(SharedString::from(format_today_up_traffic(
         state.today_net_bytes.0,
     )));
@@ -296,27 +382,18 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
         state.week_net_bytes.1,
     )));
 
-    // 4) 今日事件数
-    ui.set_event_count(SharedString::from(format!(
-        "今日卡顿: {}",
-        state.today_event_count
-    )));
-
-    // 4b) bubble 布局：2×2 网格文本 + 悬浮 tooltip（主区只显 4 项，辅助信息收敛到 tooltip）
-    let (b_up, b_down, b_cpu, b_mem) = format_bubble_metrics(state.last_summary.as_ref());
-    ui.set_bubble_up_value(SharedString::from(b_up));
-    ui.set_bubble_down_value(SharedString::from(b_down));
-    ui.set_bubble_cpu_value(SharedString::from(b_cpu));
-    ui.set_bubble_mem_value(SharedString::from(b_mem));
+    // 4) 今日事件数与完整 tooltip
+    ui.set_event_count(SharedString::from(format_event_count(state.today_event_count)));
+    ui.set_event_color(event_count_color(state.today_event_count, event_neutral));
     ui.set_bubble_tip(SharedString::from(format_bubble_tip(state)));
 
-    // 5) 上次心跳时间（调试用）
-    if let Some(hb) = &state.last_heartbeat {
-        let display = if hb.len() >= 19 { &hb[11..19] } else { hb };
-        ui.set_last_heartbeat(SharedString::from(format!("心跳: {}", display)));
-    } else {
-        ui.set_last_heartbeat(SharedString::from(""));
-    }
+    // 5) 最近心跳：转本地时区后显示；无心跳/格式异常统一显示 `--`。
+    ui.set_last_heartbeat(SharedString::from(format_heartbeat_text(
+        state.last_heartbeat.as_deref(),
+    )));
+
+    // 6) 暂停状态以 Rust 侧为唯一真相（托盘/右键菜单也会改它）。
+    ui.set_paused(state.paused);
 }
 
 #[cfg(test)]
@@ -340,7 +417,7 @@ mod tests {
     #[test]
     fn format_service_status_stale() {
         let (text, _) = format_service_status(ServiceHealth::Stale);
-        assert_eq!(text.as_str(), "● 服务卡顿");
+        assert_eq!(text.as_str(), "● 数据延迟");
     }
 
     #[test]
@@ -445,16 +522,79 @@ mod tests {
         assert!(s.last_heartbeat.is_some());
     }
 
-    /// 当日流量短文本：↑ 上行 / ↓ 下行各自独立显示（紧凑字节口径）。
+    /// 当日流量短文本：↑ 上行 / ↓ 下行紧密排版（右列空间有限）。
     #[test]
     fn format_today_traffic_directional() {
-        assert_eq!(format_today_up_traffic(0), "↑ 0B");
-        assert_eq!(format_today_up_traffic(1536), "↑ 1.5K");
+        assert_eq!(format_today_up_traffic(0), "↑0B");
+        assert_eq!(format_today_up_traffic(1536), "↑1.5K");
         // GB 级别显示一位小数
         let gb = 3 * 1024 * 1024 * 1024;
-        assert_eq!(format_today_up_traffic(gb), "↑ 3.0G");
-        assert_eq!(format_today_down_traffic(2048), "↓ 2.0K");
-        assert_eq!(format_today_down_traffic(gb), "↓ 3.0G");
+        assert_eq!(format_today_up_traffic(gb), "↑3.0G");
+        assert_eq!(format_today_down_traffic(2048), "↓2.0K");
+        assert_eq!(format_today_down_traffic(gb), "↓3.0G");
+    }
+
+    #[test]
+    fn resource_level_thresholds_are_inclusive() {
+        assert_eq!(resource_level(79.9, 80.0, 90.0), ResourceLevel::Normal);
+        assert_eq!(resource_level(80.0, 80.0, 90.0), ResourceLevel::Warning);
+        assert_eq!(resource_level(90.0, 80.0, 90.0), ResourceLevel::Critical);
+    }
+
+    #[test]
+    fn memory_critical_is_more_prominent_than_cpu_high() {
+        let normal = Color::from_rgb_u8(0x1e, 0x1e, 0x2e);
+        let mem94 = memory_usage_color(94.0, normal);
+        let cpu94 = cpu_usage_color(94.0, normal);
+        assert_eq!(
+            (mem94.red(), mem94.green(), mem94.blue()),
+            (0xc4, 0x3c, 0x3c),
+            "内存 94% 必须进入严重红档"
+        );
+        assert_eq!(
+            (cpu94.red(), cpu94.green(), cpu94.blue()),
+            (0xb2, 0x6a, 0x00),
+            "CPU 94% 仍处预警档，不应与内存严重档混淆"
+        );
+    }
+
+    #[test]
+    fn normal_usage_keeps_skin_text_color() {
+        let normal = Color::from_rgb_u8(0x3a, 0x4a, 0x36);
+        assert_eq!(cpu_usage_color(23.0, normal), normal);
+        assert_eq!(memory_usage_color(65.0, normal), normal);
+    }
+
+    #[test]
+    fn event_count_is_neutral_at_zero() {
+        let neutral = Color::from_rgb_u8(0x8a, 0x8a, 0x92);
+        assert_eq!(event_count_color(0, neutral), neutral);
+        assert_ne!(event_count_color(1, neutral), neutral);
+    }
+
+    #[test]
+    fn percent_and_gpu_format_are_consistent() {
+        assert_eq!(format_percent(23.4), "23%");
+        assert_eq!(format_percent(94.6), "95%");
+        assert_eq!(format_percent(f32::NAN), "--");
+        assert_eq!(format_gpu_value(Some(17.44)), "17.4%");
+        assert_eq!(format_gpu_value(None), "--");
+        assert_eq!(format_gpu_value(Some(f32::NAN)), "--");
+        assert_eq!(format_event_count(0), "今日卡顿 0");
+        assert_eq!(format_event_count(12), "今日卡顿 12");
+    }
+
+    #[test]
+    fn heartbeat_uses_local_display_and_handles_invalid_values() {
+        let raw = "2026-10-01T03:54:44Z";
+        let local = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string();
+        assert_eq!(format_heartbeat_text(Some(raw)), format!("最近心跳 {local}"));
+        assert_eq!(format_heartbeat_text(None), "最近心跳 --");
+        assert_eq!(format_heartbeat_text(Some("not-a-timestamp")), "最近心跳 --");
     }
 
     /// 当周 tooltip：含总量、上传、下载三段，且换行分两行。
@@ -485,13 +625,6 @@ mod tests {
                 assert!(!enabled);
             }
         }
-    }
-
-    /// 验证：HEALTH_BAR_HEIGHT 在合理范围
-    #[test]
-    fn health_bar_height_constant() {
-        assert!(HEALTH_BAR_HEIGHT > 0.0);
-        assert!(HEALTH_BAR_HEIGHT < 100.0);
     }
 
     // ===== parse_color（皮肤接线恢复）=====
@@ -541,37 +674,9 @@ mod tests {
         assert!(!s.click_through);
     }
 
-    // ===== bubble 布局（2×2 迷你气泡）=====
+    // ===== 悬浮窗 tooltip =====
 
-    /// bubble 主区文本：有采样 → 上传/下载/CPU/内存四项；无采样 → 全 "--"
-    #[test]
-    fn format_bubble_metrics_with_and_without_summary() {
-        let summary = LatestSampleSummary {
-            timestamp: "2026-10-01T00:00:00Z".to_string(),
-            cpu_usage: 17.4,
-            mem_usage_percent: 74.3,
-            mem_available_mb: 4096,
-            net_sent_bps: 598 * 1024, // ~584 KB/s
-            net_recv_bps: 11 * 1024,
-            disk_read_bps: 0,
-            disk_write_bps: 0,
-            gpu_usage: None,
-            cpu_temp: None,
-        };
-        let (up, down, cpu, mem) = format_bubble_metrics(Some(&summary));
-        assert!(up.contains("KB/s"), "{up}");
-        assert!(down.contains("KB/s"), "{down}");
-        assert_eq!(cpu, "17 %");
-        assert_eq!(mem, "74 %");
-
-        let (up, down, cpu, mem) = format_bubble_metrics(None);
-        assert_eq!(up, "--");
-        assert_eq!(down, "--");
-        assert_eq!(cpu, "--");
-        assert_eq!(mem, "--");
-    }
-
-    /// bubble tooltip：服务状态 / 今日卡顿 / 心跳 / 当日流量四行齐全
+    /// tooltip：服务状态 / 今日卡顿 / 最近心跳 / 今日流量四行齐全
     #[test]
     fn format_bubble_tip_contains_parts() {
         let mut s = OverlayState::new(SkinConfig::load("default"));
@@ -581,19 +686,20 @@ mod tests {
         s.today_net_bytes = (7 * 1024 * 1024, 4 * 1024 * 1024 * 1024_u64);
         let tip = format_bubble_tip(&s);
         assert!(tip.contains("服务运行中"), "{tip}");
-        assert!(tip.contains("今日卡顿: 52"), "{tip}");
-        assert!(tip.contains("心跳: 03:54:44"), "{tip}");
-        assert!(tip.contains("当日流量"), "{tip}");
+        assert!(tip.contains("今日卡顿 52"), "{tip}");
+        assert!(tip.contains("最近心跳 "), "{tip}");
+        assert!(!tip.contains("T03:54:44"), "不应直接显示 UTC ISO 串: {tip}");
+        assert!(tip.contains("今日流量 ↑7.0M / ↓4.0G"), "{tip}");
         assert_eq!(tip.lines().count(), 4, "{tip}");
     }
 
-    /// bubble tooltip：无心跳时显示 "--" 而不是空行
+    /// tooltip：无心跳时显示 "--" 而不是空行，服务修复提示完整保留
     #[test]
     fn format_bubble_tip_without_heartbeat() {
         let mut s = OverlayState::new(SkinConfig::load("default"));
         s.service_health = ServiceHealth::NoDatabase;
         let tip = format_bubble_tip(&s);
-        assert!(tip.contains("心跳: --"), "{tip}");
+        assert!(tip.contains("最近心跳 --"), "{tip}");
         assert!(tip.contains("未注册"), "{tip}");
     }
 

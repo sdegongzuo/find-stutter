@@ -17,7 +17,7 @@
 //!
 //! UI 反应：
 //! - `Running` → 顶部状态条绿色 "● 服务运行中"
-//! - `Stale`   → 黄色 "● 服务卡顿"
+//! - `Stale`   → 黄色 "● 数据延迟"
 //! - `Stopped` / `NoDatabase` → 红色 "● 服务已停止"
 //! - 暂停按钮在非 Running 时禁用
 
@@ -193,6 +193,7 @@ pub fn run() -> anyhow::Result<()> {
         std::sync::Mutex<Option<std::sync::Arc<crate::analysis::AnalysisWindow>>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let analysis_win_for_menu = analysis_win.clone();
+    let analysis_win_for_event = analysis_win.clone();
 
     // 3a2b) 资源区左键点击：点悬浮窗 CPU / 内存 / 网络文字区 → 新开一个精简列
     //        进程弹窗，按点击维度排序（cpu/mem/net）。每次点击都是独立窗口，
@@ -241,6 +242,25 @@ pub fn run() -> anyhow::Result<()> {
             closed.lock().unwrap().push(wid);
         });
         resource_wins_cb.lock().unwrap().push(w);
+    });
+
+    // 3a2c) 点悬浮窗「今日卡顿 N」→ 直接打开卡顿分析窗口（默认今日范围），
+    // 与右键菜单复用同一个窗口句柄：已打开时只刷新并前置，避免重复建窗。
+    ui.on_event_count_clicked(move || {
+        log::info!("今日卡顿点击: 打开卡顿分析");
+        let mut guard = analysis_win_for_event.lock().unwrap();
+        if guard.is_none() {
+            match crate::analysis::AnalysisWindow::show() {
+                Ok(w) => *guard = Some(std::sync::Arc::new(w)),
+                Err(e) => {
+                    log::warn!("卡顿分析窗口打开失败: {}", e);
+                    return;
+                }
+            }
+        }
+        if let Some(w) = guard.as_ref() {
+            w.refresh();
+        }
     });
 
     ui.on_menu_requested(move |x: f32, y: f32| {

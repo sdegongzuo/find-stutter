@@ -110,10 +110,10 @@ fn overlay_card_only_number_clickable() {
     eprintln!("card 命中类型: {:?}", got);
     assert_eq!(got, vec!["cpu", "mem", "net"], "card 布局命中类型不符");
 
-    // 暂停按钮（右列第三行）→ toggle-pause，且不触发资源区
+    // 暂停按钮（右侧垂直居中）→ toggle-pause，且不触发资源区
     let before_hits = hits.borrow().len();
     let before_pauses = *pauses.borrow();
-    click(&window, 300.0, 60.0);
+    click(&window, 340.0, 39.0);
     assert_eq!(
         *pauses.borrow(),
         before_pauses + 1,
@@ -131,9 +131,14 @@ fn overlay_card_only_number_clickable() {
 #[test]
 fn overlay_bubble_only_number_clickable() {
     let window = setup();
-    let (ui, hits, _pauses) = make_overlay(380.0, 78.0, "bubble");
+    let (ui, hits, pauses) = make_overlay(380.0, 78.0, "bubble");
+    let event_clicks = Rc::new(RefCell::new(0u32));
+    let event_clicks_cb = event_clicks.clone();
+    ui.on_event_count_clicked(move || {
+        *event_clicks_cb.borrow_mut() += 1;
+    });
 
-    // 点标签（左列行首，CPU: / 内存:）不应命中
+    // 点标签（左列行首，CPU / 内存）不应命中
     let n0 = hits.borrow().len();
     click(&window, 16.0, 18.0);
     click(&window, 16.0, 39.0);
@@ -142,6 +147,37 @@ fn overlay_bubble_only_number_clickable() {
     let got = sweep(&window, 380, 78, &hits);
     eprintln!("bubble 命中类型: {:?}", got);
     assert_eq!(got, vec!["cpu", "mem", "net"], "bubble 布局命中类型不符");
+
+    // 暂停按钮在 bubble 下同样可点，且不与资源区混淆。
+    // 全窗扫描本身会扫过暂停热区，故用点击前后的增量断言。
+    let before_hits = hits.borrow().len();
+    let before_pauses = *pauses.borrow();
+    click(&window, 360.0, 39.0);
+    assert_eq!(
+        *pauses.borrow(),
+        before_pauses + 1,
+        "bubble 暂停区应触发一次 toggle-pause"
+    );
+    assert_eq!(
+        hits.borrow().len(),
+        before_hits,
+        "bubble 暂停区点击不应触发 resource-clicked"
+    );
+
+    // 今日卡顿文字 → 打开分析，且不误触资源弹窗
+    let before_events = *event_clicks.borrow();
+    let before_hits = hits.borrow().len();
+    click(&window, 140.0, 60.0);
+    assert_eq!(
+        *event_clicks.borrow(),
+        before_events + 1,
+        "今日卡顿区应触发一次 event-count-clicked"
+    );
+    assert_eq!(
+        hits.borrow().len(),
+        before_hits,
+        "今日卡顿区点击不应触发 resource-clicked"
+    );
 
     drop(ui);
 }

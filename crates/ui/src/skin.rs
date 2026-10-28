@@ -35,7 +35,7 @@ pub struct SkinConfig {
     pub disk_color: String,
     #[serde(default = "default_label_color")]
     pub label_color: String,
-    /// 布局模式："card"（默认三列白卡）/ "bubble"（2×2 绿色迷你气泡）
+    /// 布局模式："card"（默认三列白卡）/ "bubble"（绿色三列完整指标）
     #[serde(default = "default_layout")]
     pub layout: String,
     /// 可选吉祥物图片文件名（相对皮肤目录，如 "mascot.png"）；空 = 不显示

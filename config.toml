@@ -93,7 +93,7 @@ context_switch_min_cpu_percent = 80.0
 
 [ui]
 # 皮肤名称，对应 skins 目录下的 TOML 文件（默认 "default"）
-# "bubble" = 2×2 绿色迷你气泡布局（上传/下载/CPU/内存）
+# "bubble" = 绿色三列完整指标布局（与 card 同一网格，仅配色/尺寸不同）
 skin = "bubble"
 # 是否置顶显示
 always_on_top = true

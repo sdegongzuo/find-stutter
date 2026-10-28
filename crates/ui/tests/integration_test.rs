@@ -83,7 +83,7 @@ fn format_service_status_includes_chinese_label() {
     let (text, _) = overlay::format_service_status(ServiceHealth::Running);
     assert!(text.as_str().contains("服务运行中"));
     let (text, _) = overlay::format_service_status(ServiceHealth::Stale);
-    assert!(text.as_str().contains("服务卡顿"));
+    assert!(text.as_str().contains("数据延迟"));
     let (text, _) = overlay::format_service_status(ServiceHealth::Stopped);
     assert!(text.as_str().contains("服务已停止"));
     let (text, _) = overlay::format_service_status(ServiceHealth::NoDatabase);

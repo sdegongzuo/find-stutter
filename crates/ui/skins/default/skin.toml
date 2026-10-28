@@ -10,7 +10,7 @@
 # 文本色一致）— 改本文件不会影响主窗口文字色；将来若要恢复彩色区分，可改 overlay.rs
 # 重新从 skin 字段注入。
 #
-# 布局模式：card = 三列白卡（本皮肤）；bubble = 2×2 绿色迷你气泡（见 skins/bubble/）
+# 布局模式：card = 三列白卡（本皮肤）；bubble = 绿色三列完整指标（见 skins/bubble/）
 layout = "card"
 
 width = 360.0
