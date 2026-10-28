@@ -774,7 +774,10 @@ component ResizeZone inherits TouchArea {
 }
 
 export component ProcessList inherits Window {
-    width: 870px;
+    // 全列宽度 = padding 12 + 列宽 800（56+184+56+64+76+132+56+66+110）+ 8 个列间距 64
+    // = 876，再留 ~24px 给滚动条，故 900。精简列模式只是右侧留白，不影响可读性。
+    // （原来 870 时全列会差 6px，端口列贴边被裁）
+    width: 900px;
     height: 506px;
     always-on-top: true;
     title: "find-stutter - 进程详情";

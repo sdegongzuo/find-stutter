@@ -108,6 +108,28 @@ fn resolve_skins_dir(preferred: &Path) -> PathBuf {
     }
 }
 
+/// 把相对路径解析成绝对路径（基于当前工作目录）。
+///
+/// **必须做这一步**：notify 上报的事件路径永远是绝对路径，而调用方传进来的
+/// 是 `config.toml` / `skins` 这类相对路径。不统一的话会有两个连锁故障：
+/// 1. `Path::new("config.toml").parent()` 是**空串**，`exists()` 必然 false
+///    → 父目录压根没被监听（日志里 `config parent dir "" does not exist`）；
+/// 2. 即便监听了，`paths_equal(事件绝对路径, 相对路径)` 也恒为 false
+///    → `ConfigChanged` / `SkinChanged` 永不产生，热加载静默失效。
+///
+/// 不用 `canonicalize`：目标文件在首次保存前可能还不存在（会返回 Err），
+/// 而且要保留原文件名大小写（Windows 上 canonicalize 会给出真实大小写，
+/// 与我们在别处使用的字符串比较方式不一致，反而引入新的不匹配）。
+fn absolute_or_join(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    }
+}
+
 /// 防抖窗口：在该窗口内多次 `ConfigChanged` 只触发一次 reload。
 /// 解决多数编辑器「保存 = 写入新文件 + 重命名覆盖」触发双事件的问题。
 pub const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -137,8 +159,9 @@ impl ConfigWatcher {
         config_path: P1,
         skins_dir: P2,
     ) -> notify::Result<Self> {
-        let config_path = config_path.as_ref().to_path_buf();
-        let skins_dir = resolve_skins_dir(skins_dir.as_ref());
+        // 统一绝对路径：notify 事件路径是绝对的，比较端也必须是绝对的（见 absolute_or_join）
+        let config_path = absolute_or_join(config_path.as_ref());
+        let skins_dir = absolute_or_join(&resolve_skins_dir(skins_dir.as_ref()));
         let (tx, rx) = channel();
         let watch_config = config_path.clone();
         let watch_skins = skins_dir.clone();
@@ -161,6 +184,11 @@ impl ConfigWatcher {
         if let Some(parent) = config_path.parent() {
             if parent.exists() {
                 watcher.watch(parent, RecursiveMode::NonRecursive)?;
+                log::info!(
+                    "ConfigWatcher: 监听目录 {}（config={}）",
+                    parent.display(),
+                    config_path.display()
+                );
             } else {
                 log::warn!(
                     "ConfigWatcher: config parent dir {:?} does not exist",
@@ -172,6 +200,7 @@ impl ConfigWatcher {
         // 3) 监听 skins 目录
         if skins_dir.exists() {
             watcher.watch(&skins_dir, RecursiveMode::Recursive)?;
+            log::info!("ConfigWatcher: 监听皮肤目录 {}", skins_dir.display());
         } else {
             log::warn!(
                 "ConfigWatcher: skins dir {:?} does not exist (will not watch)",
@@ -425,5 +454,34 @@ mod tests {
         } else {
             assert!(!paths_equal(&a, &b));
         }
+    }
+
+    /// 验证：相对路径被解析为绝对路径（否则 notify 的绝对事件路径永远匹配不上）
+    #[test]
+    fn absolute_or_join_resolves_relative() {
+        let p = absolute_or_join(Path::new("config.toml"));
+        assert!(p.is_absolute(), "相对路径应解析为绝对: {:?}", p);
+        assert!(p.ends_with("config.toml"), "文件名应保留: {:?}", p);
+    }
+
+    /// 验证：已经是绝对路径时原样返回（不做规范化，保留原文件名大小写）
+    #[test]
+    fn absolute_or_join_keeps_absolute() {
+        let abs = std::env::current_dir().unwrap().join("config.toml");
+        assert_eq!(absolute_or_join(&abs), abs);
+    }
+
+    /// 验证：绝对化之后，classify_change 能命中 config（复现原始 bug 的回归测试）
+    #[test]
+    fn classify_hits_config_after_absolutize() {
+        let abs = absolute_or_join(Path::new("config.toml"));
+        let skins = absolute_or_join(Path::new("crates/ui/skins"));
+        let ev = Event {
+            kind: EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            paths: vec![abs.clone()],
+            attrs: Default::default(),
+        };
+        let out = classify_change(&ev, &abs, &skins);
+        assert_eq!(out, vec![HotReloadEvent::ConfigChanged(abs)]);
     }
 }

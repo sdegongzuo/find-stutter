@@ -79,6 +79,24 @@ pub fn run() -> anyhow::Result<()> {
         config.storage.db_path
     );
 
+    // 统一工作目录到 config 所在目录（= db 所在目录）。
+    // 原因：双击 / explorer / 计划任务启动时 CWD 是 `target\release` 甚至
+    // `C:\Windows`，而下面 skins/、热加载监听、CSV 导出等都按相对路径找 ——
+    // 若不收口，皮肤会退回默认配色、热加载直接失效（日志里那条
+    // `skins dir "skins" does not exist` 就是这么来的）。
+    // Config::load 已把 db_path 解析成绝对路径，用它的父目录即可。
+    if let Some(dir) = std::path::Path::new(&config.storage.db_path).parent() {
+        let same = std::env::current_dir()
+            .map(|c| c == dir)
+            .unwrap_or(false);
+        if !same {
+            match std::env::set_current_dir(dir) {
+                Ok(()) => log::info!("工作目录已切到 config 所在目录: {}", dir.display()),
+                Err(e) => log::warn!("切换工作目录失败 ({}): {}", dir.display(), e),
+            }
+        }
+    }
+
     // 低内存模式：软件渲染器经 SLINT_BACKEND 环境变量选择，必须发生在任何 Slint
     // 窗口/平台层创建之前。（edition 2024 起 set_var 为 unsafe；此处处于 main 线程
     // 启动早期、尚无并发读者，单次写入安全。）
@@ -216,11 +234,19 @@ pub fn run() -> anyhow::Result<()> {
             "cpu" | "mem" | "net" => kind.to_string(),
             _ => return, // 未命中资源区（返回空串）
         };
-        log::info!("资源区点击: 打开进程弹窗（按 {} 排序）", sort);
+        // 内存维度要回答「谁占的、占的是专用工作集还是提交」，光看提交大小不够，
+        // 所以点击内存时不走精简列（保留专用工作集 / 磁盘 / 累计网络 / 端口）。
+        // CPU / 网络保持精简列，避免弹窗过宽遮住悬浮窗下方的内容。
+        let compact = sort != "mem";
+        log::info!(
+            "资源区点击: 打开进程弹窗（按 {} 排序，{}）",
+            sort,
+            if compact { "精简列" } else { "全列" }
+        );
         let w = match crate::process_list::ProcessListWindow::show(
             proc_highlight_pct,
             proc_refresh_ms,
-            true,
+            compact,
             &sort,
         ) {
             Ok(w) => w,

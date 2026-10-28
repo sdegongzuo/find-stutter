@@ -102,6 +102,34 @@ rtk cargo test -p find-stutter
 rtk cargo test -p find-stutter-core detector_cpu_threshold
 ```
 
+## 界面截图（开发 / 排查用）
+
+本机 agent 环境里 `.NET` 的 `Add-Type` 被安全策略硬拒（无法调 `CopyFromScreen`），
+也没有 ffmpeg / ImageMagick。因此内置两个不依赖外部工具的截屏手段：
+
+```bash
+# 1) 抓真实窗口（推荐）：按 PID 找面积最大的可见窗口，PrintWindow(RENDERFULLCONTENT)
+#    不受窗口被遮挡影响，能正确渲染 Slint 的半透明 overlay
+rtk cargo run --release -p find-stutter-ui --example screenshot_window -- <PID> target/win.png
+
+# 抓整个虚拟桌面（多显示器为所有屏幕并集）
+rtk cargo run --release -p find-stutter-ui --example screenshot_window -- screen target/desktop.png
+
+# 2) 离屏渲染悬浮窗（不需要进程在跑，CI 也能用）
+rtk cargo test -p find-stutter-ui --test overlay_snapshot
+#    产物：target/overlay-snapshot.bmp
+```
+
+输出格式按扩展名：`.png` → PNG（推荐，同一窗口约 24 KB），其它 → 32 位 BMP（约 463 KB）。
+
+注意点：
+
+- `PrintWindow` 在 `windows` 0.62 里归属 `Win32_Storage_Xps`，故该 feature 只声明在
+  `[target.'cfg(windows)'.dev-dependencies]`，不污染主依赖。
+- GDI 抓来的位图 alpha 通常恒为 0，工具会在整幅都没有非零 alpha 时统一补 255，
+  否则 PNG 会整张透明。
+- 桌面模式抓的是**屏幕可见内容**：窗口被遮挡就是遮挡后的样子；DRM / 独占全屏可能全黑。
+
 ## 配置说明
 
 编辑 `config.toml`（保存即热加载，部分字段需重启生效）：

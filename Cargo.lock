@@ -1437,6 +1437,7 @@ dependencies = [
  "notify",
  "parking_lot",
  "plotters",
+ "png 0.18.1",
  "raw-window-handle",
  "rusqlite",
  "serde",

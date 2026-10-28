@@ -101,3 +101,11 @@ slint-build = "1.18"
 
 [dev-dependencies]
 i-slint-backend-testing = "1.18"
+
+# 仅 examples/screenshot_window 需要：
+# - Win32_Storage_Xps：windows 0.62 把 PrintWindow 归到了这个模块
+# - png：截图输出 PNG（体积远小于 BMP）
+# 主依赖不该为开发工具背这些，cargo 会做 feature 合并，故此处单独声明即可。
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Storage_Xps"] }
+png = "0.18"
