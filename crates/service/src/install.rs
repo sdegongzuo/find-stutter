@@ -272,6 +272,54 @@ pub fn stop() -> ScmResult<()> {
     }
 }
 
+/// 重启已注册的服务：stop（若在运行）→ 等 SCM 真正落到 Stopped → start。
+///
+/// 为什么要有这个函数：`stop` + `start` 分两次调用就是两次 UAC 弹窗。
+/// 换二进制后的验证（升级 / 开发迭代）只需要提权一次。
+/// 停止等待有上限（20s）：超时返回错误而不是无限等，避免提权窗口挂住。
+pub fn restart() -> ScmResult<()> {
+    const WAIT_STEP_MS: u64 = 100;
+    const WAIT_MAX_STEPS: usize = 200;
+
+    let state = status()?;
+    if state == ServiceStatusInfo::NotFound {
+        return Err(ScmError::NotFound);
+    }
+    if state == ServiceStatusInfo::Stopped {
+        return start();
+    }
+    // 已经在停的过程中不重复发 stop（重复 stop 返回 ERROR_SERVICE_NOT_ACTIVE）
+    if state == ServiceStatusInfo::Running {
+        stop()?;
+    }
+    // 轮询等 Stopped。注意 StartPending 的坑：服务正在启动时 stop 会被拒，
+    // 再等下去它只会变 Running、永远等不到 Stopped —— 所以一旦看到 Running 就补发一次 stop。
+    let mut stopped = false;
+    let mut asked_again = false;
+    for _ in 0..WAIT_MAX_STEPS {
+        let now = status()?;
+        match now {
+            ServiceStatusInfo::Stopped => {
+                stopped = true;
+                break;
+            }
+            ServiceStatusInfo::Running if !asked_again => {
+                asked_again = true;
+                let _ = stop();
+            }
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_millis(WAIT_STEP_MS));
+    }
+    if !stopped {
+        return Err(ScmError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "服务 20s 内未停止（可能卡在 StopPending）",
+        )));
+    }
+    start()
+}
+
 /// 服务状态（简化版：人类可读）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceStatusInfo {

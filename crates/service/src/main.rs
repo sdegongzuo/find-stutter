@@ -132,6 +132,15 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
 
+        Some(Commands::Restart) => {
+            // 换二进制后重启：stop → 等真正停下 → start，只提权一次
+            diag_log("Restart: start");
+            install::restart().map_err(anyhow::Error::from)?;
+            println!("Service restarted: {}", service::SERVICE_NAME);
+            diag_log("Restart: success");
+            Ok(())
+        }
+
         Some(Commands::Status) => {
             let s = install::status().map_err(anyhow::Error::from)?;
             println!(

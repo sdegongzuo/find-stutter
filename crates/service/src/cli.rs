@@ -51,6 +51,12 @@ pub enum Commands {
 
     /// 一次性完成 install + start（GUI 用 UAC 一次提权跑完）
     InstallStart,
+
+    /// 重启已注册的服务（stop → 等真正停下 → start，一次提权跑完）
+    ///
+    /// 为什么合成一个子命令：`stop` 和 `start` 分两次调用 = 两次 UAC 弹窗。
+    /// 换二进制后验证（升级 / 开发迭代）都走这一条。
+    Restart,
 }
 
 #[cfg(test)]
@@ -98,6 +104,12 @@ mod tests {
     fn parse_install_start_subcommand() {
         let cli = Cli::try_parse_from(["find-stutter-service", "install-start"]).unwrap();
         assert!(matches!(cli.command, Some(Commands::InstallStart)));
+    }
+
+    #[test]
+    fn parse_restart_subcommand() {
+        let cli = Cli::try_parse_from(["find-stutter-service", "restart"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Restart)));
     }
 
     #[test]

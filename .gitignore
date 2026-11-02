@@ -2,6 +2,8 @@
 /target
 /target2
 /fsbuild
+# 换二进制前把被占用的 exe 重命名腾出的文件（服务在跑时 exe 被锁）
+/locked-svc*.exe
 
 # Runtime / project data
 stutter.db

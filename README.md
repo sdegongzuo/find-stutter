@@ -66,6 +66,23 @@ target/release/find-stutter.exe
   物理内存（专用工作集）/ 磁盘 / 网络 / 累计网络；点击列头排序、聚合行点击展开/收起、
   关键字 / PID / 端口号搜索、双击行打开进程详情面板（路径 / 命令行 / 线程 / 句柄 /
   内存明细等，文本可拖选 + Ctrl+C 复制，标题栏「复制」按钮全量复制）。
+- **网络列数据来源（重要）**：Windows 没有「按进程取网速」的廉价 API，
+  任务管理器那一列本身来自 ETW。本项目的「网络 / 累计网络」两列由
+  `find-stutter-service`（LocalSystem）订阅 ETW `Microsoft-Windows-Kernel-Network`
+  采集后写入 `process_net` 表，GUI 只读查询（最近 5 秒平均）。
+  - 服务未运行或前台 `Run` 调试（普通用户无内核会话权限）时，两列显示 **「—」**，
+    不会显示 0 B/s —— 「采不到」不能伪装成「没流量」。
+  - 「累计网络」口径是**自服务采集会话开始**的累计，不是进程启动以来的累计
+    （ETW 拿不到进程启动前的历史）。
+- **调用栈热点数据来源（重要）**：卡顿触发后，服务会开一个约 1.2 秒的
+  ETW `NT Kernel Logger` 会话（`EVENT_TRACE_FLAG_PROFILE` + `TraceSetInformation`），
+  以约 1ms 的间隔对全系统做 CPU 采样并附带调用栈，再把栈里的指令地址解析成
+  「进程 + 模块 + RVA」计数，取前 20 名写入 `stack_samples` 表（分析页展示前 5）。
+  - 只到模块 + RVA 级别，不引入 PDB 符号化（PRD §1.4）。
+  - 需要内核会话权限，因此只在服务（LocalSystem）里跑；前台 `Run` 调试会静默降级，
+    诊断日志里会出现 `StackSampler disabled reason: ...`。
+  - 这个会话是**系统级共享资源**：被 WPR / xperf 占用时本次采样跳过（不抢占、也不会
+    误停别人正在跑的会话）。
 - **Chromium 家族标注**：进程详情页对 msedgewebview2.exe / msedge.exe /
   chrome.exe 按任务管理器口径标注——内嵌 WebView2 的浏览器进程显示宿主
   「WebView2: MarkFlowy」，子进程显示角色「WebView2 实用工具: Network Service」、
@@ -233,6 +250,7 @@ find-stutter.exe query "SELECT context_switches_per_sec, cpu_usage FROM samples 
 | `stop` | 停止已运行的服务（需管理员权限） |
 | `status` | 打印服务当前状态；退出码 `0`=Running / `1`=Stopped·Pending / `2`=NotFound / `3`=Error（GUI 端按此协议走自动安装/启动逻辑） |
 | `install-start` | 一次完成 `install` + `start`（GUI 端 UAC 提权路径用，需管理员权限） |
+| `restart` | 一次完成 `stop` + 等真正停下 + `start`（换二进制后重启用；分两次调用就是两次 UAC 弹窗） |
 | `--config <path>` | 全局：指定配置文件路径（默认 `config.toml`） |
 
 ## 配置
@@ -253,7 +271,7 @@ crates/
   cli/       find-stutter-cli：agent 查询界面（events / samples / analysis /
              config / status / process 六件套 JSON 子命令 + export CSV +
              upgrade 升级编排；clap 定义也在这里，bin 只做分发）
-  service/   find-stutter-service: Windows 服务（run / install / uninstall / start / stop / status / install-start）
+  service/   find-stutter-service: Windows 服务（run / install / uninstall / start / stop / status / install-start / restart）
   ui/        悬浮窗 UI、皮肤、DbReader（1Hz SQLite 轮询）、服务健康角标、
              auto_start（GUI 启动时自动检测 + UAC 提权安装/启动）、
              elevate（ShellExecuteExW + runas）、hotreload（notify 配置/皮肤监听）、
