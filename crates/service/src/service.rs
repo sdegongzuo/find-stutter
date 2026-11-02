@@ -112,6 +112,10 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
     diag_log("run_foreground: creating StackSampler + background ETW worker");
     let stack_sampler = StackSampler::new();
     diag_log(&format!("run_foreground: StackSampler created, enabled={}", stack_sampler.enabled()));
+    // 降级原因必须落日志：这条是「栈采样为什么不工作」唯一不用提权排查的证据
+    if let Some(reason) = stack_sampler.disabled_reason() {
+        diag_log(&format!("run_foreground: StackSampler disabled reason: {}", reason));
+    }
     let (etw_tx, etw_rx) = std::sync::mpsc::channel::<(i64, Vec<ProcessBrief>)>();
     let worker_db = config.storage.db_path.clone();
     std::thread::Builder::new()
@@ -119,7 +123,13 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         .spawn(move || {
             // 后台线程独占 StackSampler：慢速采样与落库都在这里，每次事件限频一轮
             while let Ok((event_id, culprits)) = etw_rx.recv() {
-                let samples = stack_sampler.sample(&culprits);
+                let (samples, stats) = stack_sampler.sample_with_stats(&culprits);
+                // 落一行证据：raw_frames 与 hotspots 分别对应
+                // 「有没有采到栈」和「栈能不能解析成模块热点」，排查时一眼区分
+                diag_log(&format!(
+                    "etw-worker: event={} culprits={} raw_frames={} hotspots={}",
+                    event_id, stats.culprits, stats.raw_frames, stats.hotspots
+                ));
                 if samples.is_empty() {
                     continue;
                 }
@@ -130,6 +140,28 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("ETW worker thread spawn failed: {}", e))?;
     diag_log("run_foreground: ETW worker started");
+
+    // 进程级网络流量采集（ETW Microsoft-Windows-Kernel-Network）。
+    //
+    // 为什么放服务侧：该 provider 属于内核侧，普通用户进程启用会被拒
+    // （实测 EnableTraceEx2 返回 ERROR_ACCESS_DENIED=0x5）。服务以 LocalSystem
+    // 运行，才有权限开这个会话。前台 `Run` 调试时通常降级（enabled=false），
+    // 此时 GUI 的网络列显示「—」而不是 0——不把「采不到」伪装成「没流量」。
+    let mut net_tracer = find_stutter_core::NetTracer::start();
+    if let Err(e) = logger.write_net_tracer_status(net_tracer.enabled()) {
+        warn!("write_net_tracer_status failed: {}", e);
+    }
+    diag_log(&format!(
+        "run_foreground: NetTracer enabled={}",
+        net_tracer.enabled()
+    ));
+
+    // 存活进程清理 / 采集状态心跳间隔（按 tick 数换算，不假设固定 1s tick）
+    let tick_ms = config.sampling.interval_ms.max(1) as u64;
+    let net_prune_every = (300_000 / tick_ms).max(1);
+    // 采集状态必须定期刷新：GUI 用「enabled=1 且 updated_at 在 5 分钟内」判定可用，
+    // 只在启动写一次的话 5 分钟后网络列会集体变成「—」。
+    let net_status_every = (60_000 / tick_ms).max(1);
 
     // 启动时立即写一次心跳，让 GUI 一启动就能看到「服务在跑」
     if let Err(e) = logger.touch_heartbeat() {
@@ -229,6 +261,35 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
             warn!("write_sample failed: {}", e);
             if count <= 3 {
                 diag_log(&format!("run_foreground: tick={} write_sample failed: {}", count, e));
+            }
+        }
+
+        // 进程级网络：每 tick 写**全部**有累计记录的 pid（含 0 速率的静默行）。
+        // 必须写 0 行，否则 UI 用「窗口内行数」求平均时，缺行会让静默 pid 的
+        // 累计值过期、速率窗口失真。
+        if net_tracer.enabled() {
+            let rates = net_tracer.take_rates();
+            if !rates.is_empty() {
+                let rows: Vec<find_stutter_core::logger::ProcessNetRow> = rates
+                    .iter()
+                    .map(|r| find_stutter_core::logger::ProcessNetRow {
+                        pid: r.pid,
+                        sent_bps: r.sent_bps,
+                        recv_bps: r.recv_bps,
+                        sent_total: r.sent_total,
+                        recv_total: r.recv_total,
+                    })
+                    .collect();
+                logger.write_process_net(sample.timestamp.timestamp(), &rows);
+            }
+            if count % net_prune_every == 0 {
+                let alive = find_stutter_core::net_tracer::alive_pids();
+                net_tracer.retain_alive(&|pid| alive.contains(&pid));
+            }
+            if count % net_status_every == 0 {
+                if let Err(e) = logger.write_net_tracer_status(net_tracer.enabled()) {
+                    warn!("write_net_tracer_status failed: {}", e);
+                }
             }
         }
 

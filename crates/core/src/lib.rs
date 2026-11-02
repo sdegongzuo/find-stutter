@@ -3,7 +3,9 @@ pub mod detector;
 pub mod logger;
 pub mod software_root_cause;
 pub mod stack_sampler;
-pub use stack_sampler::StackSampler;
+pub use stack_sampler::{SampleStats, StackSampler};
+pub mod net_tracer;
+pub use net_tracer::{NetRate, NetTracer, PidBytes};
 pub mod types;
 pub mod win32;
 

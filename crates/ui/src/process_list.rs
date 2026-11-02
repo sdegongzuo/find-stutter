@@ -62,10 +62,18 @@ pub struct ProcessRow {
     pub disk_read_bps: u64,
     /// 磁盘写速率（B/s）
     pub disk_write_bps: u64,
-    /// 网络等非磁盘 I/O 速率（B/s）
+    /// 网络收发速率（B/s，上下行合计）。
+    ///
+    /// 来源：service 用 ETW `Microsoft-Windows-Kernel-Network` 采集后写 `process_net`
+    /// 表，本页只读查询。**不要**再用 `GetProcessIoCounters` 的
+    /// `OtherTransferCount` 当网络字节：实测下载 46.6 MB 时它只记了 17.2 MB，
+    /// 且会把非网络 I/O 混进来（详见 `net_tracer` 模块注释）。
     pub net_bps: u64,
-    /// 累计网络等非磁盘 I/O 字节（OtherTransferCount 当前值）
+    /// 自 ETW 采集会话开始以来累计的网络字节（只算网络，不含其它 I/O）。
     pub net_total_bytes: u64,
+    /// 网络数据是否可用：service 未运行 / ETW 无权限 / 尚未落库时为 false，
+    /// 此时两列显示「—」而不是 0——不能把「采不到」伪装成「没流量」。
+    pub net_known: bool,
     /// 监听 TCP 端口 + UDP 端口（去重 + 排序后的端口号列表）。
     /// 空 = 无端口。
     pub ports: Vec<u16>,
@@ -90,13 +98,124 @@ pub struct ProcessSampler {
     /// 不匹配（同周期内 pid 被其他进程复用）时视为失效重查——单独裁剪防不住
     /// 「旧进程退出、新进程立刻复用同一 pid」的串味。
     name_cache: HashMap<u32, (String, String)>,
+    /// 进程网络明细只读查询（service 采集落库 → 本页读）
+    net: ProcessNetReader,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct IoSnapshot {
     read: u64,
     write: u64,
-    other: u64,
+}
+
+/// 网络速率的统计窗口（秒）：取 service 最近 N 秒的落库行求平均。
+const NET_WINDOW_SECS: i64 = 5;
+
+/// 单个进程的网络读数（速率 + 累计）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProcessNetStat {
+    /// 窗口内平均速率（B/s，上下行合计）
+    bps: u64,
+    /// 自采集会话开始累计（字节，上下行合计）
+    total: u64,
+}
+
+/// 进程网络明细的只读查询器（数据由 service 落库）。
+///
+/// 链路边界的意义：GUI 是普通用户进程，自己开 `Microsoft-Windows-Kernel-Network`
+/// 会被拒（实测 `EnableTraceEx2` 返回 0x5），所以必须由 LocalSystem 的服务采集、
+/// GUI 只读查询——这也是 P3「服务采集 + GUI 只读」架构的自然延伸。
+struct ProcessNetReader {
+    conn: Option<rusqlite::Connection>,
+}
+
+impl ProcessNetReader {
+    /// 只读打开数据库。文件不存在 / 无权限 → None（后续读恒为空，UI 显示「—」）。
+    fn new(db_path: Option<&std::path::Path>) -> Self {
+        let conn = db_path.and_then(|p| {
+            rusqlite::Connection::open_with_flags(
+                p,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .ok()
+        });
+        Self { conn }
+    }
+
+    /// 测试专用：注入内存库连接。
+    #[cfg(test)]
+    fn from_conn(conn: rusqlite::Connection) -> Self {
+        Self { conn: Some(conn) }
+    }
+
+    /// 读最近 `window_secs` 秒的数据，按 pid 聚合为「平均速率 + 最新累计值」。
+    ///
+    /// 每行存的是「该窗口的平均 B/s」（service 已按实际窗口时长归一化，空闲降频
+    /// 到 5s 也不会失真），所以直接把窗口内各行求平均即得平滑速率。
+    ///
+    /// 返回 `(pid → 读数, 采集器是否可用)`。可用 = status 表 enabled=1 且 5 分钟内
+    /// 更新过——服务没跑或 ETW 无权限时为 false。
+    fn read(&mut self, window_secs: i64) -> (HashMap<u32, ProcessNetStat>, bool) {
+        let Some(conn) = self.conn.as_ref() else {
+            return (HashMap::new(), false);
+        };
+        let now = chrono::Utc::now();
+        let status_ok = conn
+            .query_row(
+                "SELECT enabled FROM net_tracer_status \
+                 WHERE id = 1 AND updated_at >= ?1",
+                rusqlite::params![(now - chrono::Duration::minutes(5)).to_rfc3339()],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v == 1)
+            .unwrap_or(false);
+
+        let since = now.timestamp() - window_secs.max(1);
+        let mut stmt = match conn.prepare(
+            "SELECT pid, sent_bps, recv_bps, sent_total, recv_total, ts \
+             FROM process_net WHERE ts >= ?1",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                // 表不存在（旧库 / 服务未升级）或 schema 不一致：网络列降级为「—」，
+                // 但要留日志——静默吞错会让「列一直不显示」无从排查。
+                log::warn!("process_net 查询准备失败，网络列降级显示「—」: {e}");
+                return (HashMap::new(), status_ok);
+            }
+        };
+        // pid → (窗口内字节合计, 行数, 累计字节, 该 pid 最新 ts)
+        let mut acc: HashMap<u32, (u64, u32, u64, i64)> = HashMap::new();
+        let rows = stmt.query_map(rusqlite::params![since], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u32,
+                r.get::<_, i64>(1)?.max(0) as u64,
+                r.get::<_, i64>(2)?.max(0) as u64,
+                r.get::<_, i64>(3)?.max(0) as u64,
+                r.get::<_, i64>(4)?.max(0) as u64,
+                r.get::<_, i64>(5)?,
+            ))
+        });
+        let Ok(rows) = rows else {
+            return (HashMap::new(), status_ok);
+        };
+        for row in rows.flatten() {
+            let (pid, sent, recv, sent_total, recv_total, ts) = row;
+            let e = acc.entry(pid).or_insert((0, 0, 0, i64::MIN));
+            e.0 = e.0.saturating_add(sent).saturating_add(recv);
+            e.1 += 1;
+            if ts >= e.3 {
+                e.3 = ts;
+                e.2 = sent_total.saturating_add(recv_total);
+            }
+        }
+        let out = acc
+            .into_iter()
+            .map(|(pid, (bytes, n, total, _))| {
+                (pid, ProcessNetStat { bps: bytes / n.max(1) as u64, total })
+            })
+            .collect();
+        (out, status_ok)
+    }
 }
 
 /// Chromium 家族进程（WebView2 / Edge / Chrome）的角色，取自命令行 --type 开关。
@@ -321,7 +440,10 @@ impl ProcessSampler {
     /// 只刷新本页所需（进程 + CPU + 内存）：`new_all`/`refresh_all` 还会枚举
     /// 磁盘 / 网络接口 / 硬件组件，而 new() 在 UI 线程（右键菜单回调）执行，
     /// 全量枚举会让窗口打开瞬间冻结数百毫秒。
-    pub fn new() -> Self {
+    ///
+    /// `db_path`：service 写入的 stutter.db（网络列从这里读）。传 None 时网络列
+    /// 显示「—」，其余列照常——进程详情页不因网络数据缺失而不可用。
+    pub fn new(db_path: Option<&std::path::Path>) -> Self {
         let mut sys = sysinfo::System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         sys.refresh_cpu_all();
@@ -333,6 +455,7 @@ impl ProcessSampler {
             prev_time: None,
             port_cache: HashMap::new(),
             name_cache: HashMap::new(),
+            net: ProcessNetReader::new(db_path),
         }
     }
 
@@ -359,6 +482,10 @@ impl ProcessSampler {
         // 系统级调用几十毫秒，进程列表刷新间隔 ≥ 500ms，开销可接受。
         self.port_cache = port_map();
 
+        // 进程网络读数：service 用 ETW 采集落库，这里按 pid 只读查询。
+        // 窗口取 5 秒：任务管理器那列本身也是短窗口平滑，纯 1 秒瞬时值抖动大。
+        let (net_map, net_known) = self.net.read(NET_WINDOW_SECS);
+
         let mut rows: Vec<ProcessRow> = Vec::with_capacity(self.sys.processes().len());
         let mut next_io: HashMap<u32, IoSnapshot> = HashMap::new();
         // Chromium 家族（WebView2/Edge/Chrome）pid → 角色（命令行 --type 解析，供展示名标注）
@@ -370,13 +497,12 @@ impl ProcessSampler {
             let (cur, detail) = process_io_and_memory(pid_u32);
 
             // 差分速率：需要上次基线 + 时间间隔
-            let (read_bps, write_bps, net_bps) = match (self.prev_io.get(&pid_u32), dt) {
+            let (read_bps, write_bps) = match (self.prev_io.get(&pid_u32), dt) {
                 (Some(prev), Some(dt)) if dt > 0.0 => (
                     rate(prev.read, cur.read, dt),
                     rate(prev.write, cur.write, dt),
-                    rate(prev.other, cur.other, dt),
                 ),
-                _ => (0, 0, 0),
+                _ => (0, 0),
             };
             next_io.insert(pid_u32, cur);
 
@@ -396,6 +522,7 @@ impl ProcessSampler {
             let pws = detail.map_or(ws, |d| d.1); // 专用工作集
             // 监听/UDP 端口：port_map 里有就取，没有就是空（绝大多数进程无端口）
             let ports = self.port_cache.get(&pid_u32).cloned().unwrap_or_default();
+            let net_stat = net_map.get(&pid_u32).copied().unwrap_or_default();
             rows.push(ProcessRow {
                 pid: pid_u32,
                 parent_pid: p.parent().map(|x| x.as_u32()).unwrap_or(0),
@@ -408,8 +535,9 @@ impl ProcessSampler {
                 memory_pct: mem_pct(mem, total_mem),
                 disk_read_bps: read_bps,
                 disk_write_bps: write_bps,
-                net_bps,
-                net_total_bytes: cur.other,
+                net_bps: net_stat.bps,
+                net_total_bytes: net_stat.total,
+                net_known,
                 ports,
                 status: format_status(p.status()),
             });
@@ -643,6 +771,8 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
         acc.disk_write_bps = acc.disk_write_bps.saturating_add(r.disk_write_bps);
         acc.net_bps = acc.net_bps.saturating_add(r.net_bps);
         acc.net_total_bytes = acc.net_total_bytes.saturating_add(r.net_total_bytes);
+        // 组内任一进程有网络数据即视为该组可展示（否则整组显示「—」）
+        acc.net_known |= r.net_known;
     }
     acc
 }
@@ -1840,7 +1970,7 @@ fn process_io_and_memory(pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(h) => h,
-            Err(_) => return (IoSnapshot { read: 0, write: 0, other: 0 }, None),
+            Err(_) => return (IoSnapshot { read: 0, write: 0 }, None),
         };
         let mut counters: windows::Win32::System::Threading::IO_COUNTERS =
             std::mem::zeroed();
@@ -1848,10 +1978,9 @@ fn process_io_and_memory(pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
             IoSnapshot {
                 read: counters.ReadTransferCount,
                 write: counters.WriteTransferCount,
-                other: counters.OtherTransferCount,
             }
         } else {
-            IoSnapshot { read: 0, write: 0, other: 0 }
+            IoSnapshot { read: 0, write: 0 }
         };
         // EX2 结构传基结构指针（Win32 惯例，与 process_memory_detail 一致）
         let mut mc: PROCESS_MEMORY_COUNTERS_EX2 = std::mem::zeroed();
@@ -1873,7 +2002,7 @@ fn process_io_and_memory(pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
 
 #[cfg(not(windows))]
 fn process_io_and_memory(_pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
-    (IoSnapshot { read: 0, write: 0, other: 0 }, None)
+    (IoSnapshot { read: 0, write: 0 }, None)
 }
 
 /// 枚举当前运行的 Windows 服务 → pid → 服务显示名列表。
@@ -1995,27 +2124,40 @@ pub fn format_disk_full(row: &ProcessRow) -> String {
     )
 }
 
-/// 网络速率短文本。
+/// 网络速率短文本。采集不可用时显示「—」（不能把「采不到」显示成 0 B/s）。
 pub fn format_net_short(row: &ProcessRow) -> String {
+    if !row.net_known {
+        return "—".to_string();
+    }
     format!("{}/s", format_bytes(row.net_bps))
 }
 
 pub fn format_net_full(row: &ProcessRow) -> String {
+    if !row.net_known {
+        return "网络: —（服务未运行或 ETW 采集不可用）".to_string();
+    }
     format!(
-        "网络等非磁盘 I/O: {}/s ({} B/s)\n说明: Windows 将网络计入 IO_COUNTERS.Other，含管道等",
+        "网络: {}/s ({} B/s，上下行合计)\n口径: 服务侧 ETW Kernel-Network 采集，最近 {}s 平均",
         format_bytes(row.net_bps),
-        row.net_bps
+        row.net_bps,
+        NET_WINDOW_SECS
     )
 }
 
 /// 累计网络传输量短文本（任务管理器「网络」总列）。
 pub fn format_net_total(row: &ProcessRow) -> String {
+    if !row.net_known {
+        return "—".to_string();
+    }
     format_bytes(row.net_total_bytes)
 }
 
 pub fn format_net_total_full(row: &ProcessRow) -> String {
+    if !row.net_known {
+        return "累计网络: —（服务未运行或 ETW 采集不可用）".to_string();
+    }
     format!(
-        "累计网络等非磁盘 I/O: {} ({} 字节)\n说明: Windows 将网络计入 IO_COUNTERS.Other，含管道等",
+        "累计网络: {} ({} 字节，上下行合计)\n口径: 自 ETW 采集会话开始累计（服务启动时刻），非进程启动以来",
         format_bytes(row.net_total_bytes),
         row.net_total_bytes
     )
@@ -2277,11 +2419,14 @@ impl ProcessListWindow {
         refresh_ms: u64,
         compact_columns: bool,
         initial_sort: &str,
+        db_path: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
         let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::SeqCst);
         let ui = crate::ProcessList::new()?;
         ui.set_compact_columns(compact_columns);
-        let sampler: Arc<Mutex<ProcessSampler>> = Arc::new(Mutex::new(ProcessSampler::new()));
+        let sampler: Arc<Mutex<ProcessSampler>> = Arc::new(Mutex::new(ProcessSampler::new(
+            db_path.as_deref(),
+        )));
         let sort: Arc<Mutex<(String, bool)>> =
             Arc::new(Mutex::new((initial_sort.to_string(), false)));
         let search: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
@@ -3442,6 +3587,7 @@ mod tests {
             disk_write_bps: 0,
             net_bps: 0,
             net_total_bytes: 0,
+            net_known: false,
             ports: Vec::new(),
             status: "运行中".into(),
         }
@@ -3764,7 +3910,90 @@ mod tests {
     fn format_net_short_rate() {
         let mut r = row(1, "a", 10.0, 100);
         r.net_bps = 5 * 1024 * 1024;
+        r.net_total_bytes = 8 * 1024 * 1024;
+        r.net_known = true;
         assert_eq!(format_net_short(&r), "5.0M/s");
+        assert_eq!(format_net_total(&r), "8.0M");
+    }
+
+    /// 进程网络读取：多行求平均 + 取最新累计 + 采集器可用性判定。
+    #[test]
+    fn process_net_reader_averages_window_and_takes_latest_total() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE process_net (
+                ts INTEGER NOT NULL, pid INTEGER NOT NULL,
+                sent_bps INTEGER NOT NULL, recv_bps INTEGER NOT NULL,
+                sent_total INTEGER NOT NULL, recv_total INTEGER NOT NULL,
+                PRIMARY KEY (ts, pid)) WITHOUT ROWID;
+             CREATE TABLE net_tracer_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // pid 7 三行（ts = now, now-1, now-2）：每行上下行各 1000 B/s；
+        // 累计每行递增（单方向 20000/22000/24000），展示值取上下行合计。
+        for (i, total) in [(0i64, 20000i64), (1, 22000), (2, 24000)] {
+            conn.execute(
+                "INSERT INTO process_net VALUES (?1, 7, 1000, 1000, ?2, ?2)",
+                rusqlite::params![now - i, total],
+            )
+            .unwrap();
+        }
+        // pid 9：只有一行旧数据（窗口外）→ 不应计入
+        conn.execute(
+            "INSERT INTO process_net VALUES (?1, 9, 999, 999, 999, 999)",
+            rusqlite::params![now - 60],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO net_tracer_status VALUES (1, 1, ?1)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let mut reader = ProcessNetReader::from_conn(conn);
+        let (map, known) = reader.read(5);
+        assert!(known, "status 表 enabled=1 且新鲜 → 采集可用");
+        let st = map.get(&7).expect("pid 7 应在窗口内");
+        assert_eq!(st.bps, 2000, "每行上下行各 1000 → 合计 2000，三行平均仍是 2000");
+        assert_eq!(st.total, 40000, "累计 = 上下行合计，取 ts 最新那一行（20000+20000）");
+        assert!(!map.contains_key(&9), "窗口外的旧行不计入");
+    }
+
+    #[test]
+    fn process_net_reader_reports_unknown_without_status() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE process_net (
+                ts INTEGER NOT NULL, pid INTEGER NOT NULL,
+                sent_bps INTEGER NOT NULL, recv_bps INTEGER NOT NULL,
+                sent_total INTEGER NOT NULL, recv_total INTEGER NOT NULL,
+                PRIMARY KEY (ts, pid)) WITHOUT ROWID;
+             CREATE TABLE net_tracer_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        // 无 status 行（旧服务 / 未采集）→ 不可用，UI 应显示「—」
+        let mut reader = ProcessNetReader::from_conn(conn);
+        let (map, known) = reader.read(5);
+        assert!(!known);
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn format_net_shows_dash_when_collector_unavailable() {
+        // 采集不可用（服务没跑 / ETW 无权限）时必须显示「—」而不是 0 B/s，
+        // 否则用户会把「采不到」误读成「没流量」——这正是原 OtherTransferCount
+        // 方案给人的错觉。
+        let r = row(1, "a", 0.0, 0);
+        assert!(!r.net_known);
+        assert_eq!(format_net_short(&r), "—");
+        assert_eq!(format_net_total(&r), "—");
+        assert!(format_net_full(&r).contains("采集不可用"));
+        assert!(format_net_total_full(&r).contains("采集不可用"));
     }
 
     #[test]
@@ -4212,6 +4441,7 @@ mod tests {
             disk_write_bps: 0,
             net_bps: 0,
             net_total_bytes: 0,
+            net_known: false,
             ports: vec![],
             status: String::new(),
         }

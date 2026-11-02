@@ -18,6 +18,22 @@ pub struct Logger {
     /// 实际落库节流到 MIN_HEARTBEAT_INTERVAL_MS，降低单行表 WAL 写放大；
     /// GUI Stale 阈值默认 5s，2s 节拍留有 2.5 倍裕度。
     heartbeat_last_ms: AtomicU64,
+    /// 进程级网络流量缓冲：`(unix 秒, 速率与累计)`，随 flush 批量落库。
+    net_buffer: Vec<(i64, ProcessNetRow)>,
+}
+
+/// 进程网络明细保留时长（秒）：UI 只读最近几秒算速率、最近一分钟取累计，
+/// 保留 180s 有充足裕度，同时把表规模压在「活跃进程数 × 180」以内。
+pub const PROCESS_NET_RETENTION_SECS: i64 = 180;
+
+/// 进程网络行（写库用）。速率已归一化为 B/s，与采样间隔/降频无关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessNetRow {
+    pub pid: u32,
+    pub sent_bps: u64,
+    pub recv_bps: u64,
+    pub sent_total: u64,
+    pub recv_total: u64,
 }
 
 /// 心跳最小落库间隔
@@ -165,6 +181,26 @@ impl Logger {
                 software_root_cause TEXT NOT NULL,
                 baseline_delta TEXT NOT NULL,
                 computed_at TEXT NOT NULL
+            );
+            -- 进程级网络流量明细（ETW Microsoft-Windows-Kernel-Network 采集）。
+            -- sent_bytes/recv_bytes 是「该秒内的增量」，UI 取最近 N 秒求平均得速率；
+            -- sent_total/recv_total 是「自 ETW 会话开始的累计」，取该 pid 最新一行。
+            -- 仅保留 PROCESS_NET_RETENTION_SECS 秒，规模 = 活跃进程数 × 180。
+            CREATE TABLE IF NOT EXISTS process_net (
+                ts INTEGER NOT NULL,
+                pid INTEGER NOT NULL,
+                sent_bps INTEGER NOT NULL,
+                recv_bps INTEGER NOT NULL,
+                sent_total INTEGER NOT NULL,
+                recv_total INTEGER NOT NULL,
+                PRIMARY KEY (ts, pid)
+            ) WITHOUT ROWID;
+            -- 采集器状态（单行）：enabled=0 表示 ETW 不可用（无权限/被占用），
+            -- UI 据此把网络列显示为「—」而不是 0——不能把「采不到」伪装成「没流量」。
+            CREATE TABLE IF NOT EXISTS net_tracer_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
             );",
         )?;
 
@@ -226,6 +262,7 @@ impl Logger {
             config: config.clone(),
             last_flush: Instant::now(),
             heartbeat_last_ms: AtomicU64::new(0),
+            net_buffer: Vec::new(),
         })
     }
 
@@ -237,12 +274,31 @@ impl Logger {
         Ok(())
     }
 
+    /// 进程级网络流量写入（缓冲，随下一次 flush 批量落库）。
+    ///
+    /// `ts` 为 Unix 秒；`rows` 为本窗口速率（B/s）与累计值，调用方负责只传存活 pid。
+    pub fn write_process_net(&mut self, ts: i64, rows: &[ProcessNetRow]) {
+        for r in rows {
+            self.net_buffer.push((ts, *r));
+        }
+    }
+
+    /// 记录采集器可用状态（每次服务启动写一次，供 GUI 区分「没流量」与「采不到」）。
+    pub fn write_net_tracer_status(&self, enabled: bool) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO net_tracer_status (id, enabled, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+            params![enabled as i64, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> anyhow::Result<()> {
-        if self.buffer.is_empty() {
+        if self.buffer.is_empty() && self.net_buffer.is_empty() {
             return Ok(());
         }
         let tx = self.conn.transaction()?;
-        {
+        if !self.buffer.is_empty() {
             let mut stmt = tx.prepare(
                 "INSERT INTO samples (
                     timestamp, cpu_usage, cpu_per_core, cpu_freq_mhz,
@@ -294,8 +350,32 @@ impl Logger {
                 ])?;
             }
         }
+        if !self.net_buffer.is_empty() {
+            {
+                let mut stmt = tx.prepare(
+                    "INSERT OR REPLACE INTO process_net
+                        (ts, pid, sent_bps, recv_bps, sent_total, recv_total)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )?;
+                for (ts, d) in &self.net_buffer {
+                    stmt.execute(params![
+                        ts,
+                        d.pid as i64,
+                        d.sent_bps as i64,
+                        d.recv_bps as i64,
+                        d.sent_total as i64,
+                        d.recv_total as i64,
+                    ])?;
+                }
+            }
+            // 明细只服务最近几秒的速率计算与最近一分钟的累计读数，
+            // 每次 flush 顺带裁掉过期行（表规模恒定，不需要额外定时任务）。
+            let cutoff = Utc::now().timestamp() - PROCESS_NET_RETENTION_SECS;
+            tx.execute("DELETE FROM process_net WHERE ts < ?1", params![cutoff])?;
+        }
         tx.commit()?;
         self.buffer.clear();
+        self.net_buffer.clear();
         self.last_flush = Instant::now();
         Ok(())
     }
@@ -832,6 +912,76 @@ mod tests {
         logger.touch_heartbeat().unwrap(); // 节流窗口内：应跳过
         let ts2 = logger.latest_heartbeat().unwrap().unwrap();
         assert_eq!(ts1, ts2, "节流窗口内的第二次调用不应更新时间戳");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 进程网络：写入 → 回读一致，且过期行在 flush 时被裁掉。
+    #[test]
+    fn process_net_roundtrip_and_retention() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("net.db");
+        let cfg = StorageConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            retention_days: 30,
+            event_retention_days: 7,
+            hot_retention_days: 0,
+        };
+        let mut logger = Logger::new(&cfg).unwrap();
+        let now = Utc::now().timestamp();
+        let rows = vec![
+            ProcessNetRow { pid: 42, sent_bps: 1000, recv_bps: 2000, sent_total: 5000, recv_total: 9000 },
+            ProcessNetRow { pid: 43, sent_bps: 0, recv_bps: 0, sent_total: 0, recv_total: 0 },
+        ];
+        logger.write_process_net(now, &rows);
+        logger.flush().unwrap();
+
+        let conn = Connection::open(&db).unwrap();
+        let (sb, rb, st, rt): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT sent_bps, recv_bps, sent_total, recv_total FROM process_net WHERE pid = 42 AND ts = ?1",
+                params![now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!((sb, rb, st, rt), (1000, 2000, 5000, 9000));
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM process_net", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "0 速率的静默行也要落库（保累计值不过期）");
+
+        // 过期时间戳的行：flush 时随保留期清理一起删掉
+        logger.write_process_net(now - PROCESS_NET_RETENTION_SECS - 30, &rows);
+        logger.flush().unwrap();
+        drop(conn);
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM process_net", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "超过保留期的行应被 flush 清掉，只留未过期的两条");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn net_tracer_status_upserts_single_row() {
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = StorageConfig {
+            db_path: dir.join("netstatus.db").to_string_lossy().into_owned(),
+            retention_days: 30,
+            event_retention_days: 7,
+            hot_retention_days: 0,
+        };
+        let logger = Logger::new(&cfg).unwrap();
+        logger.write_net_tracer_status(false).unwrap();
+        logger.write_net_tracer_status(true).unwrap();
+        let (n, enabled): (i64, i64) = logger
+            .conn
+            .query_row("SELECT COUNT(*), MAX(enabled) FROM net_tracer_status", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((n, enabled), (1, 1), "单行表，后写覆盖先写");
         std::fs::remove_dir_all(&dir).ok();
     }
 
