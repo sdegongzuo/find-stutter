@@ -206,39 +206,82 @@ pub struct SampleStats {
     pub culprits: usize,
 }
 
-/// ETW 调用栈采样器。`enabled=false` 表示初始化失败，已静默降级（该层关闭）。
+/// 内核会话启动失败的分类。
+///
+/// 两类失败的重试价值完全相反，混成一个字符串就只能二选一：一律放弃 → 被 WPR /
+/// xperf 临时占用也整场失效；一律重试 → 没权限时每个卡顿事件都白打一次日志。
+#[derive(Debug)]
+enum StartError {
+    /// 权限类：运行期不会自己变好，直接关闭该层，别再白试
+    Fatal(String),
+    /// 暂时性：会话被其他工具占用（WPR / xperf）或偶发失败，下个卡顿事件再试
+    Retryable(String),
+}
+
+impl StartError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Fatal(m) | Self::Retryable(m) => m,
+        }
+    }
+
+    fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+}
+
+/// ETW 调用栈采样器。`enabled=false` 表示已确认不可恢复（权限），该层静默降级。
+///
+/// 构造时**不探测**：`StartTraceW` 一开就占用系统唯一的 NT Kernel Logger 会话，
+/// 启动时探测（起 + 停）既拖慢服务启动（实测 258ms），又会和 WPR / xperf 抢会话——
+/// 对方只是临时占用，却会让栈采样整场失效。改为首个卡顿事件按需启动（见 `sample`）。
 pub struct StackSampler {
-    enabled: bool,
-    /// 初始化失败原因（成功为 None），供服务写诊断日志——提权排查时唯一的证据链。
-    reason: Option<String>,
+    /// 是否还值得尝试。只有确认不可恢复（权限）才置 false。
+    enabled: std::sync::atomic::AtomicBool,
+    /// 最近一次失败原因（没失败过为 None），供服务写诊断日志——提权排查时唯一的证据链。
+    /// `sample` 只拿 `&self`，所以用 Mutex 而不是 `&mut`。
+    reason: Mutex<Option<String>>,
 }
 
 impl StackSampler {
-    // new() 会做 ETW 能力探测（有副作用），不实现 Default（避免语义误导）
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        match probe_etw() {
-            Ok(()) => Self {
-                enabled: true,
-                reason: None,
-            },
-            Err(e) => {
-                warn!("ETW 调用栈采样初始化失败（{}），该层静默关闭", e);
-                Self {
-                    enabled: false,
-                    reason: Some(e),
-                }
-            }
+        Self {
+            enabled: std::sync::atomic::AtomicBool::new(true),
+            reason: Mutex::new(None),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.enabled
+        self.enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// 初始化失败原因；成功返回 None。
-    pub fn disabled_reason(&self) -> Option<&str> {
-        self.reason.as_deref()
+    /// 最近一次记录的启动失败原因；没失败过返回 None。
+    pub fn disabled_reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 记录一次启动失败：原因只在**变化时**打 warn（每个事件都打会把诊断日志刷爆），
+    /// 且只有确认不可恢复（权限）才关闭该层。
+    fn note_failure(&self, err: StartError) {
+        let mut guard = self.reason.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_deref() != Some(err.message()) {
+            if err.is_fatal() {
+                warn!("ETW 调用栈采样不可用（{}），该层静默关闭", err.message());
+            } else {
+                warn!(
+                    "ETW 调用栈采样本次启动失败（{}），下个卡顿事件重试",
+                    err.message()
+                );
+            }
+        }
+        *guard = Some(err.message().to_string());
+        if err.is_fatal() {
+            self.enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// 对一组 culprit 进程做一次限频调用栈采样，返回聚合后的热点（可能为空）。
@@ -252,34 +295,28 @@ impl StackSampler {
             culprits: culprits.len(),
             ..Default::default()
         };
-        if !self.enabled || culprits.is_empty() {
+        if !self.enabled() || culprits.is_empty() {
             return (Vec::new(), stats);
         }
         match run_sample_window() {
             Ok(frames) => {
                 stats.raw_frames = frames.len();
-                let samples = aggregate_stack_samples(&frames, culprits);
+                let samples = aggregate_stack_samples(&frames, culprits, &snapshot_module_addrs);
                 stats.hotspots = samples.len();
                 (samples, stats)
             }
             Err(e) => {
-                warn!("ETW 调用栈采样运行失败，本次跳过: {}", e);
+                // 失败不 sleep、不阻塞：启动失败是微秒级，下个事件重试即可
+                self.note_failure(e);
                 (Vec::new(), stats)
             }
         }
     }
 }
 
-/// 探测 ETW 能力：能否启动内核会话 + 让采样事件带栈，并立即停止。
-/// 失败原因原样返回（供 `disabled_reason` 落到诊断日志）。
-fn probe_etw() -> Result<(), String> {
-    let handle = start_session()?;
-    stop_session(handle);
-    Ok(())
-}
-
-/// 启动 NT Kernel Logger 实时会话并开启「采样事件带栈」。失败返回原因（含缺权限 / 会话被占）。
-fn start_session() -> Result<CONTROLTRACE_HANDLE, String> {
+/// 启动 NT Kernel Logger 实时会话并开启「采样事件带栈」。
+/// 失败按可恢复性分类（见 [`StartError`]）。
+fn start_session() -> Result<CONTROLTRACE_HANDLE, StartError> {
     unsafe {
         let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
         let name: Vec<u16> = KERNEL_SESSION
@@ -315,17 +352,24 @@ fn start_session() -> Result<CONTROLTRACE_HANDLE, String> {
 
         let mut handle = CONTROLTRACE_HANDLE::default();
         let rc = StartTraceW(&mut handle, PCWSTR(name.as_ptr()), props);
+        // 会话被占（WPR / xperf 正在用系统唯一的 NT Kernel Logger）只是暂时状态：对方
+        // 一停我们就能开，所以留待下个事件重试；没权限则整场都不会变，直接关闭该层。
         if rc == ERROR_ALREADY_EXISTS {
-            return Err("NT Kernel Logger 会话已被其他程序占用（如 WPR / xperf）".to_string());
+            return Err(StartError::Retryable(
+                "NT Kernel Logger 会话已被其他程序占用（如 WPR / xperf）".to_string(),
+            ));
         }
         if rc != WIN32_ERROR(0) {
             if rc == ERROR_ACCESS_DENIED {
-                return Err(format!(
+                return Err(StartError::Fatal(format!(
                     "StartTraceW 拒绝访问，需要管理员 / LocalSystem: 0x{:08X}",
                     rc.0
-                ));
+                )));
             }
-            return Err(format!("StartTraceW 失败: 0x{:08X}", rc.0));
+            return Err(StartError::Retryable(format!(
+                "StartTraceW 失败: 0x{:08X}",
+                rc.0
+            )));
         }
 
         // 让内核为 PerfInfo 类的 SampledProfile(46) 事件附带调用栈。
@@ -344,10 +388,10 @@ fn start_session() -> Result<CONTROLTRACE_HANDLE, String> {
         );
         if rc != WIN32_ERROR(0) {
             stop_session(handle);
-            return Err(format!(
+            return Err(StartError::Retryable(format!(
                 "TraceSetInformation(TraceStackTracingInfo) 失败: 0x{:08X}",
                 rc.0
-            ));
+            )));
         }
         Ok(handle)
     }
@@ -388,7 +432,7 @@ fn stop_session(handle: CONTROLTRACE_HANDLE) {
 /// 执行一次限频采样窗口：启动会话 → 打开实时日志（必须带 `LoggerName`）→
 /// `ProcessTrace` 后台线程收集 → 采样窗口结束按句柄停会话（解除阻塞）→ 取回 SINK 原始帧。
 /// 任一步失败返回 Err（调用方降级为跳过本次）。
-fn run_sample_window() -> Result<Vec<RawFrame>, String> {
+fn run_sample_window() -> Result<Vec<RawFrame>, StartError> {
     let session = start_session()?;
     unsafe {
         // 清空 SINK，避免累积上一轮数据；同时重置「本轮是否已见过 ExtendedData 栈」
@@ -415,7 +459,9 @@ fn run_sample_window() -> Result<Vec<RawFrame>, String> {
         let trace = OpenTraceW(&mut logfile);
         if trace.Value == u64::MAX || trace.Value == 0 {
             stop_session(session);
-            return Err("OpenTraceW 失败（实时会话打不开）".to_string());
+            return Err(StartError::Retryable(
+                "OpenTraceW 失败（实时会话打不开）".to_string(),
+            ));
         }
         // ProcessTrace 阻塞直到会话被停止，放到后台线程
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -432,7 +478,10 @@ fn run_sample_window() -> Result<Vec<RawFrame>, String> {
                 // （直到服务重启），而且别的工具也再开不了内核会话。
                 stop_session(session);
                 let _ = CloseTrace(trace);
-                return Err(format!("ETW 采样线程创建失败: {}", e));
+                return Err(StartError::Retryable(format!(
+                    "ETW 采样线程创建失败: {}",
+                    e
+                )));
             }
         };
         std::thread::sleep(Duration::from_millis(SAMPLE_WINDOW_MS));
@@ -464,16 +513,21 @@ fn run_sample_window() -> Result<Vec<RawFrame>, String> {
 
 /// 聚合原始栈帧为调用栈热点（模块 + RVA 级别）。
 ///
-/// 1. 对每个 culprit 进程快照已加载模块（基址 + 大小）；
+/// 1. 对每个 culprit 进程快照已加载模块（基址 + 大小）——模块表查询由
+///    `modules_of` 注入，生产传 [`snapshot_module_addrs`]，单测传固定表；
 /// 2. 把采样到的指令地址解析成「模块名 + RVA」（地址落在模块 [base, base+size) 内）；
 /// 3. 按 (pid, 进程名, 模块, RVA) 计数，降序取前 MAX_HOTSPOTS。
-fn aggregate_stack_samples(frames: &[RawFrame], culprits: &[ProcessBrief]) -> Vec<StackSample> {
+fn aggregate_stack_samples(
+    frames: &[RawFrame],
+    culprits: &[ProcessBrief],
+    modules_of: &impl Fn(u32) -> Vec<(String, u64, u64)>,
+) -> Vec<StackSample> {
     // pid -> 进程名
     let names: HashMap<u32, String> = culprits.iter().map(|c| (c.pid, c.name.clone())).collect();
     // pid -> [(模块路径, 基址, 大小)]
     let mut maps: HashMap<u32, Vec<(String, u64, u64)>> = HashMap::new();
     for pid in names.keys() {
-        let mods = snapshot_module_addrs(*pid);
+        let mods = modules_of(*pid);
         if !mods.is_empty() {
             maps.insert(*pid, mods);
         }
@@ -540,6 +594,8 @@ mod tests {
         assert_eq!(resolve_address(&mods, 0x1000), None);
     }
 
+    /// 聚合：按 (模块, RVA) 计数、按 sample_count 降序、无模块命中的帧丢弃。
+    /// 模块表由参数注入（生产是 `snapshot_module_addrs`，系统 API 无法在单测里固定）。
     #[test]
     fn aggregate_stack_samples_tallies_by_module_rva() {
         let culprits = vec![ProcessBrief {
@@ -547,42 +603,92 @@ mod tests {
             name: "a.exe".into(),
             ..Default::default()
         }];
+        // 固定模块表：a.dll 占 [0x1000, 0x2000)
+        let modules = |_pid: u32| vec![("C:\\app\\a.dll".to_string(), 0x1000u64, 0x1000u64)];
         let frames = vec![
-            RawFrame {
-                pid: 7,
-                address: 0x1010,
-            },
-            RawFrame {
-                pid: 7,
-                address: 0x1010,
-            },
-            RawFrame {
-                pid: 7,
-                address: 0x1020,
-            },
-            RawFrame {
-                pid: 7,
-                address: 0x9999,
-            }, // 无模块命中 → 丢弃
+            RawFrame { pid: 7, address: 0x1010 },
+            RawFrame { pid: 7, address: 0x1010 },
+            RawFrame { pid: 7, address: 0x1020 },
+            RawFrame { pid: 7, address: 0x9999 }, // 无模块命中 → 丢弃
         ];
-        // 真实模块映射来自系统 API，这里直接构造一个固定帧集合并验证计数逻辑
-        // （地址解析依赖 snapshot_module_addrs，无法在测试里 mock，故此处只验证空输入安全）
-        let out = aggregate_stack_samples(&[], &culprits);
-        assert!(out.is_empty());
-        // 无 culprit 时安全
-        let out2 = aggregate_stack_samples(&frames, &[]);
-        assert!(out2.is_empty());
+        let out = aggregate_stack_samples(&frames, &culprits, &modules);
+        assert_eq!(out.len(), 2, "两个不同 RVA，0x9999 的帧被丢弃");
+        assert_eq!(out[0].rva, 0x10);
+        assert_eq!(out[0].sample_count, 2);
+        assert_eq!(out[0].module, "C:\\app\\a.dll");
+        assert_eq!(out[0].pid, 7);
+        assert_eq!(out[0].process_name, "a.exe");
+        assert_eq!(out[1].rva, 0x20);
+        assert_eq!(out[1].sample_count, 1);
+        // 降序：计数大的在前
+        assert!(out[0].sample_count >= out[1].sample_count);
+    }
+
+    /// 聚合结果被 MAX_HOTSPOTS 截断，且保留的是计数最高的那些。
+    #[test]
+    fn aggregate_stack_samples_truncates_to_max_hotspots() {
+        let culprits = vec![ProcessBrief {
+            pid: 7,
+            name: "a.exe".into(),
+            ..Default::default()
+        }];
+        let modules = |_pid: u32| vec![("a.dll".to_string(), 0x1000u64, 0x1000u64)];
+        // 25 个不同 RVA，计数分别为 25..=1（都被逐次采样）
+        let mut frames = Vec::new();
+        for i in 0..25u64 {
+            for _ in 0..(25 - i) {
+                frames.push(RawFrame {
+                    pid: 7,
+                    address: 0x1000 + i,
+                });
+            }
+        }
+        let out = aggregate_stack_samples(&frames, &culprits, &modules);
+        assert_eq!(out.len(), MAX_HOTSPOTS, "超过上限要截断");
+        assert_eq!(out[0].sample_count, 25, "截断保留计数最高的");
+        assert_eq!(out[MAX_HOTSPOTS - 1].sample_count, 25 - (MAX_HOTSPOTS as u64 - 1));
+    }
+
+    /// 空输入 / 无 culprit 时安全（原测试的意图，独立保留）。
+    #[test]
+    fn aggregate_stack_samples_handles_empty_input() {
+        let culprits = vec![ProcessBrief {
+            pid: 7,
+            name: "a.exe".into(),
+            ..Default::default()
+        }];
+        let modules = |_pid: u32| vec![("a.dll".to_string(), 0x1000u64, 0x1000u64)];
+        assert!(aggregate_stack_samples(&[], &culprits, &modules).is_empty());
+        let frames = vec![RawFrame { pid: 7, address: 0x1010 }];
+        assert!(aggregate_stack_samples(&frames, &[], &modules).is_empty());
     }
 
     #[test]
     fn stack_sampler_disabled_returns_empty() {
-        let s = StackSampler {
-            enabled: false,
-            reason: Some("unit-test".into()),
-        };
+        let s = StackSampler::new();
+        // 模拟已确认不可恢复（权限）后的状态
+        s.enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        *s.reason.lock().unwrap() = Some("unit-test".into());
         assert!(!s.enabled());
-        assert_eq!(s.disabled_reason(), Some("unit-test"));
+        assert_eq!(s.disabled_reason().as_deref(), Some("unit-test"));
         assert!(s.sample(&[]).is_empty());
+    }
+
+    /// 只有 Fatal（权限）才关闭该层；Retryable（会话被 WPR 占用等）只记录原因，
+    /// 下个事件还要继续尝试——否则 WPR 临时占用会让栈采样整场失效。
+    #[test]
+    fn stack_sampler_retries_retryable_failure_but_disables_on_fatal() {
+        let s = StackSampler::new();
+        assert!(s.enabled(), "构造后不探测，默认仍可尝试");
+
+        s.note_failure(StartError::Retryable("会话被占用".into()));
+        assert!(s.enabled(), "暂时性失败不能关闭该层");
+        assert_eq!(s.disabled_reason().as_deref(), Some("会话被占用"));
+
+        s.note_failure(StartError::Fatal("拒绝访问".into()));
+        assert!(!s.enabled(), "权限类失败才置 enabled=false");
+        assert_eq!(s.disabled_reason().as_deref(), Some("拒绝访问"));
     }
 
     /// `CLASSIC_EVENT_ID` 必须用 crate 的 24 字节布局（header 里是 `Reserved[7]`）。

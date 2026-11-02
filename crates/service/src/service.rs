@@ -106,16 +106,14 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // F-RC14-d：ETW 调用栈采样器（初始化失败自动静默降级，不影响采集热路径）。
+    // F-RC14-d：ETW 调用栈采样器（按需探测，首个卡顿事件时才启动内核会话）。
+    // 不在启动时探测：`StartTraceW` 会占用系统唯一的 NT Kernel Logger，探测本身拖慢
+    // 启动（实测 258ms），还会和 WPR / xperf 抢会话（对方临时占用不该让我们整场失效）。
     // 采样窗口在独立后台线程执行（PRD §F-RC14-d / 验收 687：绝不阻塞采集热路径）：
     // 主循环只把 (event_id, culprits) 塞进通道即返回，worker 线程完成采样后补写库。
-    diag_log("run_foreground: creating StackSampler + background ETW worker");
+    diag_log("run_foreground: creating StackSampler（按需探测，首个卡顿事件时才启动内核会话）");
     let stack_sampler = StackSampler::new();
     diag_log(&format!("run_foreground: StackSampler created, enabled={}", stack_sampler.enabled()));
-    // 降级原因必须落日志：这条是「栈采样为什么不工作」唯一不用提权排查的证据
-    if let Some(reason) = stack_sampler.disabled_reason() {
-        diag_log(&format!("run_foreground: StackSampler disabled reason: {}", reason));
-    }
     let (etw_tx, etw_rx) = std::sync::mpsc::channel::<(i64, Vec<ProcessBrief>)>();
     let worker_db = config.storage.db_path.clone();
     std::thread::Builder::new()
@@ -125,11 +123,16 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
             while let Ok((event_id, culprits)) = etw_rx.recv() {
                 let (samples, stats) = stack_sampler.sample_with_stats(&culprits);
                 // 落一行证据：raw_frames 与 hotspots 分别对应
-                // 「有没有采到栈」和「栈能不能解析成模块热点」，排查时一眼区分
-                diag_log(&format!(
+                // 「有没有采到栈」和「栈能不能解析成模块热点」，排查时一眼区分；
+                // reason= 是「栈采样为什么不工作」唯一不用提权排查的证据，有就带上。
+                let mut line = format!(
                     "etw-worker: event={} culprits={} raw_frames={} hotspots={}",
                     event_id, stats.culprits, stats.raw_frames, stats.hotspots
-                ));
+                );
+                if let Some(reason) = stack_sampler.disabled_reason() {
+                    line.push_str(&format!(" reason={}", reason));
+                }
+                diag_log(&line);
                 if samples.is_empty() {
                     continue;
                 }
@@ -156,7 +159,9 @@ pub fn run_foreground(config: Config) -> anyhow::Result<()> {
         net_tracer.enabled()
     ));
 
-    // 存活进程清理 / 采集状态心跳间隔（按 tick 数换算，不假设固定 1s tick）
+    // 存活进程清理 / 采集状态心跳间隔：按 interval_ms 换算成 tick 数。
+    // 实际单 tick 周期 = interval_ms + 本轮采集耗时，故真实间隔略大于标称值，
+    // 对「5 分钟清理一次」「1 分钟刷一次状态」这类粗粒度节拍无影响。
     let tick_ms = config.sampling.interval_ms.max(1) as u64;
     let net_prune_every = (300_000 / tick_ms).max(1);
     // 采集状态必须定期刷新：GUI 用「enabled=1 且 updated_at 在 5 分钟内」判定可用，

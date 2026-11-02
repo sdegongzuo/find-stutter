@@ -35,9 +35,9 @@ pub struct PidBytes {
 
 /// 一次采样窗口的读数：速率已按实际窗口时长归一化为 B/s + 累计值。
 ///
-/// 速率必须由采集器归一化，不能把「本窗口字节数」直接落库：
-/// 服务有空闲降频（`slow_interval_factor`，空闲时 tick 从 1s 放大到 5s），
-/// 下游若按「每行 = 1 秒」换算会高估数倍。
+/// 速率必须由采集器归一化，不能把「本窗口字节数」直接落库：服务侧 tick 周期是
+/// `interval_ms` + 本轮采集耗时（实际略大于标称值），下游若按「每行 = 1 秒」
+/// 换算会高估。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetRate {
     pub pid: u32,
@@ -63,6 +63,10 @@ pub struct NetTracer {
     control: Option<windows::Win32::System::Diagnostics::Etw::CONTROLTRACE_HANDLE>,
     #[cfg(windows)]
     consumer: Option<std::thread::JoinHandle<()>>,
+    /// 消费线程的退出通知：Drop 用它**带超时**地等线程结束（停不掉会话时
+    /// `ProcessTrace` 永不返回，直接 join 会把服务停止永久挂住）。
+    #[cfg(windows)]
+    done: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl NetTracer {
@@ -71,7 +75,7 @@ impl NetTracer {
         #[cfg(windows)]
         {
             match backtrace_impl::start() {
-                Ok((control, consumer)) => {
+                Ok((control, consumer, done)) => {
                     info!("进程网络采集已启动（Kernel-Network ETW 实时会话）");
                     Self {
                         enabled: true,
@@ -79,6 +83,7 @@ impl NetTracer {
                         last_at: None,
                         control: Some(control),
                         consumer: Some(consumer),
+                        done: Some(done),
                     }
                 }
                 Err(e) => {
@@ -89,6 +94,7 @@ impl NetTracer {
                         last_at: None,
                         control: None,
                         consumer: None,
+                        done: None,
                     }
                 }
             }
@@ -169,12 +175,26 @@ impl Drop for NetTracer {
     fn drop(&mut self) {
         #[cfg(windows)]
         {
-            // 先停会话解除 ProcessTrace 阻塞，再回收线程
-            backtrace_impl::stop_session();
-            if let Some(h) = self.consumer.take() {
-                let _ = h.join();
+            // 先按句柄停会话解除 ProcessTrace 阻塞，再回收线程。
+            backtrace_impl::stop_session(self.control.take());
+            if let Some(done) = self.done.take() {
+                // 会话停不掉时 ProcessTrace 永不返回，直接 join 会把服务停止永久挂住
+                // （与 stack_sampler 那边同样的 3s 上限）。超时只放弃线程句柄，
+                // 进程退出时 OS 会回收，比卡死服务强。
+                match done.recv_timeout(std::time::Duration::from_secs(3)) {
+                    Ok(()) => {
+                        if let Some(h) = self.consumer.take() {
+                            let _ = h.join();
+                        }
+                    }
+                    Err(_) => {
+                        warn!("ETW 网络消费线程未在 3s 内退出，放弃 join（不阻塞服务停止）");
+                        if let Some(h) = self.consumer.take() {
+                            std::mem::forget(h);
+                        }
+                    }
+                }
             }
-            self.control = None;
         }
     }
 }
@@ -260,10 +280,19 @@ mod backtrace_impl {
     }
 
     /// 启动会话 + 启用 provider + 后台消费线程。任一步失败返回可读原因。
-    pub(super) fn start() -> Result<(CONTROLTRACE_HANDLE, std::thread::JoinHandle<()>), String> {
+    ///
+    /// 第三个返回值是消费线程的退出通知（线程结束时发送），供 `Drop` 带超时等待。
+    pub(super) fn start() -> Result<
+        (
+            CONTROLTRACE_HANDLE,
+            std::thread::JoinHandle<()>,
+            std::sync::mpsc::Receiver<()>,
+        ),
+        String,
+    > {
         // 先停掉可能残留的同名会话：服务崩溃/被强杀时实时会话不会自动注销，
         // 复用那个「没人消费」的会话会导致事件堆积，必须重新建。
-        stop_session();
+        stop_session(None);
         let handle = start_session()?;
         // 先清空历史累计（服务重启后不应继承上一轮的值）
         {
@@ -278,7 +307,7 @@ mod backtrace_impl {
             let keyword = KEYWORD_IPV4 | KEYWORD_IPV6;
             let rc = EnableTraceEx2(handle, &NET_PROVIDER, 1, 0, keyword, 0, 0, None);
             if rc != WIN32_ERROR(0) {
-                stop_session();
+                stop_session(Some(handle));
                 let hint = if rc == ERROR_ACCESS_DENIED {
                     "（需要管理员或 LocalSystem 权限）"
                 } else {
@@ -291,6 +320,7 @@ mod backtrace_impl {
             // `EVENT_TRACE_LOGFILEW` 与 `LoggerName` 的缓冲必须存活到 CloseTrace，
             // 放在线程里生命周期最清晰（放外面给别的线程用是悬垂指针）。
             let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let consumer = std::thread::Builder::new()
                 .name("etw-net".into())
                 .spawn(move || {
@@ -317,6 +347,8 @@ mod backtrace_impl {
                             let _ = ready_tx.send(Err(
                                 "OpenTraceW 失败（实时会话无法打开）".to_string()
                             ));
+                            // 通知 Drop：线程已退出，不必等满 3s 超时
+                            let _ = done_tx.send(());
                             return;
                         }
                         let _ = ready_tx.send(Ok(()));
@@ -324,21 +356,23 @@ mod backtrace_impl {
                         let _ = ProcessTrace(&[trace], None, None);
                         let _ = CloseTrace(trace);
                     }
+                    // 退出通知必须在 CloseTrace 之后：Drop 收到它才认为可以 join
+                    let _ = done_tx.send(());
                 })
                 .map_err(|e| {
-                    stop_session();
+                    stop_session(Some(handle));
                     format!("ETW 网络消费线程创建失败: {e}")
                 })?;
 
             // 等消费线程确认 OpenTrace 成功后再返回，避免「enabled=true 但没数据」
             match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-                Ok(Ok(())) => Ok((handle, consumer)),
+                Ok(Ok(())) => Ok((handle, consumer, done_rx)),
                 Ok(Err(e)) => {
-                    stop_session();
+                    stop_session(Some(handle));
                     Err(e)
                 }
                 Err(_) => {
-                    stop_session();
+                    stop_session(Some(handle));
                     Err("ETW 消费线程启动超时（OpenTrace 未就绪）".to_string())
                 }
             }
@@ -374,7 +408,7 @@ mod backtrace_impl {
             let rc = StartTraceW(&mut handle, PCWSTR(name.as_ptr()), props);
             if rc != WIN32_ERROR(0) {
                 if rc == ERROR_ALREADY_EXISTS {
-                    // 走到这里说明 `start()` 开头的 `stop_session()` 也没清掉残留会话。
+                    // 走到这里说明 `start()` 开头的按名 `stop_session(None)` 也没清掉残留会话。
                     // 此时 `handle` 是无效值，继续用它会得到一堆「看不懂的」错误码，
                     // 直接当成失败、把原因说清楚。
                     return Err("会话名 find-stutter-net 已被占用（疑似上一实例残留）".to_string());
@@ -392,9 +426,23 @@ mod backtrace_impl {
     }
 
     /// 停止并清理会话（幂等；失败仅记日志）。
-    pub(super) fn stop_session() {
+    ///
+    /// 有句柄时先按句柄停——只影响我们自己开的这个会话；失败（或本来就没句柄，
+    /// 如启动前清残留）再按会话名兜底。按名停会把同名会话一起杀掉，所以不是首选。
+    pub(super) fn stop_session(handle: Option<CONTROLTRACE_HANDLE>) {
         unsafe {
             let props_size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>();
+            if let Some(h) = handle {
+                let mut props: EVENT_TRACE_PROPERTIES = EVENT_TRACE_PROPERTIES::default();
+                props.Wnode.BufferSize = props_size as u32;
+                props.Wnode.Flags = WNODE_FLAG_TRACED_GUID;
+                props.LoggerNameOffset = props_size as u32;
+                if ControlTraceW(h, PCWSTR::null(), &mut props, EVENT_TRACE_CONTROL_STOP)
+                    == WIN32_ERROR(0)
+                {
+                    return;
+                }
+            }
             let name: Vec<u16> = SESSION_NAME.encode_utf16().chain(std::iter::once(0)).collect();
             let mut props: EVENT_TRACE_PROPERTIES = EVENT_TRACE_PROPERTIES::default();
             props.Wnode.BufferSize = props_size as u32;
@@ -461,6 +509,8 @@ mod tests {
             control: None,
             #[cfg(windows)]
             consumer: None,
+            #[cfg(windows)]
+            done: None,
         };
         assert!(t.take_rates().is_empty());
         assert_eq!(t.totals_len(), 0);

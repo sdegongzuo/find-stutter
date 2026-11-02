@@ -69,9 +69,11 @@ target/release/find-stutter.exe
 - **网络列数据来源（重要）**：Windows 没有「按进程取网速」的廉价 API，
   任务管理器那一列本身来自 ETW。本项目的「网络 / 累计网络」两列由
   `find-stutter-service`（LocalSystem）订阅 ETW `Microsoft-Windows-Kernel-Network`
-  采集后写入 `process_net` 表，GUI 只读查询（最近 5 秒平均）。
-  - 服务未运行或前台 `Run` 调试（普通用户无内核会话权限）时，两列显示 **「—」**，
-    不会显示 0 B/s —— 「采不到」不能伪装成「没流量」。
+  采集后写入 `process_net` 表，GUI 只读查询。
+  - 速率取**最近 5 秒均值**；服务端是攒批落库（约 5 秒一次），5 秒窗口偶尔查不到行，
+    此时回退到最近一行（≤60 秒内）的速率，不会闪成 0。
+  - 服务未运行、ETW 无权限（前台 `Run` 调试）或**最新数据已超 15 秒**（采集停摆）时，
+    两列显示 **「—」**，不会显示 0 B/s —— 「采不到」不能伪装成「没流量」。
   - 「累计网络」口径是**自服务采集会话开始**的累计，不是进程启动以来的累计
     （ETW 拿不到进程启动前的历史）。
 - **调用栈热点数据来源（重要）**：卡顿触发后，服务会开一个约 1.2 秒的
@@ -80,9 +82,10 @@ target/release/find-stutter.exe
   「进程 + 模块 + RVA」计数，取前 20 名写入 `stack_samples` 表（分析页展示前 5）。
   - 只到模块 + RVA 级别，不引入 PDB 符号化（PRD §1.4）。
   - 需要内核会话权限，因此只在服务（LocalSystem）里跑；前台 `Run` 调试会静默降级，
-    诊断日志里会出现 `StackSampler disabled reason: ...`。
-  - 这个会话是**系统级共享资源**：被 WPR / xperf 占用时本次采样跳过（不抢占、也不会
-    误停别人正在跑的会话）。
+    诊断日志里 `etw-worker: ... reason=...` 会带上失败原因（启动时不再预先探测，
+    首个卡顿事件才开内核会话）。
+  - 这个会话是**系统级共享资源**：被 WPR / xperf 占用时本次采样跳过、下个卡顿事件
+    自动重试；只在权限类失败时才彻底关闭该层（不抢占、也不会误停别人正在跑的会话）。
 - **Chromium 家族标注**：进程详情页对 msedgewebview2.exe / msedge.exe /
   chrome.exe 按任务管理器口径标注——内嵌 WebView2 的浏览器进程显示宿主
   「WebView2: MarkFlowy」，子进程显示角色「WebView2 实用工具: Network Service」、

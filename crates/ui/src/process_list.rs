@@ -108,8 +108,20 @@ struct IoSnapshot {
     write: u64,
 }
 
-/// 网络速率的统计窗口（秒）：取 service 最近 N 秒的落库行求平均。
+/// 网络速率的平滑窗口（秒）：窗口内多行求平均，纯 1 秒瞬时值抖动太大。
+///
+/// 不能只查这个窗口：服务端是「攒 10 行或满 5 秒」才 flush 一次，落库时刻天然
+/// 比采集时刻晚几秒（实测最大滞后 6s），只看 5s 会在 flush 空档一行都查不到。
 const NET_WINDOW_SECS: i64 = 5;
+
+/// 单次查询覆盖的窗口（秒）：速率窗口查不到行时，从这里回退取最新一行的速率。
+/// 必须明显大于服务端 flush 周期（~5s），否则回退也会落空。
+const TOTAL_WINDOW_SECS: i64 = 60;
+
+/// 数据陈旧阈值（秒）：全表最新一行的 ts 比 now 旧超过这个值 = 采集停摆
+/// （服务退出 / ETW 会话被关），此时旧数不能当实时读数用。
+/// 必须大于服务端 flush 周期（~5s），否则正常 flush 空档会被误判为停摆。
+const NET_STALE_SECS: i64 = 15;
 
 /// 单个进程的网络读数（速率 + 累计）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,50 +139,81 @@ struct ProcessNetStat {
 /// GUI 只读查询——这也是 P3「服务采集 + GUI 只读」架构的自然延伸。
 struct ProcessNetReader {
     conn: Option<rusqlite::Connection>,
+    /// 库路径：连接失败时留着供下次 read 重试（GUI 常先于服务启动，库/表还不存在）。
+    db_path: Option<std::path::PathBuf>,
+}
+
+/// 只读打开数据库；文件不存在 / 无权限 / 非 Windows 路径问题时返回 None。
+fn open_read_only(path: Option<&std::path::Path>) -> Option<rusqlite::Connection> {
+    let path = path?;
+    rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()
 }
 
 impl ProcessNetReader {
-    /// 只读打开数据库。文件不存在 / 无权限 → None（后续读恒为空，UI 显示「—」）。
+    /// 只读打开数据库。文件不存在 / 无权限 → 连接为空（首次 read 会再试一次）。
     fn new(db_path: Option<&std::path::Path>) -> Self {
-        let conn = db_path.and_then(|p| {
-            rusqlite::Connection::open_with_flags(
-                p,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            )
-            .ok()
-        });
-        Self { conn }
+        let db_path = db_path.map(|p| p.to_path_buf());
+        Self {
+            conn: open_read_only(db_path.as_deref()),
+            db_path,
+        }
     }
 
     /// 测试专用：注入内存库连接。
     #[cfg(test)]
     fn from_conn(conn: rusqlite::Connection) -> Self {
-        Self { conn: Some(conn) }
+        Self {
+            conn: Some(conn),
+            db_path: None,
+        }
     }
 
-    /// 读最近 `window_secs` 秒的数据，按 pid 聚合为「平均速率 + 最新累计值」。
+    /// 读最近 [`TOTAL_WINDOW_SECS`] 秒的落库行，按 pid 聚合为「速率 + 累计」。
     ///
-    /// 每行存的是「该窗口的平均 B/s」（service 已按实际窗口时长归一化，空闲降频
-    /// 到 5s 也不会失真），所以直接把窗口内各行求平均即得平滑速率。
+    /// 为什么查 60 秒而不是 5 秒：服务端把 ETW 读数攒在 `net_buffer` 里，等
+    /// `Logger::write_sample` 触发 flush（攒满 10 行或距上次 flush 满 5 秒）才落库，
+    /// 所以库里的 ts 最多比真实时间晚 6 秒。只查 5 秒窗口时，flush 空档内 pid 一行
+    /// 都查不到 → 速率和**累计**同时变 0，而采集明明是好的，UI 就周期性闪「0 B/s / 0 B」。
     ///
-    /// 返回 `(pid → 读数, 采集器是否可用)`。可用 = status 表 enabled=1 且 5 分钟内
-    /// 更新过——服务没跑或 ETW 无权限时为 false。
-    fn read(&mut self, window_secs: i64) -> (HashMap<u32, ProcessNetStat>, bool) {
+    /// 一次查 60 秒，在 Rust 里按 ts 分两段用：
+    /// - **速率**：优先取最近 [`NET_WINDOW_SECS`] 秒的行求平均（每行已是归一化 B/s）；
+    ///   该窗口 0 行时回退到最新一行的速率（旧几秒但仍是准确 B/s），绝不返回 0。
+    /// - **累计**：一律取最新一行的 `sent_total+recv_total`（累计值单调，旧一点也不失真）。
+    ///
+    /// 返回 `(pid → 读数, 采集器是否可用)`。可用 = status 表 enabled=1 且 5 分钟内更新过，
+    /// **并且**全表最新一行不超过 [`NET_STALE_SECS`] 秒——采集停摆时返回 `(空, false)`，
+    /// 让 UI 显示「—」，不拿十几秒前的旧数冒充实时。
+    fn read(&mut self) -> (HashMap<u32, ProcessNetStat>, bool) {
+        // 连接可恢复：GUI 可能比服务先启动（库文件和表都还没建），开窗那一次打开
+        // 失败不能变成永久「—」。每次 read 重试一次，成功后就一直复用。
+        if self.conn.is_none() {
+            self.conn = open_read_only(self.db_path.as_deref());
+        }
         let Some(conn) = self.conn.as_ref() else {
             return (HashMap::new(), false);
         };
         let now = chrono::Utc::now();
         let status_ok = conn
             .query_row(
+                // 不直接比整串 RFC3339：`to_rfc3339()` 的小数位是 0/3/6/9 位自适应，
+                // "…:12.5Z" 与 "…:12Z" 的字典序与时间顺序相反，会误判新鲜度。
+                // 截到秒（前 19 字符）再比。
                 "SELECT enabled FROM net_tracer_status \
-                 WHERE id = 1 AND updated_at >= ?1",
-                rusqlite::params![(now - chrono::Duration::minutes(5)).to_rfc3339()],
+                 WHERE id = 1 AND substr(updated_at, 1, 19) >= ?1",
+                rusqlite::params![(now - chrono::Duration::minutes(5))
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string()],
                 |r| r.get::<_, i64>(0),
             )
             .map(|v| v == 1)
             .unwrap_or(false);
 
-        let since = now.timestamp() - window_secs.max(1);
+        let since = now.timestamp() - TOTAL_WINDOW_SECS;
+        let rate_since = now.timestamp() - NET_WINDOW_SECS;
         let mut stmt = match conn.prepare(
             "SELECT pid, sent_bps, recv_bps, sent_total, recv_total, ts \
              FROM process_net WHERE ts >= ?1",
@@ -180,11 +223,13 @@ impl ProcessNetReader {
                 // 表不存在（旧库 / 服务未升级）或 schema 不一致：网络列降级为「—」，
                 // 但要留日志——静默吞错会让「列一直不显示」无从排查。
                 log::warn!("process_net 查询准备失败，网络列降级显示「—」: {e}");
-                return (HashMap::new(), status_ok);
+                return (HashMap::new(), false);
             }
         };
-        // pid → (窗口内字节合计, 行数, 累计字节, 该 pid 最新 ts)
-        let mut acc: HashMap<u32, (u64, u32, u64, i64)> = HashMap::new();
+        // pid → (速率窗口内合计, 速率窗口行数, 最新行速率, 最新行累计, 该 pid 最新 ts)
+        let mut acc: HashMap<u32, (u64, u32, u64, u64, i64)> = HashMap::new();
+        // 全表最新 ts（只看 60s 窗口内即可：窗口外的行早已超过陈旧阈值）
+        let mut max_ts: Option<i64> = None;
         let rows = stmt.query_map(rusqlite::params![since], |r| {
             Ok((
                 r.get::<_, i64>(0)? as u32,
@@ -196,22 +241,38 @@ impl ProcessNetReader {
             ))
         });
         let Ok(rows) = rows else {
-            return (HashMap::new(), status_ok);
+            return (HashMap::new(), false);
         };
         for row in rows.flatten() {
             let (pid, sent, recv, sent_total, recv_total, ts) = row;
-            let e = acc.entry(pid).or_insert((0, 0, 0, i64::MIN));
-            e.0 = e.0.saturating_add(sent).saturating_add(recv);
-            e.1 += 1;
-            if ts >= e.3 {
-                e.3 = ts;
-                e.2 = sent_total.saturating_add(recv_total);
+            let bps = sent.saturating_add(recv);
+            let total = sent_total.saturating_add(recv_total);
+            max_ts = Some(max_ts.map_or(ts, |m: i64| m.max(ts)));
+            let e = acc.entry(pid).or_insert((0, 0, 0, 0, i64::MIN));
+            if ts >= rate_since {
+                e.0 = e.0.saturating_add(bps);
+                e.1 += 1;
+            }
+            if ts >= e.4 {
+                e.4 = ts;
+                e.2 = bps;
+                e.3 = total;
             }
         }
+
+        // 陈旧判定：超过 NET_STALE_SECS 没有任何新行 = 采集停摆。宁可显示「—」，
+        // 也不能把十几秒前的旧值当成实时速率（那正是「采集不到」被伪装成「没流量」）。
+        let fresh = max_ts.is_some_and(|m| now.timestamp() - m <= NET_STALE_SECS);
+        if !fresh {
+            return (HashMap::new(), false);
+        }
+
         let out = acc
             .into_iter()
-            .map(|(pid, (bytes, n, total, _))| {
-                (pid, ProcessNetStat { bps: bytes / n.max(1) as u64, total })
+            .map(|(pid, (sum, n, latest_bps, total, _))| {
+                // 速率窗口没有行（flush 滞后）→ 用最新行速率兜底，不要给 0
+                let bps = if n > 0 { sum / u64::from(n) } else { latest_bps };
+                (pid, ProcessNetStat { bps, total })
             })
             .collect();
         (out, status_ok)
@@ -483,8 +544,8 @@ impl ProcessSampler {
         self.port_cache = port_map();
 
         // 进程网络读数：service 用 ETW 采集落库，这里按 pid 只读查询。
-        // 窗口取 5 秒：任务管理器那列本身也是短窗口平滑，纯 1 秒瞬时值抖动大。
-        let (net_map, net_known) = self.net.read(NET_WINDOW_SECS);
+        // 查询窗口/兜底规则见 ProcessNetReader::read（不能只查 5 秒，见那里的注释）。
+        let (net_map, net_known) = self.net.read();
 
         let mut rows: Vec<ProcessRow> = Vec::with_capacity(self.sys.processes().len());
         let mut next_io: HashMap<u32, IoSnapshot> = HashMap::new();
@@ -3941,10 +4002,10 @@ mod tests {
             )
             .unwrap();
         }
-        // pid 9：只有一行旧数据（窗口外）→ 不应计入
+        // pid 9：只有一行早已过期的数据（远在 TOTAL_WINDOW_SECS 外）→ 不应计入
         conn.execute(
             "INSERT INTO process_net VALUES (?1, 9, 999, 999, 999, 999)",
-            rusqlite::params![now - 60],
+            rusqlite::params![now - 90],
         )
         .unwrap();
         conn.execute(
@@ -3954,12 +4015,89 @@ mod tests {
         .unwrap();
 
         let mut reader = ProcessNetReader::from_conn(conn);
-        let (map, known) = reader.read(5);
+        let (map, known) = reader.read();
         assert!(known, "status 表 enabled=1 且新鲜 → 采集可用");
         let st = map.get(&7).expect("pid 7 应在窗口内");
         assert_eq!(st.bps, 2000, "每行上下行各 1000 → 合计 2000，三行平均仍是 2000");
         assert_eq!(st.total, 40000, "累计 = 上下行合计，取 ts 最新那一行（20000+20000）");
         assert!(!map.contains_key(&9), "窗口外的旧行不计入");
+    }
+
+    /// 回归（网络列周期性归零）：服务端 flush 最多滞后 ~5s，5 秒窗口内可能一行都没有。
+    ///
+    /// 行只写到 `now-6s`（模拟 flush 滞后 6 秒）：旧实现查 5 秒窗口 → 查不到行 →
+    /// 速率和累计一起变 0，而 `net_known` 仍是 true，看起来像「这一秒没流量」。
+    #[test]
+    fn process_net_reader_falls_back_to_latest_row_when_flush_lags() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE process_net (
+                ts INTEGER NOT NULL, pid INTEGER NOT NULL,
+                sent_bps INTEGER NOT NULL, recv_bps INTEGER NOT NULL,
+                sent_total INTEGER NOT NULL, recv_total INTEGER NOT NULL,
+                PRIMARY KEY (ts, pid)) WITHOUT ROWID;
+             CREATE TABLE net_tracer_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // 三行全部落在 5 秒窗口之外（now-6/-7/-8），最新一行：上下行各 1500 B/s、
+        // 累计各 5_000_000 → 展示值 3000 B/s / 10_000_000 B。
+        for (i, total) in [(6i64, 5_000_000i64), (7, 4_900_000), (8, 4_800_000)] {
+            conn.execute(
+                "INSERT INTO process_net VALUES (?1, 42, 1500, 1500, ?2, ?2)",
+                rusqlite::params![now - i, total],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO net_tracer_status VALUES (1, 1, ?1)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let mut reader = ProcessNetReader::from_conn(conn);
+        let (map, known) = reader.read();
+        assert!(known, "6 秒滞后远小于陈旧阈值（15s），采集仍算可用");
+        let st = map.get(&42).expect("flush 滞后不能让 pid 从结果里消失");
+        assert_eq!(st.bps, 3000, "5s 窗口无行 → 回退最新一行的速率，不能返回 0");
+        assert_eq!(st.total, 10_000_000, "累计取最新一行（5_000_000×2）");
+    }
+
+    /// 采集停摆（最新一行已 30 秒前）时必须报不可用：宁可显示「—」，
+    /// 也不能把 30 秒前的旧速率当成实时值。
+    #[test]
+    fn process_net_reader_reports_unknown_when_data_is_stale() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE process_net (
+                ts INTEGER NOT NULL, pid INTEGER NOT NULL,
+                sent_bps INTEGER NOT NULL, recv_bps INTEGER NOT NULL,
+                sent_total INTEGER NOT NULL, recv_total INTEGER NOT NULL,
+                PRIMARY KEY (ts, pid)) WITHOUT ROWID;
+             CREATE TABLE net_tracer_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER NOT NULL, updated_at TEXT NOT NULL);",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO process_net VALUES (?1, 7, 1000, 1000, 5000, 5000)",
+            rusqlite::params![now - 30],
+        )
+        .unwrap();
+        // status 仍新鲜（服务活着但 ETW 断了 / 采集线程卡住）→ 靠 ts 陈旧判定拦下
+        conn.execute(
+            "INSERT INTO net_tracer_status VALUES (1, 1, ?1)",
+            rusqlite::params![chrono::Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        let mut reader = ProcessNetReader::from_conn(conn);
+        let (map, known) = reader.read();
+        assert!(!known, "最新行 30 秒前 → 采集已停摆，必须报不可用");
+        assert!(map.is_empty(), "停摆时不返回任何读数（UI 显示「—」）");
     }
 
     #[test]
@@ -3978,7 +4116,7 @@ mod tests {
         .unwrap();
         // 无 status 行（旧服务 / 未采集）→ 不可用，UI 应显示「—」
         let mut reader = ProcessNetReader::from_conn(conn);
-        let (map, known) = reader.read(5);
+        let (map, known) = reader.read();
         assert!(!known);
         assert!(map.is_empty());
     }

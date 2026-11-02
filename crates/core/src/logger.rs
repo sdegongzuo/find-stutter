@@ -351,28 +351,27 @@ impl Logger {
             }
         }
         if !self.net_buffer.is_empty() {
-            {
-                let mut stmt = tx.prepare(
-                    "INSERT OR REPLACE INTO process_net
-                        (ts, pid, sent_bps, recv_bps, sent_total, recv_total)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                )?;
-                for (ts, d) in &self.net_buffer {
-                    stmt.execute(params![
-                        ts,
-                        d.pid as i64,
-                        d.sent_bps as i64,
-                        d.recv_bps as i64,
-                        d.sent_total as i64,
-                        d.recv_total as i64,
-                    ])?;
-                }
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO process_net
+                    (ts, pid, sent_bps, recv_bps, sent_total, recv_total)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for (ts, d) in &self.net_buffer {
+                stmt.execute(params![
+                    ts,
+                    d.pid as i64,
+                    d.sent_bps as i64,
+                    d.recv_bps as i64,
+                    d.sent_total as i64,
+                    d.recv_total as i64,
+                ])?;
             }
-            // 明细只服务最近几秒的速率计算与最近一分钟的累计读数，
-            // 每次 flush 顺带裁掉过期行（表规模恒定，不需要额外定时任务）。
-            let cutoff = Utc::now().timestamp() - PROCESS_NET_RETENTION_SECS;
-            tx.execute("DELETE FROM process_net WHERE ts < ?1", params![cutoff])?;
         }
+        // 过期行**无条件**清：明细只服务最近几秒的速率计算与最近一分钟的累计读数。
+        // 不能跟「本批有 net 行」绑在一起——采集关闭（ETW 不可用）后 net_buffer 恒空，
+        // 旧行就会永远留在库里，GUI 读到的 max(ts) 也永远是那个过期时刻。
+        let cutoff = Utc::now().timestamp() - PROCESS_NET_RETENTION_SECS;
+        tx.execute("DELETE FROM process_net WHERE ts < ?1", params![cutoff])?;
         tx.commit()?;
         self.buffer.clear();
         self.net_buffer.clear();
