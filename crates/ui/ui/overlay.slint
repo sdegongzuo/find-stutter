@@ -779,7 +779,9 @@ export component ProcessList inherits Window {
     // （原来 870 时全列会差 6px，端口列贴边被裁）
     width: 900px;
     height: 506px;
-    always-on-top: true;
+    // 不置顶：这是普通窗口，点别的 APP 就该被压到后面（只有 Overlay /
+    // Taskbar 保持置顶）。切回入口是任务栏按钮 / Alt-Tab / 托盘菜单。
+    always-on-top: false;
     title: "find-stutter - 进程详情";
     no-frame: true;
     background: transparent;
@@ -1363,7 +1365,8 @@ component CulpritBar inherits Rectangle {
 export component Analysis inherits Window {
     width: 880px;
     height: 720px;
-    always-on-top: true;
+    // 同 ProcessList：普通窗口，不置顶（覆盖层窗口才置顶）
+    always-on-top: false;
     title: "find-stutter - 卡顿分析";
     no-frame: true;
     background: transparent;

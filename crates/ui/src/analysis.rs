@@ -1048,13 +1048,22 @@ impl AnalysisWindow {
         });
 
         ui.show()?;
-        // 不在 Windows 系统任务栏显示（工具窗口样式）
-        crate::window::ensure_tool_window_for(ui.window());
+        // 打开即夹进工作区：窗口按声明尺寸（880×720 逻辑像素）出现在 winit
+        // 选定的位置，若落在屏幕右/下边缘附近会有一截跑出工作区（看不见）。
+        // 与进程详情窗口（ProcessList）同一套处理。
+        crate::window::fit_window_to_work(ui.window());
+        // 卡顿分析页是普通应用窗口（留在任务栏 / Alt-Tab），且不置顶
+        crate::window::ensure_app_window_for(ui.window());
+        // 打开即前置（不置顶的窗口在别的 APP 前台时可能被压在后面）
+        crate::window::bring_to_front(ui.window());
         // winit 在 show 后重算样式 → 延迟补一次（与 ProcessList 一致）
         let weak_toolwin = ui.as_weak();
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
-                crate::window::ensure_tool_window_for(ui.window());
+                crate::window::ensure_app_window_for(ui.window());
+                // 首次 show 后 HWND 常还取不到 → 上一处 fit 拿不到原生矩形，
+                // 这里补一次（幂等：已在工作区内则不动）
+                crate::window::fit_window_to_work(ui.window());
             }
         });
 
@@ -1096,8 +1105,11 @@ impl AnalysisWindow {
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
             let _ = self.ui.show();
-            crate::window::ensure_tool_window_for(self.ui.window());
+            crate::window::ensure_app_window_for(self.ui.window());
         }
+        // 复用已有窗口时前置（窗口不置顶，可能已被别的 APP 压到后面）。
+        // refresh() 只由用户操作触发，不会周期性抢前台。
+        crate::window::bring_to_front(self.ui.window());
         let base = TimeRange::from_index(*self.range_index.lock().unwrap());
         let range = resolve_range(base, &self.custom_range.lock().unwrap());
         let adv = *self.advanced.lock().unwrap();
@@ -1116,7 +1128,7 @@ impl AnalysisWindow {
         );
     }
 
-    /// 底层 Slint 窗口（供 lib.rs 1Hz tick 守护 tool-window 样式）。
+    /// 底层 Slint 窗口（供 lib.rs 1Hz tick 守护窗口样式）。
     pub fn window(&self) -> &slint::Window {
         self.ui.window()
     }

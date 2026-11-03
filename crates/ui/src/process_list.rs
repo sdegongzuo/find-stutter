@@ -955,8 +955,29 @@ pub enum KillError {
     NotFound,
     /// 权限不足（典型：以非管理员运行，进程属 SYSTEM 或高权限）
     Permission,
-    /// 其他失败
-    Other,
+    /// 其他失败，携带原始 Win32 错误码（0 = 未知）
+    Other(u32),
+}
+
+/// 把 windows crate 抛出的 `HRESULT` 还原成 `GetLastError()` 的原始 Win32 错误码。
+///
+/// 陷阱（2026-11-03 实测踩坑）：`windows` crate 的 Win32 API 失败统一走
+/// `Error::from_thread()` → `HRESULT::from_win32()`，即 `0x8007_xxxx`
+/// （SEVERITY_ERROR | FACILITY_WIN32 | 低 16 位原始码）。于是
+/// `e.code().0 as u32` 拿到的是 **2147942405（0x80070005）**，而不是 **5
+/// （ERROR_ACCESS_DENIED）**。直接拿它和 `ERROR_ACCESS_DENIED.0` 比较永远不相等，
+/// 权限不足会被误判成「其他失败」，既不弹 UAC 提权框，还给出
+/// 「进程可能已退出」这种误导文案。
+///
+/// 处理：FACILITY_WIN32 的 HRESULT 取低 16 位；其他 HRESULT 原样返回。
+/// （`crates/core/src/win32.rs` 处理 `ERROR_INSUFFICIENT_BUFFER` 时是同样的做法。）
+fn hresult_to_win32(hr: i32) -> u32 {
+    let u = hr as u32;
+    if u >> 16 == 0x8007 {
+        u & 0xFFFF
+    } else {
+        u
+    }
 }
 
 /// 终止进程。成功返回 `Ok(())`；失败返回原因（权限不足 / 进程不存在 / 其他）。
@@ -970,13 +991,13 @@ pub fn kill_process(pid: u32) -> Result<(), KillError> {
         let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
             Ok(h) => h,
             Err(e) => {
-                let code = e.code().0 as u32;
+                let code = hresult_to_win32(e.code().0);
                 return if code == ERROR_INVALID_PARAMETER.0 || code == ERROR_NOT_FOUND.0 {
                     Err(KillError::NotFound)
                 } else if code == ERROR_ACCESS_DENIED.0 {
                     Err(KillError::Permission)
                 } else {
-                    Err(KillError::Other)
+                    Err(KillError::Other(code))
                 };
             }
         };
@@ -988,14 +1009,14 @@ pub fn kill_process(pid: u32) -> Result<(), KillError> {
         // 细分失败原因（与 OpenProcess 分支同一套映射）：进程在 Open 与
         // Terminate 之间退出时这里会报 ERROR_ACCESS_DENIED/INVALID_PARAMETER，
         // 不应一律归为权限不足（会误弹 UAC 提权重试框）
-        let code = ok.err().map(|e| e.code().0 as u32).unwrap_or(0);
+        let code = ok.err().map(|e| hresult_to_win32(e.code().0)).unwrap_or(0);
         let _ = CloseHandle(handle);
         if code == ERROR_INVALID_PARAMETER.0 || code == ERROR_NOT_FOUND.0 {
             Err(KillError::NotFound)
         } else if code == ERROR_ACCESS_DENIED.0 {
             Err(KillError::Permission)
         } else {
-            Err(KillError::Other)
+            Err(KillError::Other(code))
         }
     }
 }
@@ -1125,23 +1146,41 @@ fn confirm_elevate(title: &str, msg: &str) -> bool {
 }
 
 /// 杀进程失败提示（#2）：权限不足 → 弹「以管理员身份重试」确认框（UAC 提权
-/// 运行 taskkill）；进程已退出/其他 → 信息框。UI 线程调用。
+/// 运行 taskkill）；进程已退出 → 「可能已退出」信息框；其他失败 → 带原始
+/// Win32 错误码的信息框（不再笼统说「进程可能已退出」误导排查）。UI 线程调用。
 #[cfg(windows)]
 pub fn prompt_kill_failure(pid: u32, name: &str, err: KillError) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
     match err {
         KillError::Permission => {
+            // 已是管理员仍被拒 → 目标进程受系统保护（PPL 等），提权也没用，
+            // 弹「是否以管理员身份重试」只会让用户白点一次 UAC。
+            if is_elevated() {
+                let msg = format!(
+                    "无法结束进程 {} (PID {})\n\n当前已是管理员权限，仍被系统拒绝。\n该进程受系统保护（如 PPL / 更高完整性级别），无法从用户态终止。",
+                    name, pid
+                );
+                let _ = unsafe {
+                    MessageBoxW(
+                        None,
+                        windows::core::PCWSTR(wide_static(&msg).as_ptr()),
+                        windows::core::PCWSTR(wide_static("停止进程").as_ptr()),
+                        MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+                    )
+                };
+                return;
+            }
             let msg = format!(
                 "权限不足，无法结束进程 {} (PID {})\n\n是否以管理员身份重试？",
                 name, pid
             );
             if confirm_elevate("停止进程", &msg) {
-                elevate_kill_process(pid, false);
+                elevate_kill_process(pid, false, name.to_string());
             }
         }
-        KillError::NotFound | KillError::Other => {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-            };
+        KillError::NotFound => {
             let msg = format!(
                 "无法结束进程 {} (PID {})\n\n进程可能已退出或已停止运行。",
                 name, pid
@@ -1155,6 +1194,27 @@ pub fn prompt_kill_failure(pid: u32, name: &str, err: KillError) {
                 )
             };
         }
+        KillError::Other(code) => {
+            // 把原始错误码和常见含义一起亮出来，否则用户只看到「干不掉」无从判断
+            let hint = match code {
+                5 => "（拒绝访问：进程受保护或权限更高）",
+                87 => "（参数错误：进程句柄已失效）",
+                0 => "（未取到错误码）",
+                _ => "",
+            };
+            let msg = format!(
+                "无法结束进程 {} (PID {})\n\n系统返回错误码 {} {}\n详情见日志。",
+                name, pid, code, hint
+            );
+            let _ = unsafe {
+                MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(wide_static(&msg).as_ptr()),
+                    windows::core::PCWSTR(wide_static("停止进程").as_ptr()),
+                    MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+                )
+            };
+        }
     }
 }
 
@@ -1162,38 +1222,135 @@ pub fn prompt_kill_failure(pid: u32, name: &str, err: KillError) {
 /// 用户确认后走 UAC 提权运行 `taskkill /F /T /PID <pid>`（连同子树一起终止）。
 #[cfg(windows)]
 pub fn prompt_kill_tree_failure(pid: u32, name: &str) {
+    if is_elevated() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+        };
+        let msg = format!(
+            "无法结束进程树 {} (PID {})\n\n当前已是管理员权限，仍被系统拒绝（进程受保护）。",
+            name, pid
+        );
+        let _ = unsafe {
+            MessageBoxW(
+                None,
+                windows::core::PCWSTR(wide_static(&msg).as_ptr()),
+                windows::core::PCWSTR(wide_static("结束进程树").as_ptr()),
+                MB_OK | MB_ICONWARNING | MB_TOPMOST | MB_SETFOREGROUND,
+            )
+        };
+        return;
+    }
     let msg = format!(
         "权限不足，无法结束进程树 {} (PID {})\n\n是否以管理员身份重试？\n（将连同其子进程一起终止）",
         name, pid
     );
     if confirm_elevate("结束进程树", &msg) {
-        elevate_kill_process(pid, true);
+        elevate_kill_process(pid, true, name.to_string());
     }
 }
 
-/// UAC 提权运行 `taskkill /F /PID <pid>`（ShellExecuteW "runas"）。
-/// `tree=true` 时追加 `/T`，连同子树一起终止（进程树场景）。
+/// 当前进程是否已具备管理员权限。
+///
+/// 已是管理员还报 `ERROR_ACCESS_DENIED`，说明目标进程受系统保护（PPL/更高完整性），
+/// 再弹「以管理员身份重试」纯属误导，应直接告知「提权也杀不掉」。
 #[cfg(windows)]
-fn elevate_kill_process(pid: u32, tree: bool) {
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    let params = format!("/F{} /PID {}", if tree { " /T" } else { "" }, pid);
-    let result = unsafe {
-        ShellExecuteW(
+fn is_elevated() -> bool {
+    // IsUserAnAdmin 是兼容性最好的一条判定（内部查 token 的 Administrators 组）
+    unsafe { windows::Win32::UI::Shell::IsUserAnAdmin().as_bool() }
+}
+
+/// 定位 taskkill.exe 的绝对路径。
+///
+/// 不再用裸 `"taskkill.exe"` 交给 ShellExecute 去搜 PATH：ShellExecute 的搜索
+/// 顺序受当前工作目录/App Paths 影响，一旦命中同名恶意程序就是提权执行任意文件。
+/// 固定用 `%SystemRoot%\System32\taskkill.exe`。
+#[cfg(windows)]
+fn taskkill_path() -> std::path::PathBuf {
+    let root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    root.join("System32").join("taskkill.exe")
+}
+
+/// UAC 提权运行 `taskkill /F [/T] /PID <pid>`，并**回报真实结果**。
+///
+/// 两个改造点（2026-11-03）：
+/// 1. 旧实现用 `ShellExecuteW`，只能判断「有没有把进程拉起来」（返回值 > 32），
+///    提权进程到底杀没杀掉、UAC 是不是被用户点了「否」，一概不知道，
+///    日志里永远写「已以管理员身份启动 taskkill」，等于没验证。
+///    改用 `find_stutter_core::elevate::spawn_elevated_and_wait`
+///    （ShellExecuteExW + SEE_MASK_NOCLOSEPROCESS + 等退出 + 取退出码），
+///    UAC 拒绝（1223）与 taskkill 的退出码都能拿到。
+/// 2. 同步等待会卡 UI 线程（用户可能盯着 UAC 框想好几秒），所以整段丢到后台线程，
+///    结果用 `invoke_from_event_loop` 回主线程弹框。
+#[cfg(windows)]
+fn elevate_kill_process(pid: u32, tree: bool, name: String) {
+    use find_stutter_core::elevate::{spawn_elevated_and_wait, ElevateOutcome};
+
+    std::thread::spawn(move || {
+        let exe = taskkill_path();
+        let pid_s = pid.to_string();
+        let mut args: Vec<&str> = vec!["/F"];
+        if tree {
+            args.push("/T");
+        }
+        args.push("/PID");
+        args.push(&pid_s);
+
+        let out = spawn_elevated_and_wait(&exe, &args, std::time::Duration::from_secs(60));
+        log::info!(
+            "提权 taskkill /F{} /PID {} → {}",
+            if tree { " /T" } else { "" },
+            pid,
+            out.message()
+        );
+
+        // 提权进程退出码：0=全部成功，128=进程不存在，1=访问被拒/参数错
+        let text = match &out {
+            ElevateOutcome::Ok(0) => Some(format!(
+                "已以管理员身份结束{} {} (PID {})。",
+                if tree { "进程树" } else { "进程" },
+                name,
+                pid
+            )),
+            ElevateOutcome::Ok(code) => Some(format!(
+                "已以管理员身份执行，但 taskkill 退出码为 {}。\n{} (PID {}) 可能仍未被结束。\n\n常见：128=进程已不存在，1=访问被拒。",
+                code, name, pid
+            )),
+            ElevateOutcome::UacDenied => Some(format!(
+                "已取消管理员授权，{} (PID {}) 未被结束。",
+                name, pid
+            )),
+            other => Some(format!(
+                "提权执行失败：{}\n{} (PID {}) 未被结束。",
+                other.message(),
+                name,
+                pid
+            )),
+        };
+
+        if let Some(text) = text {
+            let _ = slint::invoke_from_event_loop(move || {
+                show_kill_result(&text);
+            });
+        }
+    });
+}
+
+/// 提权结束进程后的结果提示框（信息级，不阻断用户继续操作）。
+#[cfg(windows)]
+fn show_kill_result(text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    };
+    let _ = unsafe {
+        MessageBoxW(
             None,
-            windows::core::w!("runas"),
-            windows::core::w!("taskkill.exe"),
-            windows::core::PCWSTR(wide_static(&params).as_ptr()),
-            None,
-            SW_HIDE,
+            windows::core::PCWSTR(wide_static(text).as_ptr()),
+            windows::core::PCWSTR(wide_static("停止进程").as_ptr()),
+            MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND,
         )
     };
-    // 返回 HINSTANCE > 32 表示成功；<= 32 是错误码
-    if result.0 as usize <= 32 {
-        log::warn!("提权 taskkill 启动失败 (code={})", result.0 as usize);
-    } else {
-        log::info!("已以管理员身份启动 taskkill /F /PID {}", pid);
-    }
 }
 
 #[cfg(not(windows))]
@@ -1504,6 +1661,21 @@ fn hit_test_row(ui: &crate::ProcessList, sx: i32, sy: i32) -> Option<(i32, Strin
     }
     let row = model.row_data(idx)?;
     Some((row.pid, row.name.to_string()))
+}
+
+/// 按窗口角色设置扩展样式（winit 在 show / 状态变化时会重算，故需周期性重调）：
+///
+/// - `is_popup = false`（主进程详情页）→ `WS_EX_APPWINDOW`：留在任务栏 / Alt-Tab。
+///   与 `.slint` 里的 `always-on-top: false` 配套：窗口是普通层，被别的 APP 压下去后
+///   靠任务栏按钮或 Alt-Tab 切回。
+/// - `is_popup = true`（资源区点出来的临时弹窗）→ `WS_EX_TOOLWINDOW`：不占任务栏。
+///   这类窗口每次点击都新建一个，进任务栏会攒出一串同名按钮。
+fn ensure_window_style(win: &slint::Window, is_popup: bool) {
+    if is_popup {
+        crate::window::ensure_tool_window_for(win);
+    } else {
+        crate::window::ensure_app_window_for(win);
+    }
 }
 
 /// 打开进程可执行文件所在的位置（任务管理器「打开文件所在的位置」）。
@@ -2552,6 +2724,8 @@ pub struct ProcessListWindow {
     _timer: Arc<slint::Timer>,
     /// 资源区弹窗唯一 id（lib.rs 跟踪表用；关闭时按 id 移除并 drop）
     id: usize,
+    /// 是否为资源区派生的临时弹窗（决定扩展样式：工具窗口 vs 普通应用窗口）
+    is_popup: bool,
     /// 关闭回调（资源区弹窗用：关闭按钮点击后通知调用方移除跟踪，
     /// 触发 drop 以停止采样线程，避免多次点击累积常驻线程）
     on_closed: Arc<Mutex<Option<Box<dyn Fn() + Send>>>>,
@@ -2573,6 +2747,7 @@ impl ProcessListWindow {
         highlight_pct: f32,
         refresh_ms: u64,
         compact_columns: bool,
+        is_popup: bool,
         initial_sort: &str,
         db_path: Option<std::path::PathBuf>,
     ) -> anyhow::Result<Self> {
@@ -3034,6 +3209,10 @@ impl ProcessListWindow {
         });
 
         ui.show()?;
+        // 打开即夹进工作区：窗口按声明尺寸（900×506 逻辑像素）出现在 winit
+        // 选定的位置，若落在屏幕右/下边缘附近会有一截跑出工作区（看不见）。
+        // 按所在显示器工作区夹取尺寸与位置，保证整窗可见。
+        crate::window::fit_window_to_work(ui.window());
         // 安装原生边缘缩放命中测试：WM_NCHITTEST 子类化让 Windows 直接驱动
         // 尺寸拖拽循环（绕开 Slint TouchArea 的按压状态机——实测其对
         // 「窗口随拖拽连续变形」场景不可靠：首个拖拽后重复按压热区大概率
@@ -3049,15 +3228,23 @@ impl ProcessListWindow {
             "进程详情（{} 自动刷新）",
             interval_ms_to_text(*refresh_ms.lock().unwrap())
         )));
-        // 进程详情页同样不出现在 Windows 系统任务栏（工具窗口样式）
-        crate::window::ensure_tool_window_for(ui.window());
-        // winit 在 show 后会重算扩展样式（覆盖 WS_EX_TOOLWINDOW / 加回
-        // WS_EX_APPWINDOW），延迟 500ms 再补一次；长期由 Overlay 的
+        // 窗口样式按角色分两类：
+        // - 主进程详情页：普通应用窗口（留在任务栏 / Alt-Tab），配合不置顶——
+        //   点别的 APP 就被压到后面，任务栏按钮是切回入口；
+        // - 资源区派生的临时弹窗（is_popup）：工具窗口，不占任务栏。它每次点击
+        //   都会新建一个，占了任务栏会累积一串同名按钮。
+        ensure_window_style(ui.window(), is_popup);
+        // 打开即前置：窗口不置顶，新窗口在别的 APP 前台时可能被压在后面
+        crate::window::bring_to_front(ui.window());
+        // winit 在 show 后会重算扩展样式，延迟 500ms 再补一次；长期由 Overlay 的
         // 1Hz tick 守护（lib.rs）。
         let weak_toolwin = ui.as_weak();
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
-                crate::window::ensure_tool_window_for(ui.window());
+                ensure_window_style(ui.window(), is_popup);
+                // 首次 show 后 HWND 常还取不到 → 上一处 fit 拿不到原生矩形，
+                // 这里补一次（幂等：已在工作区内则不动）
+                crate::window::fit_window_to_work(ui.window());
                 // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）。
                 // 但详情面板打开期间本就应保持「未安装」（见 on_row_clicked 的
                 // uninstall）——重试若无条件重装，会击穿 show 后 500ms 内开面板
@@ -3156,6 +3343,7 @@ impl ProcessListWindow {
             sampler_handle: Some(sampler_handle),
             _timer: tick_timer,
             id,
+            is_popup,
             on_closed,
         })
     }
@@ -3169,17 +3357,24 @@ impl ProcessListWindow {
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
             let _ = self.ui.show();
-            // show 可能触发 winit 重算扩展样式 → 重新确保不在任务栏显示
-            crate::window::ensure_tool_window_for(self.ui.window());
+            // show 可能触发 winit 重算扩展样式 → 按窗口角色重新设置
+            ensure_window_style(self.ui.window(), self.is_popup);
             // 重新显示后延迟对账一次：show 路径若把 Slint 布局尺寸重置回
             // 声明值而原生窗口保持旧尺寸，右/下热区会整体失效
             let weak_refresh = self.ui.as_weak();
             slint::Timer::single_shot(Duration::from_millis(50), move || {
                 if let Some(ui) = weak_refresh.upgrade() {
                     crate::window::reconcile_geometry(ui.window());
+                    // 重新显示后同样夹一次：隐藏期间换了显示器 / 分辨率时
+                    // 旧位置可能已经落在工作区外
+                    crate::window::fit_window_to_work(ui.window());
                 }
             });
         }
+        // 复用已有窗口时也要前置：主窗口不置顶，此刻它可能已被别的 APP 压到后面，
+        // 而 show() 对「已可见」的窗口是空操作。refresh() 只由用户操作
+        // （托盘菜单 / 悬浮窗点击）触发，不存在周期性抢前台的风险。
+        crate::window::bring_to_front(self.ui.window());
         render(
             &self.ui,
             &*self.cache,
@@ -3193,7 +3388,7 @@ impl ProcessListWindow {
         self.sample_now.store(true, Ordering::SeqCst);
     }
 
-    /// 底层 Slint 窗口（供 tick 守护重新设置任务栏样式）。
+    /// 底层 Slint 窗口（供 tick 守护重新设置窗口样式：普通应用窗口）。
     pub fn window(&self) -> &slint::Window {
         self.ui.window()
     }
@@ -5017,5 +5212,32 @@ mod tests {
         assert!(d.name.contains("WebView2: MarkFlowy"));
         assert!(d.name.contains("(2)"));
         assert_eq!(d.group_key, "msedgewebview2.exe:200");
+    }
+
+    // ---- 杀进程错误码映射（2026-11-03：权限不足被误判成「进程已退出」） ----
+
+    #[test]
+    fn hresult_win32_facility_unwraps_low_16_bits() {
+        // windows crate 把 GetLastError 包成 0x8007xxxx，低 16 位才是原始码
+        assert_eq!(hresult_to_win32(0x8007_0005u32 as i32), 5); // ERROR_ACCESS_DENIED
+        assert_eq!(hresult_to_win32(0x8007_0057u32 as i32), 87); // ERROR_INVALID_PARAMETER
+        assert_eq!(hresult_to_win32(0x8007_0490u32 as i32), 1168); // ERROR_NOT_FOUND
+    }
+
+    #[test]
+    fn hresult_non_win32_facility_kept_as_is() {
+        // 非 FACILITY_WIN32（如 0x80004005 E_FAIL）不猜含义，原样返回
+        assert_eq!(hresult_to_win32(0x8000_4005u32 as i32), 0x8000_4005);
+        // 裸 win32 码（理论上不会出现）也原样返回，不做截断
+        assert_eq!(hresult_to_win32(5), 5);
+    }
+
+    #[test]
+    fn raw_hresult_never_equals_win32_code() {
+        // 反向锁死修复前那个 bug：直接 `e.code().0 as u32` 与 ERROR_ACCESS_DENIED(5)
+        // 比较永远为假 —— 这正是权限不足被吞成「其他失败」的根因。
+        let raw = 0x8007_0005u32;
+        assert_ne!(raw, 5u32);
+        assert_eq!(hresult_to_win32(raw as i32), 5u32);
     }
 }

@@ -7,7 +7,13 @@
 //! - 拖动改用 Slint 的 TouchArea + set_position()（仅在用户实际拖动期间更新，不是每帧），
 //!   避免 egui 那种「每帧 OuterPosition」更新导致透明窗重影/闪烁
 //! - 点击穿透通过切换 `WS_EX_TRANSPARENT` 实现，开启后窗口鼠标事件完全穿透
-//! - Slint 创建的窗口默认有 `WS_EX_TOPMOST`（由 `always-on-top: true` 触发）
+//! - Z 序分层刻意分两类：
+//!   * **悬浮窗 / 伪任务栏**：`.slint` 里 `always-on-top: true` → 带 `WS_EX_TOPMOST`，
+//!     永远压在所有普通窗口之上；
+//!   * **进程详情页 / 卡顿分析页**：`always-on-top: false` → 普通窗口，点别的 APP
+//!     就会被压到后面（符合正常使用习惯）。
+//!   扩展样式另有两套：工具窗口（不进任务栏 / Alt-Tab）与普通应用窗口（进任务栏），
+//!   见 `ensure_tool_window_for` / `ensure_app_window_for`。
 
 use raw_window_handle::HasWindowHandle;
 use slint::ComponentHandle;
@@ -15,10 +21,12 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW,
-    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, SetWindowLongPtrW, SetWindowPos, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT,
-    HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, WM_GETMINMAXINFO, WM_NCHITTEST,
-    WM_NCLBUTTONDOWN, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, MINMAXINFO,
+    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, IsIconic, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
+    WM_GETMINMAXINFO, WM_NCHITTEST, WM_NCLBUTTONDOWN, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    WS_EX_TRANSPARENT, MINMAXINFO,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
@@ -105,8 +113,9 @@ pub fn attach_parent_console_for_cli() {}
 
 /// 让窗口不出现在 **Windows 系统任务栏**（工具窗口样式 `WS_EX_TOOLWINDOW`）。
 ///
-/// 悬浮窗 / 进程详情页 / 任务栏窗口都适用：设置后窗口不占系统任务栏按钮，
-/// 也不会出现在 Alt-Tab 切换列表里。
+/// 悬浮窗 / 伪任务栏窗口适用：设置后窗口不占系统任务栏按钮，也不会出现在
+/// Alt-Tab 切换列表里。**进程详情页 / 卡顿分析页不要用这个**——它们是普通
+/// 窗口，需要一个任务栏按钮作为切回入口，见 [`ensure_app_window_for`]。
 ///
 /// ## 为什么是「ensure」而不是「set once」
 ///
@@ -119,7 +128,7 @@ pub fn attach_parent_console_for_cli() {}
 /// 1. 置位 `WS_EX_TOOLWINDOW`（0x80）
 /// 2. 清除 `WS_EX_APPWINDOW`（0x40000）
 ///
-/// 调用方应**周期性重复调用**（Overlay 的 1Hz tick 守护三个窗口），
+/// 调用方应**周期性重复调用**（Overlay 的 1Hz tick 守护各窗口），
 /// 确保 winit 覆盖后 1 秒内自动恢复。函数幂等，无样式变化时不重绘。
 pub fn ensure_tool_window_for(win: &slint::Window) {
     if let Some(hwnd) = extract_hwnd_from(win) {
@@ -129,14 +138,40 @@ pub fn ensure_tool_window_for(win: &slint::Window) {
 
 /// 设置 `WS_EX_TOOLWINDOW` + 清除 `WS_EX_APPWINDOW`（纯位运算，可单测）。
 fn ensure_tool_window(hwnd: HWND) {
+    apply_ex_style(hwnd, toggle_tool_window_bits);
+}
+
+/// 让窗口成为**普通应用窗口**（有任务栏按钮、出现在 Alt-Tab 列表）。
+///
+/// 进程详情页 / 卡顿分析页用这个。与 [`ensure_tool_window_for`] 的差别只在
+/// 扩展样式的两位方向：清 `WS_EX_TOOLWINDOW`、置 `WS_EX_APPWINDOW`。
+///
+/// 为什么主窗口要留在任务栏：主窗口**不置顶**（见下），点别的 APP 就会被压到
+/// 后面；此时必须有地方能把它切回来——任务栏按钮 / Alt-Tab。若还做成工具窗口，
+/// 窗口一被压下去就只能靠托盘菜单找回，等于半个"消失"。
+///
+/// 同样需要周期性重调：winit 在 show / 状态变化时会重算扩展样式。
+pub fn ensure_app_window_for(win: &slint::Window) {
+    if let Some(hwnd) = extract_hwnd_from(win) {
+        ensure_app_window(hwnd);
+    }
+}
+
+fn ensure_app_window(hwnd: HWND) {
+    apply_ex_style(hwnd, toggle_app_window_bits);
+}
+
+/// 扩展样式的「读-改-写」外壳：只有位确实变化时才写回 + 触发一次重绘。
+///
+/// `f` 接收当前样式，返回目标样式（见 [`toggle_tool_window_bits`] /
+/// [`toggle_app_window_bits`]）。
+fn apply_ex_style(hwnd: HWND, f: fn(isize) -> isize) {
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let tool = WS_EX_TOOLWINDOW.0 as isize;
-        let appwin = WS_EX_APPWINDOW.0 as isize;
-        let new_style = (style | tool) & !appwin;
+        let new_style = f(style);
         if new_style != style {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
-            // 触发重绘使样式生效
+            // 触发重绘使样式生效（SWP_NOZORDER：只改样式，不动 Z 序）
             let _ = SetWindowPos(
                 hwnd,
                 None,
@@ -146,6 +181,56 @@ fn ensure_tool_window(hwnd: HWND) {
                 0,
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
             );
+        }
+    }
+}
+
+/// 工具窗口位运算：置 TOOLWINDOW、清 APPWINDOW。
+fn toggle_tool_window_bits(style: isize) -> isize {
+    let tool = WS_EX_TOOLWINDOW.0 as isize;
+    let appwin = WS_EX_APPWINDOW.0 as isize;
+    (style | tool) & !appwin
+}
+
+/// 普通应用窗口位运算：置 APPWINDOW、清 TOOLWINDOW。
+fn toggle_app_window_bits(style: isize) -> isize {
+    let tool = WS_EX_TOOLWINDOW.0 as isize;
+    let appwin = WS_EX_APPWINDOW.0 as isize;
+    (style | appwin) & !tool
+}
+
+/// 把窗口带到最前并激活。
+///
+/// 只用于**用户显式要求打开 / 切回窗口**的路径（标题栏/托盘菜单/悬浮窗点击），
+/// 不要放进定时刷新里——那会周期性抢前台，正是本次要修掉的行为。
+///
+/// 主窗口不置顶后，若它已被别的 APP 压到后面，`Slint::show()` 并不会把它翻到
+/// 前面（窗口已可见时 show 基本是空操作）。因此复用已有窗口前必须显式前置。
+///
+/// `SetForegroundWindow` 受 Windows 前台锁限制：调用进程不是前台进程时会被拒绝
+/// （返回 false）。这里的调用点都源自用户输入事件（点菜单/点悬浮窗），本进程
+/// 持有前台输入权，正常情况下能成功；失败时窗口仍会被 `SetWindowPos(HWND_TOP)`
+/// 抬到同层最前，只是没有键盘焦点，故只记 debug 日志。
+pub fn bring_to_front(win: &slint::Window) {
+    let Some(hwnd) = extract_hwnd_from(win) else {
+        return;
+    };
+    unsafe {
+        // 最小化状态直接 SetForegroundWindow 无效，先还原
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+        if !SetForegroundWindow(hwnd).as_bool() {
+            log::debug!("SetForegroundWindow 被前台锁拒绝（窗口已抬到最前但没有焦点）");
         }
     }
 }
@@ -267,6 +352,183 @@ pub fn snap_to_work_area(win: &slint::Window, threshold_logical: f32) -> bool {
 #[cfg(not(windows))]
 pub fn snap_to_work_area(_win: &slint::Window, _threshold_logical: f32) -> bool {
     false
+}
+
+/// 窗口所在显示器的**工作区**（物理像素 `(left, top, right, bottom)`，
+/// 已扣除任务栏）。多屏下取离窗口最近的那块（`MONITOR_DEFAULTTONEAREST`）。
+///
+/// HWND 不可提取时返回 `None`（非 Windows / 窗口尚未创建）。
+#[cfg(windows)]
+pub fn monitor_work_area_for_window(win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let hwnd = extract_hwnd_from(win)?;
+    let mut mi = MONITORINFO::default();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // SAFETY：mi 为合法输出结构且 cbSize 已置；只读显示器信息
+    let ok = unsafe {
+        let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(mon, &mut mi).as_bool()
+    };
+    if !ok {
+        return None;
+    }
+    Some((mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom))
+}
+
+#[cfg(not(windows))]
+pub fn monitor_work_area_for_window(_win: &slint::Window) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// 屏幕物理坐标 `(x, y)` 所在显示器的工作区（多屏 / 负坐标安全）。
+///
+/// 用于「子窗口跟随锚点摆放」：锚点窗口尚未移动时，`MonitorFromWindow`
+/// 取的是锚点所在屏，这与用户期望一致。
+#[cfg(windows)]
+pub fn monitor_work_area_at(x: i32, y: i32) -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let mut mi = MONITORINFO::default();
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    // SAFETY：mi 为合法输出结构且 cbSize 已置；只读显示器信息
+    let ok = unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(mon, &mut mi).as_bool()
+    };
+    if !ok {
+        return None;
+    }
+    Some((mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom))
+}
+
+#[cfg(not(windows))]
+pub fn monitor_work_area_at(_x: i32, _y: i32) -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// 把矩形夹进工作区（纯函数，单位均为物理像素）：
+/// - 尺寸超过工作区 → 缩到工作区大小（不小于 1px）；
+/// - 位置越界 → 平移回工作区内（不改变尺寸）。
+///
+/// **注意**：这里的下限是 1px，不是 UI 的 resize 最小值（`RESIZE_MIN_W/H`，
+/// 500×300 逻辑像素）。工作区比窗口还小的极端屏（超低分辨率 / 超大缩放）下，
+/// 缩到工作区后内部布局会挤（列溢出），但仍保证整窗可见——可见性优先于
+/// 布局美观，这是有意的取舍。
+///
+/// 返回 `(x, y, w, h)`；输入已在工作区内时原样返回。
+pub fn clamp_rect_to_work(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    work: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (l, t, r, b) = work;
+    let work_w = (r - l).max(1);
+    let work_h = (b - t).max(1);
+    let nw = w.clamp(1, work_w);
+    let nh = h.clamp(1, work_h);
+    // 右/下夹取的上界可能小于左/上（窗口比工作区大，已被缩到等号），
+    // 用 max(l)/max(t) 兜住，避免 clamp 的 min > max panic。
+    let nx = x.clamp(l, (r - nw).max(l));
+    let ny = y.clamp(t, (b - nh).max(t));
+    (nx, ny, nw, nh)
+}
+
+/// 子窗口相对锚点窗口的摆放矩形（纯函数，单位均为物理像素）。
+///
+/// 优先放在锚点**下方** `gap` 处；下方空间不足时翻到**上方**；上下都放不下
+/// （子窗口比屏幕还高）才退回下方并把位置交给 [`clamp_rect_to_work`]。
+/// 横向与锚点左对齐，越界由 clamp 收回工作区。
+///
+/// `anchor`：锚点窗口矩形 `(x, y, w, h)`；`win_w`/`win_h`：子窗口尺寸。
+pub fn place_popup_rect(
+    anchor: (i32, i32, i32, i32),
+    win_w: i32,
+    win_h: i32,
+    work: (i32, i32, i32, i32),
+    gap: i32,
+) -> (i32, i32, i32, i32) {
+    let (ax, ay, _aw, ah) = anchor;
+    let (_l, t, _r, b) = work;
+    let below = ay + ah + gap;
+    let above = ay - gap - win_h;
+    let y = if below + win_h <= b {
+        below
+    } else if above >= t {
+        above
+    } else {
+        below
+    };
+    clamp_rect_to_work(ax, y, win_w, win_h, work)
+}
+
+/// 让**已显示**的窗口完整落在所在显示器工作区内（尺寸超限则缩小、
+/// 位置越界则平移），返回是否真的动过窗口。
+///
+/// 用于「窗口刚打开时靠近屏幕边缘被裁掉一部分」：位置按固定偏移算出来
+/// （例如贴在悬浮窗下方），在屏幕右边/下边就会有一截跑到工作区之外。
+/// 读取用的是原生矩形（`GetWindowRect`），因此对 Slint 侧几何是否同步
+/// 不敏感。
+pub fn fit_window_to_work(win: &slint::Window) -> bool {
+    let Some((x, y, w, h)) = native_rect(win) else {
+        return false;
+    };
+    // 窗口尚未真正落地（尺寸为 0/1）时不动，交给下一次重试
+    if w <= 1 || h <= 1 {
+        return false;
+    }
+    let Some(work) = monitor_work_area_for_window(win) else {
+        return false;
+    };
+    let rect = clamp_rect_to_work(x, y, w, h, work);
+    if rect == (x, y, w, h) {
+        return false;
+    }
+    log::info!("窗口越出工作区 {:?}，夹回到 {:?}", (x, y, w, h), rect);
+    set_window_rect(win, rect.0, rect.1, rect.2, rect.3);
+    true
+}
+
+/// 把子窗口 `win` 摆在**锚点窗口** `anchor_win` 的下方（不足则上方），
+/// 并整体夹进锚点所在显示器的工作区。`gap_logical` 为间距（逻辑像素）。
+///
+/// 返回 `false` 表示拿不到几何（HWND 未就绪 / 窗口尺寸异常），调用方
+/// 可退回自算位置。
+pub fn place_popup_near(
+    win: &slint::Window,
+    anchor_win: &slint::Window,
+    gap_logical: f32,
+) -> bool {
+    let Some(anchor) = native_rect(anchor_win) else {
+        return false;
+    };
+    // 子窗口尺寸优先取原生矩形（与 set_window_rect 同一口径）；HWND 尚未
+    // 就绪时退回 Slint 的 physical size
+    let (w, h) = match native_rect(win) {
+        Some((_, _, w, h)) => (w, h),
+        None => {
+            let s = win.size();
+            (s.width as i32, s.height as i32)
+        }
+    };
+    if w <= 1 || h <= 1 {
+        return false;
+    }
+    // 工作区取「锚点中心」所在显示器：子窗口此刻可能还在别的屏上
+    let (cx, cy) = (anchor.0 + anchor.2 / 2, anchor.1 + anchor.3 / 2);
+    let Some(work) = monitor_work_area_at(cx, cy) else {
+        return false;
+    };
+    let gap = (gap_logical * anchor_win.scale_factor()).round() as i32;
+    let rect = place_popup_rect(anchor, w, h, work, gap);
+    set_window_rect(win, rect.0, rect.1, rect.2, rect.3);
+    true
 }
 
 
@@ -902,7 +1164,7 @@ mod tests {
     #[test]
     fn tool_window_sets_bit_and_clears_appwindow() {
         let style = APPWINDOW | 0x1000; // winit 默认：APPWINDOW + 一些其他样式
-        let new = (style | TOOLWINDOW) & !APPWINDOW;
+        let new = toggle_tool_window_bits(style);
         assert_ne!(new & TOOLWINDOW, 0);
         assert_eq!(new & APPWINDOW, 0);
         assert_ne!(new & 0x1000, 0); // 不破坏其他位
@@ -912,19 +1174,49 @@ mod tests {
     #[test]
     fn tool_window_idempotent_when_already_clean() {
         let style = TOOLWINDOW | 0x1000; // 无 APPWINDOW
-        let new = (style | TOOLWINDOW) & !APPWINDOW;
-        assert_eq!(new, style);
+        assert_eq!(toggle_tool_window_bits(style), style);
     }
 
     /// 典型 winit 初始样式（0x40118）应判定为需要修改
     #[test]
     fn tool_window_detects_winit_default_needs_fix() {
         let style = 0x40118; // 实测 winit 默认：APPWINDOW|WINDOWEDGE|TOPMOST|ACCEPTFILES
-        let new = (style | TOOLWINDOW) & !APPWINDOW;
+        let new = toggle_tool_window_bits(style);
         assert_ne!(new, style); // APPWINDOW 被清除 → 需要修改
         assert_eq!(new & APPWINDOW, 0);
         assert_ne!(new & TOOLWINDOW, 0);
         assert_eq!(new & 0x100, 0x100); // WINDOWEDGE 保留
+    }
+
+    // ===== WS_EX_APPWINDOW（进程详情页 / 卡顿分析页要留在任务栏）=====
+
+    /// 主窗口位逻辑：置 APPWINDOW + 清 TOOLWINDOW + 保留其他
+    #[test]
+    fn app_window_sets_bit_and_clears_toolwindow() {
+        let style = TOOLWINDOW | 0x1000;
+        let new = toggle_app_window_bits(style);
+        assert_ne!(new & APPWINDOW, 0);
+        assert_eq!(new & TOOLWINDOW, 0);
+        assert_ne!(new & 0x1000, 0);
+    }
+
+    /// winit 默认样式（已含 APPWINDOW）→ app 版本应是恒等（零重绘开销）
+    #[test]
+    fn app_window_idempotent_on_winit_default() {
+        let style = 0x40118;
+        assert_eq!(toggle_app_window_bits(style), style);
+    }
+
+    /// 两个方向互为逆运算：工具位集合与普通位集合不重叠，来回切换不残留
+    #[test]
+    fn tool_and_app_window_bits_are_inverse() {
+        let base = 0x10100; // WINDOWEDGE + ACCEPTFILES
+        let tool = toggle_tool_window_bits(base);
+        let app = toggle_app_window_bits(tool);
+        assert_eq!(app & TOOLWINDOW, 0);
+        assert_ne!(app & APPWINDOW, 0);
+        // 再切回工具窗口应回到最初的工具位集合
+        assert_eq!(toggle_tool_window_bits(app), tool);
     }
 
     // ===== NativeMenuCmd（右键原生菜单命令）=====
@@ -995,6 +1287,88 @@ mod tests {
     #[test]
     fn snap_axis_zero_threshold_is_noop() {
         assert_eq!(snap_axis(3, 300, 0, 1920, 0), 3);
+    }
+
+    // ===== 工作区夹取（clamp_rect_to_work / place_popup_rect）=====
+
+    /// 1920×1080 去任务栏后的典型工作区
+    const WORK: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+
+    /// 完全在工作区内 → 原样返回（调用方据此不做多余的 SetWindowPos）
+    #[test]
+    fn clamp_rect_noop_when_inside() {
+        assert_eq!(clamp_rect_to_work(100, 100, 900, 506, WORK), (100, 100, 900, 506));
+    }
+
+    /// 右侧越界（x=1500 + 900 = 2400 > 1920）→ 左移到 1020
+    #[test]
+    fn clamp_rect_pulls_back_from_right_edge() {
+        assert_eq!(clamp_rect_to_work(1500, 100, 900, 506, WORK), (1020, 100, 900, 506));
+    }
+
+    /// 下方越界（y=800 + 506 = 1306 > 1040）→ 上移到 534
+    #[test]
+    fn clamp_rect_pulls_back_from_bottom_edge() {
+        assert_eq!(clamp_rect_to_work(100, 800, 900, 506, WORK), (100, 534, 900, 506));
+    }
+
+    /// 左上越界（跨屏拖动后残留的负坐标）→ 贴回工作区左上
+    #[test]
+    fn clamp_rect_pulls_back_from_negative() {
+        assert_eq!(clamp_rect_to_work(-200, -50, 900, 506, WORK), (0, 0, 900, 506));
+    }
+
+    /// 窗口比工作区还大 → 缩到工作区大小，位置贴左上（不能留下越界坐标）
+    #[test]
+    fn clamp_rect_shrinks_when_larger_than_work() {
+        assert_eq!(clamp_rect_to_work(0, 0, 3000, 2000, WORK), (0, 0, 1920, 1040));
+        assert_eq!(clamp_rect_to_work(500, 500, 3000, 2000, WORK), (0, 0, 1920, 1040));
+    }
+
+    /// 多屏负坐标工作区（主屏左侧的副屏 rcWork = (-1920,0,0,1080)）
+    #[test]
+    fn clamp_rect_handles_negative_work_origin() {
+        let work = (-1920, 0, 0, 1080);
+        assert_eq!(clamp_rect_to_work(-1000, 100, 900, 506, work), (-1000, 100, 900, 506));
+        assert_eq!(clamp_rect_to_work(-50, 100, 900, 506, work), (-900, 100, 900, 506));
+    }
+
+    /// 锚点在屏幕中部：弹窗放锚点下方 gap 处
+    #[test]
+    fn popup_prefers_below_anchor() {
+        let anchor = (100, 100, 400, 62);
+        assert_eq!(
+            place_popup_rect(anchor, 900, 506, WORK, 8),
+            (100, 170, 900, 506)
+        );
+    }
+
+    /// 锚点贴底：下方放不下 → 翻到上方
+    #[test]
+    fn popup_flips_above_when_no_room_below() {
+        let anchor = (100, 900, 400, 62); // 下方剩余 1040-962=78 < 506
+        let (x, y, w, h) = place_popup_rect(anchor, 900, 506, WORK, 8);
+        assert_eq!((x, w, h), (100, 900, 506));
+        assert_eq!(y, 900 - 8 - 506); // 386：贴锚点上方，仍完整可见
+        assert!(y + h <= WORK.3);
+    }
+
+    /// 锚点靠右：横向被夹回，右边缘不越界
+    #[test]
+    fn popup_clamped_horizontally() {
+        let anchor = (1700, 100, 200, 62);
+        let (x, _y, w, _h) = place_popup_rect(anchor, 900, 506, WORK, 8);
+        assert_eq!(x + w, 1920);
+        assert_eq!(x, 1020);
+    }
+
+    /// 上下都放不下（弹窗比工作区还高）：退回下方，位置交给 clamp
+    #[test]
+    fn popup_falls_back_to_clamp_when_too_tall() {
+        let work = (0, 0, 1920, 400);
+        let anchor = (100, 200, 400, 62);
+        let (x, y, w, h) = place_popup_rect(anchor, 900, 506, work, 8);
+        assert_eq!((x, y, w, h), (100, 0, 900, 400));
     }
 
     // ===== 几何对账（Slint 布局 vs 原生窗口矩形）=====

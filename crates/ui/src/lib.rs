@@ -252,6 +252,7 @@ pub fn run() -> anyhow::Result<()> {
             proc_highlight_pct,
             proc_refresh_ms,
             compact,
+            true, // 资源区临时弹窗：不占任务栏
             &sort,
             Some(std::path::PathBuf::from(proc_db_path_for_res.clone())),
         ) {
@@ -261,15 +262,23 @@ pub fn run() -> anyhow::Result<()> {
                 return;
             }
         };
-        // 位置：悬浮窗左下方偏移 8px，避免遮挡悬浮窗
+        // 位置：悬浮窗左下方偏移 8px，避免遮挡悬浮窗。
+        // 下方/右侧空间不足时（悬浮窗贴屏幕底边或右边）翻到上方 / 左移，
+        // 并整体夹进所在显示器工作区——否则窗口会有一截跑到屏幕外看不见。
         if let Some(ui) = weak_ui_for_res.upgrade() {
-            let win = ui.window();
-            let scale = win.scale_factor();
-            let pos = win.position();
-            let size = win.size();
-            let x = pos.x;
-            let y = pos.y + size.height as i32 + (8.0 * scale) as i32;
-            w.window().set_position(slint::PhysicalPosition::new(x, y));
+            if !crate::window::place_popup_near(w.window(), ui.window(), 8.0) {
+                // 兜底：取不到原生矩形（HWND 尚未就绪）时按 Slint 几何摆放。
+                // 此时 fit 往往也拿不到 HWND（同一原因），真正兜底的是
+                // ProcessListWindow::show 里 500ms 的重试——最迟半秒内纠正。
+                let win = ui.window();
+                let scale = win.scale_factor();
+                let pos = win.position();
+                let size = win.size();
+                let x = pos.x;
+                let y = pos.y + size.height as i32 + (8.0 * scale) as i32;
+                w.window().set_position(slint::PhysicalPosition::new(x, y));
+                crate::window::fit_window_to_work(w.window());
+            }
         }
         let w = std::sync::Arc::new(w);
         let wid = w.id();
@@ -333,6 +342,7 @@ pub fn run() -> anyhow::Result<()> {
                             proc_highlight_pct,
                             proc_refresh_ms,
                             false,
+                            false, // 主进程详情页：普通应用窗口
                             "cpu",
                             Some(std::path::PathBuf::from(proc_db_path_for_menu.clone())),
                         ) {
@@ -467,6 +477,7 @@ pub fn run() -> anyhow::Result<()> {
                 proc_highlight_pct,
                 proc_refresh_ms,
                 false,
+                false, // 主进程详情页：普通应用窗口
                 "cpu",
                 Some(std::path::PathBuf::from(proc_db_path.clone())),
             ) {
@@ -482,20 +493,21 @@ pub fn run() -> anyhow::Result<()> {
         slint::TimerMode::Repeated,
         POLL_INTERVAL,
         move || {
-            // -2) 守护：三个窗口都不显示在 Windows 系统任务栏。
-            //     winit 在 show / 状态变化时会重算扩展样式（覆盖 WS_EX_TOOLWINDOW、
-            //     加回 WS_EX_APPWINDOW），因此每 tick 复查一次；
-            //     ensure_tool_window_for 幂等，样式无变化时零开销（微秒级）。
+            // -2) 守护窗口样式（winit 在 show / 状态变化时会重算扩展样式）：
+            //     悬浮窗 + 伪任务栏 + 资源区临时弹窗 = 工具窗口（不进系统任务栏、不进 Alt-Tab）；
+            //     进程详情页 + 卡顿分析页 = 普通应用窗口（要留在任务栏，作为
+            //     被其它 APP 压下去后的切回入口）。两者都幂等，样式无变化时
+            //     零开销（微秒级）。
             if let Some(ui) = weak_ui.upgrade() {
                 crate::window::ensure_tool_window_for(ui.window());
                 if let Some(tb) = &taskbar_for_tick {
                     crate::window::ensure_tool_window_for(tb.window());
                 }
                 if let Some(pw) = process_win_for_tick.lock().unwrap().as_ref() {
-                    crate::window::ensure_tool_window_for(pw.window());
+                    crate::window::ensure_app_window_for(pw.window());
                 }
                 if let Some(aw) = analysis_win_for_tick.lock().unwrap().as_ref() {
-                    crate::window::ensure_tool_window_for(aw.window());
+                    crate::window::ensure_app_window_for(aw.window());
                 }
                 // 资源区弹窗：先移除已关闭的（drop 停采样线程），再守护剩余
                 {
@@ -508,6 +520,7 @@ pub fn run() -> anyhow::Result<()> {
                     if !closed.is_empty() {
                         wins.retain(|w| !closed.contains(&w.id()));
                     }
+                    // 资源区弹窗是临时窗口（工具窗口样式）：关闭后移除跟踪即可
                     for w in wins.iter() {
                         crate::window::ensure_tool_window_for(w.window());
                     }
