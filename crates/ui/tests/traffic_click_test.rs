@@ -17,11 +17,11 @@
 //!
 //! 1. 右列第三行「今日 ↑x ↓y」→ `traffic-clicked`（本窗口）
 //! 2. 中列第三行「今日卡顿 N」→ `event-count-clicked`，不触发 traffic
-//! 3. 右列第二行暂停按钮 → `toggle-pause`，不触发 traffic
+//! 3. 右列第二行「最近卡顿」无热区，不触发 traffic / pause
 //! 4. 左列 CPU 数值 → `resource-clicked("cpu")`，不触发 traffic
 //!
-//! 两组尺寸分别对应皮肤默认卡片（314×70）与 bubble（334×70）：两者右列宽度不同，
-//! 热区换算容易在某一组里跑偏。
+//! card / bubble 皮肤现在同为 314×70；仍按两种皮肤各跑一遍，锁住配色/吉祥物差异
+//! 不会改变布局命中区。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -68,7 +68,6 @@ fn click(win: &Rc<MinimalSoftwareWindow>, x: f32, y: f32) {
 struct Counters {
     traffic: Rc<RefCell<u32>>,
     events: Rc<RefCell<u32>>,
-    pauses: Rc<RefCell<u32>>,
     resources: Rc<RefCell<Vec<String>>>,
 }
 
@@ -86,6 +85,7 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Counters) {
     ui.set_net_today_down(SharedString::from("↓ 2.7G"));
     ui.set_service_status(SharedString::from("● 运行中"));
     ui.set_last_heartbeat(SharedString::from("12:49:57"));
+    ui.set_last_event(SharedString::from("最近卡顿 3分钟前"));
     ui.set_event_count(SharedString::from("今日卡顿 1"));
     ui.show().unwrap();
 
@@ -97,10 +97,6 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Counters) {
     let e = events.clone();
     ui.on_event_count_clicked(move || *e.borrow_mut() += 1);
 
-    let pauses = Rc::new(RefCell::new(0u32));
-    let p = pauses.clone();
-    ui.on_toggle_pause(move || *p.borrow_mut() += 1);
-
     let resources = Rc::new(RefCell::new(Vec::<String>::new()));
     let r = resources.clone();
     ui.on_resource_clicked(move |kind: SharedString| r.borrow_mut().push(kind.to_string()));
@@ -110,7 +106,6 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Counters) {
         Counters {
             traffic,
             events,
-            pauses,
             resources,
         },
     )
@@ -268,36 +263,12 @@ fn assert_all(w: f32, h: f32, tag: &str) {
         "[{tag}] 点「今日卡顿」不应触发 traffic-clicked"
     );
 
-    // ==== 断言 3：右列第二行暂停按钮 → toggle-pause，不触发 traffic ====
-    // 扫描范围：右列 x ∈ [55% w, w) × 上半窗 y ∈ [0, 46)，步长 3px。
-    // 只扫上半窗，天然避开第三行的流量入口（第三行起点 y≈48）。
-    let pause_pts = scan_points(&win, (w * 0.55, w, 0.0, 46.0), 3.0, &c.pauses);
-    let pb = bbox(&pause_pts)
-        .unwrap_or_else(|| panic!("[{tag}] 右列第二行未扫到任何暂停命中点"));
-    eprintln!(
-        "[{tag}] pause 命中 {} 点，bbox x=[{:.1},{:.1}] y=[{:.1},{:.1}]",
-        pause_pts.len(),
-        pb.0,
-        pb.1,
-        pb.2,
-        pb.3
-    );
+    // ==== 断言 3：右列第二行「最近卡顿」无热区，不触发 traffic ====
+    // 暂停已收敛到右键菜单/托盘；这里扫描整个第二行，任何 traffic 触发都算串台。
+    let last_event_pts = scan_points(&win, (w * 0.55, w, 24.0, 46.0), 3.0, &c.traffic);
     assert!(
-        !overlaps(tb, pb),
-        "[{tag}] 暂停热区与 traffic 热区重叠：pause={pb:?} traffic={tb:?}"
-    );
-    let (px, py) = center(pb);
-    let (p_before, tr_before) = (*c.pauses.borrow(), *c.traffic.borrow());
-    click(&win, px, py);
-    assert_eq!(
-        *c.pauses.borrow(),
-        p_before + 1,
-        "[{tag}] 点击 ({px}, {py})（暂停按钮中心）应触发一次 toggle-pause"
-    );
-    assert_eq!(
-        *c.traffic.borrow(),
-        tr_before,
-        "[{tag}] 点暂停按钮不应触发 traffic-clicked"
+        last_event_pts.is_empty(),
+        "[{tag}] 右列第二行不应触发 traffic-clicked，实测命中：{last_event_pts:?}"
     );
 
     // ==== 断言 4：左列 CPU 数值 → resource-clicked("cpu")，不触发 traffic ====
@@ -351,9 +322,9 @@ fn traffic_entry_hit_default_card() {
     assert_all(314.0, 70.0, "card 314x70");
 }
 
-/// bubble 尺寸（skin.toml bubble：334×70）。
+/// bubble 尺寸（skin.toml bubble：314×70）。
 #[test]
 fn traffic_entry_hit_bubble() {
-    assert_all(334.0, 70.0, "bubble 334x70");
+    assert_all(314.0, 70.0, "bubble 314x70");
 }
 

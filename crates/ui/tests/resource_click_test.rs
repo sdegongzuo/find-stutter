@@ -1,6 +1,6 @@
 //! Overlay 资源区左键点击（真实组件）：card / bubble 两种布局下，
-//! 只有「数字」（ClickableValue）区域命中并触发 resource-clicked("cpu"/"mem"/"net")，
-//! 点标签不触发；点暂停按钮区触发 toggle-pause 且不误触资源区。
+//! 只有「数字」（ClickableValue）区域命中并触发 resource-clicked("cpu"/"mem"/"net")；
+//! 点标签、右列非入口行都不触发——暂停已收敛到右键菜单/托盘，窗口内无热区。
 use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::ComponentHandle;
@@ -56,7 +56,7 @@ fn click_kind(
 
 type Hit = Rc<RefCell<Vec<String>>>;
 
-fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Hit, Rc<RefCell<u32>>) {
+fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Hit) {
     let ui = find_stutter_ui::Overlay::new().unwrap();
     ui.set_skin_width(w);
     ui.set_skin_height(h);
@@ -69,6 +69,7 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Hit, Rc<RefCell<u3
     ui.set_net_recv_value(slint::SharedString::from("1023.9 MB/s"));
     ui.set_event_count(slint::SharedString::from("今日卡顿 12"));
     ui.set_last_heartbeat(slint::SharedString::from("12:49:57"));
+    ui.set_last_event(slint::SharedString::from("最近卡顿 3分钟前"));
     ui.show().unwrap();
 
     let hits: Hit = Rc::new(RefCell::new(Vec::new()));
@@ -76,12 +77,7 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Hit, Rc<RefCell<u3
     ui.on_resource_clicked(move |kind: slint::SharedString| {
         h2.borrow_mut().push(kind.to_string());
     });
-    let pauses = Rc::new(RefCell::new(0u32));
-    let p2 = pauses.clone();
-    ui.on_toggle_pause(move || {
-        *p2.borrow_mut() += 1;
-    });
-    (ui, hits, pauses)
+    (ui, hits)
 }
 
 /// 某一类命中区的包围盒（物理像素）。
@@ -111,10 +107,10 @@ impl Bounds {
 }
 
 // 布局常量，必须与 crates/ui/ui/overlay.slint 的 HorizontalLayout 一致：
-// padding-left/right 12，左列 24%，右列 38%。
+// padding-left 12 / padding-right 8，左列 24%，右列 38%。
 // 改了 slint 的列宽就要同步这里，否则下面的越界断言会给出错误的通过/失败。
 const PAD_LEFT: f32 = 12.0;
-const PAD_RIGHT: f32 = 12.0;
+const PAD_RIGHT: f32 = 8.0;
 const LEFT_COL_PCT: f32 = 0.24;
 const RIGHT_COL_PCT: f32 = 0.38;
 
@@ -193,39 +189,33 @@ fn assert_hits_stay_in_columns(map: &std::collections::BTreeMap<String, Bounds>,
 #[test]
 fn overlay_card_only_number_clickable() {
     let window = setup();
-    let (ui, hits, pauses) = make_overlay(314.0, 70.0);
+    let (ui, hits) = make_overlay(314.0, 70.0);
 
     // 点标签（左列行首，CPU / 内存 文字）不应命中
     let n0 = hits.borrow().len();
     click(&window, 10.0, 18.0);
     click(&window, 10.0, 39.0);
     assert_eq!(hits.borrow().len(), n0, "标签区不应触发 resource-clicked");
-    assert_eq!(*pauses.borrow(), 0, "标签点击不应触发暂停");
 
     // 全窗扫描：三个数字区都能命中，且命中矩形不越出自己的列
     let got = sweep(&window, 314, 70, &hits);
     eprintln!("card 命中包围盒: {:?}", got);
     assert_hits_stay_in_columns(&got, 314.0);
 
-    // 暂停按钮（右列第二行）→ toggle-pause，且不触发资源区
+    // 右列第二行（最近卡顿）不再是暂停热区：点击不应触发 resource-clicked，
+    // 也不应翻转 paused（防止此前“整行命中”的回归）。
     let before_hits = hits.borrow().len();
-    let before_pauses = *pauses.borrow();
     let before_paused = ui.get_paused();
     click(&window, 290.0, 35.0);
     assert_eq!(
-        *pauses.borrow(),
-        before_pauses + 1,
-        "card 暂停区应触发一次 toggle-pause"
+        hits.borrow().len(),
+        before_hits,
+        "右列非入口行点击不应触发 resource-clicked"
     );
     assert_eq!(
         ui.get_paused(),
-        !before_paused,
-        "暂停点击后 slint 侧 paused 属性应翻转（只在渲染层翻转而没同步属性是 P1-1 的成因）"
-    );
-    assert_eq!(
-        hits.borrow().len(),
-        before_hits,
-        "暂停区点击不应触发 resource-clicked"
+        before_paused,
+        "窗口内不再有暂停热区；paused 只应由右键菜单/托盘改变"
     );
 
     drop(ui);
@@ -234,7 +224,7 @@ fn overlay_card_only_number_clickable() {
 #[test]
 fn overlay_bubble_only_number_clickable() {
     let window = setup();
-    let (ui, hits, pauses) = make_overlay(334.0, 70.0);
+    let (ui, hits) = make_overlay(314.0, 70.0);
     let event_clicks = Rc::new(RefCell::new(0u32));
     let event_clicks_cb = event_clicks.clone();
     ui.on_event_count_clicked(move || {
@@ -247,24 +237,23 @@ fn overlay_bubble_only_number_clickable() {
     click(&window, 16.0, 39.0);
     assert_eq!(hits.borrow().len(), n0, "标签区不应触发 resource-clicked");
 
-    let got = sweep(&window, 334, 70, &hits);
+    let got = sweep(&window, 314, 70, &hits);
     eprintln!("bubble 命中包围盒: {:?}", got);
-    assert_hits_stay_in_columns(&got, 334.0);
+    assert_hits_stay_in_columns(&got, 314.0);
 
-    // 暂停按钮在 bubble 下同样可点，且不与资源区混淆。
-    // 全窗扫描本身会扫过暂停热区，故用点击前后的增量断言。
+    // bubble 下右列第二行同样无热区：点击不触发资源弹窗、不改变 paused。
     let before_hits = hits.borrow().len();
-    let before_pauses = *pauses.borrow();
+    let before_paused = ui.get_paused();
     click(&window, 300.0, 35.0);
-    assert_eq!(
-        *pauses.borrow(),
-        before_pauses + 1,
-        "bubble 暂停区应触发一次 toggle-pause"
-    );
     assert_eq!(
         hits.borrow().len(),
         before_hits,
-        "bubble 暂停区点击不应触发 resource-clicked"
+        "bubble 右列非入口行点击不应触发 resource-clicked"
+    );
+    assert_eq!(
+        ui.get_paused(),
+        before_paused,
+        "bubble 右列非入口行点击不应改变暂停状态"
     );
 
     // 今日卡顿文字 → 打开分析，且不误触资源弹窗

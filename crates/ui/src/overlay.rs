@@ -187,6 +187,29 @@ pub fn format_heartbeat_text(raw: Option<&str>) -> String {
     format!("最近心跳 {}", format_heartbeat_time(raw))
 }
 
+/// 相对时间文案（本地时区观感）：刚刚 / N分钟前 / N小时前 / N天前。
+pub fn format_last_event_elapsed(seconds: i64) -> String {
+    let s = seconds.max(0);
+    if s < 60 {
+        "刚刚".to_string()
+    } else if s < 3600 {
+        format!("{}分钟前", s / 60)
+    } else if s < 86_400 {
+        format!("{}小时前", s / 3600)
+    } else {
+        format!("{}天前", s / 86_400)
+    }
+}
+
+/// 悬浮窗右列「最近卡顿」行：相对时间比固定 HH:MM:SS 更一眼可读。
+pub fn format_last_event_text(raw: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    let Some(ts) = raw else {
+        return "最近卡顿 --".to_string();
+    };
+    let seconds = (chrono::Utc::now().signed_duration_since(ts)).num_seconds();
+    format!("最近卡顿 {}", format_last_event_elapsed(seconds))
+}
+
 /// 「当日上行累计流量」短文本（紧凑单位，无额外空格）。
 pub fn format_today_up_traffic(sent: u64) -> String {
     format!("↑{}", crate::process_list::format_bytes(sent))
@@ -248,7 +271,13 @@ pub fn parse_color(s: &str) -> Option<Color> {
 
 /// 悬浮窗 tooltip（多行）：服务状态 / 今日卡顿 / 最近心跳 / 当日流量。
 /// 主区空间有限，完整状态（含服务未注册时的修复命令）收敛到这里。
+///
+/// 暂停时整体换成暂停说明：slint 端 `Tooltip` 没有 `visible` 属性、
+/// `@markdown()` 又只接受字符串字面量，分支文案只能在 Rust 侧做。
 pub fn format_bubble_tip(state: &OverlayState) -> String {
+    if state.paused {
+        return "界面已暂停刷新；后台服务仍持续采集，可在右键菜单恢复".to_string();
+    }
     let (status, _) = format_service_status(state.service_health);
     format!(
         "{}\n{}\n{}\n今日流量 {} / {}",
@@ -335,9 +364,7 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
     ui.set_service_status(text);
     ui.set_service_status_color(color);
 
-    // 2) 暂停按钮在服务停止时禁用
-    let pause_enabled = matches!(state.service_health, ServiceHealth::Running);
-    ui.set_pause_enabled(pause_enabled);
+    // 暂停入口在右键菜单/托盘；窗口内不再有 pause-enabled 属性。
 
     // 3) 指标：每 tick 显式覆盖，避免 GPU 等可选信号在采集失败后残留旧读数。
     // 无 summary 时统一回落到 `--`，不把不可信的历史值伪装成实时数据。
@@ -394,6 +421,11 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
     // 5) 最近心跳：主区只显示本地时间，与服务状态合并；完整说明见 tooltip。
     ui.set_last_heartbeat(SharedString::from(format_heartbeat_time(
         state.last_heartbeat.as_deref(),
+    )));
+
+    // 5b) 最近卡顿：占原暂停按钮位；相对时间一眼可读，数据本就在 poll 里。
+    ui.set_last_event(SharedString::from(format_last_event_text(
+        state.last_event_at,
     )));
 
     // 6) 暂停状态以 Rust 侧为唯一真相（托盘/右键菜单也会改它）。
@@ -601,6 +633,25 @@ mod tests {
         assert_eq!(format_heartbeat_time(Some("not-a-timestamp")), "--");
         assert_eq!(format_heartbeat_text(Some(raw)), format!("最近心跳 {local}"));
         assert_eq!(format_heartbeat_text(None), "最近心跳 --");
+    }
+
+    /// 「最近卡顿」相对时间：秒级分档是悬浮窗文案契约。
+    #[test]
+    fn last_event_elapsed_buckets() {
+        assert_eq!(format_last_event_elapsed(0), "刚刚");
+        assert_eq!(format_last_event_elapsed(59), "刚刚");
+        assert_eq!(format_last_event_elapsed(60), "1分钟前");
+        assert_eq!(format_last_event_elapsed(3_599), "59分钟前");
+        assert_eq!(format_last_event_elapsed(3_600), "1小时前");
+        assert_eq!(format_last_event_elapsed(86_399), "23小时前");
+        assert_eq!(format_last_event_elapsed(86_400), "1天前");
+        // 未来时间（时钟漂移）不显示负数
+        assert_eq!(format_last_event_elapsed(-30), "刚刚");
+    }
+
+    #[test]
+    fn last_event_text_handles_none() {
+        assert_eq!(format_last_event_text(None), "最近卡顿 --");
     }
 
     /// 当周 tooltip：含总量、上传、下载三段，且换行分两行。

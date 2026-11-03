@@ -442,6 +442,36 @@ fn trim_trailing_zeros(s: &str) -> String {
     }
 }
 
+/// 日历格右上角的紧凑流量文本（"1.0T" / "12G" / "3.2G" / "590M" / "12K"）。
+///
+/// 格子宽约 90px，只放得下 4~5 个字符；无数据（0 字节）返回空串，由 slint 侧不画。
+/// 精度取舍：TB 恒 1 位小数；GB 小于 10 保留 1 位（"3.2G"），否则取整（"12G"）；
+/// MB / KB / B 取整——避免同一列里数字长短参差。
+fn format_cal_bytes(bytes: u64) -> String {
+    if bytes == 0 {
+        return String::new();
+    }
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    let v = bytes as f64;
+    if bytes >= TIB {
+        format!("{:.1}T", v / TIB as f64)
+    } else if bytes >= GIB {
+        let g = v / GIB as f64;
+        if g < 10.0 {
+            format!("{:.1}G", g)
+        } else {
+            format!("{:.0}G", g)
+        }
+    } else if bytes >= MB {
+        format!("{:.0}M", v / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0}K", v / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 /// 流量档位（0..4；`total == 0` 视为无数据 → -1）。
 fn traffic_level(total: u64) -> i32 {
     if total == 0 {
@@ -482,18 +512,28 @@ fn build_calendar(year: i32, month: u32, daily: &[DailyTraffic]) -> Vec<crate::C
     let start = first - ChronoDuration::days(offset);
 
     let mut cells = Vec::with_capacity(42);
+    let today = Local::now().date_naive();
     for i in 0..42i64 {
         let date = start + ChronoDuration::days(i);
         let in_month = date.year() == year && date.month() == month;
-        let level = if !in_month {
-            -1
+        // 本月内取当日总量（无样本 = 0），档位与右上角紧凑流量都由它派生
+        let total = if in_month {
+            by_day.get(&date).copied().unwrap_or(0)
         } else {
-            by_day.get(&date).map(|v| traffic_level(*v)).unwrap_or(-1)
+            0
         };
+        let level = if in_month { traffic_level(total) } else { -1 };
         cells.push(crate::CalCell {
             day: date.day() as i32,
             level,
             in_month,
+            // 今天只在当前月份里出现，跨月格子不必描边
+            is_today: in_month && date == today,
+            total_text: if in_month {
+                SharedString::from(format_cal_bytes(total))
+            } else {
+                SharedString::new()
+            },
         });
     }
     cells
@@ -543,10 +583,14 @@ fn recompute(
 
     ui.set_has_data(!rows.is_empty());
     ui.set_rows(ModelRc::from(Rc::new(VecModel::from(rows))));
-    ui.set_summary_text(SharedString::from(format!(
-        "共 {} 条 · 累计 {}（上传 {} / 下载 {}）",
+    // 汇总拆两段：主行（条数 + 累计）加粗，明细（上传 / 下载）弱化
+    ui.set_summary_main(SharedString::from(format!(
+        "共 {} 条 · 累计 {}",
         agg.len(),
-        format_traffic_bytes(total),
+        format_traffic_bytes(total)
+    )));
+    ui.set_summary_sub(SharedString::from(format!(
+        "上传 {} · 下载 {}",
         format_traffic_bytes(total_up),
         format_traffic_bytes(total_down)
     )));
@@ -557,16 +601,20 @@ fn recompute(
     )))));
     ui.set_month_text(SharedString::from(format!("{} 年 {} 月", month.0, month.1)));
     let (m_up, m_down, has_month) = month_totals(month.0, month.1, daily);
-    ui.set_cal_summary_text(SharedString::from(if has_month {
-        format!(
-            "当前月总流量：{}（上传 {}，下载 {}）",
-            format_traffic_bytes(m_up.saturating_add(m_down)),
+    if has_month {
+        ui.set_cal_summary_main(SharedString::from(format!(
+            "本月总流量 {}",
+            format_traffic_bytes(m_up.saturating_add(m_down))
+        )));
+        ui.set_cal_summary_sub(SharedString::from(format!(
+            "上传 {} · 下载 {}",
             format_traffic_bytes(m_up),
             format_traffic_bytes(m_down)
-        )
+        )));
     } else {
-        "本月暂无数据".to_string()
-    }));
+        ui.set_cal_summary_main(SharedString::from("本月暂无数据"));
+        ui.set_cal_summary_sub(SharedString::new());
+    }
 }
 
 /// 皮肤注入：让窗口外框跟随 skin.toml（与 Analysis / ProcessList 一致）。
@@ -630,6 +678,19 @@ mod tests {
         assert_eq!(format_traffic_bytes(1154487209165), "1.05 TB");
         // 超过 TB 仍以 TB 为单位，不越界
         assert_eq!(format_traffic_bytes(u64::MAX), "16777216 TB");
+    }
+
+    /// 日历格右上角的紧凑文本（4~5 字符以内，无数据为空串）。
+    #[test]
+    fn format_cal_bytes_is_compact() {
+        let gb = 1024 * 1024 * 1024u64;
+        assert_eq!(format_cal_bytes(0), "");
+        assert_eq!(format_cal_bytes(512), "512B");
+        assert_eq!(format_cal_bytes(12 * 1024), "12K");
+        assert_eq!(format_cal_bytes(590 * 1024 * 1024), "590M");
+        assert_eq!(format_cal_bytes(3 * gb + gb / 5), "3.2G");
+        assert_eq!(format_cal_bytes(12 * gb), "12G");
+        assert_eq!(format_cal_bytes(1024 * gb), "1.0T");
     }
 
     // === 聚合 ===

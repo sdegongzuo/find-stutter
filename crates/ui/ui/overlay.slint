@@ -129,15 +129,10 @@ export component Overlay inherits Window {
     in property <image> mascot-image;
     in property <bool> mascot-visible: false;
 
-    // === 暂停界面刷新（后台服务仍采集；服务停止时禁用）===
-    in property <bool> pause-enabled: true;
+    // === 暂停界面刷新（后台服务仍采集；入口在右键菜单与托盘）===
     in-out property <bool> paused: false;
-    // 暂停按钮文字（34px 宽只放得下两个字；是否"只暂停界面"由 tooltip 说明）
-    out property <string> pause-text: root.paused ? "恢复" : "暂停";
-    out property <string> pause-tooltip: root.paused
-        ? "点击恢复界面刷新；暂停期间后台服务仍持续采集"
-        : "仅暂停界面刷新与卡顿通知，后台服务仍持续采集";
-    callback toggle-pause();
+    // 右列第二行：最近一次卡顿的相对时间（无记录时 "最近卡顿 --"）。
+    in property <string> last-event: "最近卡顿 --";
 
     // === 拖动 + 右键菜单 ===
     // no-frame 模式下去掉了 Windows 原生 HTCAPTION，必须自己接管拖动。
@@ -197,13 +192,7 @@ export component Overlay inherits Window {
     function hovering(el-x: length, el-y: length, el-w: length, el-h: length) -> bool {
         return ta.has-hover && root.in-elem(ta.mouse-x, ta.mouse-y, el-x, el-y, el-w, el-h);
     }
-    // 暂停热区覆盖右列整个第二行，视觉按钮虽只有 34×18，点击区域仍足够大；
-    // 不向上下行扩展，避免与状态文字、今日流量入口抢点击。
-    function pause-hit(x: length, y: length) -> bool {
-        return root.in-elem(x, y, pause-row.absolute-position.x, pause-row.absolute-position.y, pause-row.width, pause-row.height);
-    }
-
-    // 命名 ta 供 bubble 暂停悬浮区引用（has-hover / mouse-x）
+    // 命名 ta 供数字悬浮态引用（has-hover / mouse-x）
     ta := TouchArea {
         z: 100;
         moved => {
@@ -218,15 +207,11 @@ export component Overlay inherits Window {
                 root.drag-ended();
             }
         }
-        // 暂停按钮：点击落在右列按钮区域时切换暂停。
         // 用同一 TouchArea 坐标判断，不依赖 z 层级（多 TouchArea 叠层在
         // 本窗口实测点击不生效，统一到一个 TouchArea 最可靠）。
-        // 未命中暂停区时判定资源区（CPU/内存/网络）→ 通知 Rust 弹对应弹窗。
+        // 暂停已移入右键菜单/托盘，窗口内不再有整行暂停热区。
         clicked => {
-            if (root.pause-enabled && root.pause-hit(self.pressed-x, self.pressed-y)) {
-                root.paused = !root.paused;
-                root.toggle-pause();
-            } else if (root.event-count-hit(self.pressed-x, self.pressed-y)) {
+            if (root.event-count-hit(self.pressed-x, self.pressed-y)) {
                 root.event-count-clicked();
             } else if (root.traffic-hit(self.pressed-x, self.pressed-y)) {
                 root.traffic-clicked();
@@ -256,7 +241,8 @@ export component Overlay inherits Window {
             height: 62px;
             width: 100%;
             padding-left: 12px;
-            padding-right: 12px;
+            // 右边距比左边小：状态行本身不铺满右列，留 12px 会形成明显空白带。
+            padding-right: 8px;
             spacing: 8px;
 
             // 左列：CPU / 内存 / GPU
@@ -392,7 +378,7 @@ export component Overlay inherits Window {
                 }
             }
 
-            // 右列：服务状态+心跳 / 暂停 / 今日累计流量
+            // 右列：服务状态+心跳 / 最近卡顿 / 今日累计流量
             // 吉祥物可见时（32px + 8px 间距）从右列扣，否则中列会被挤到 min-width 以下，
             // 网络速率又回到「压右列」的老问题。
             main-col3 := VerticalLayout {
@@ -405,38 +391,18 @@ export component Overlay inherits Window {
                     color: root.paused ? root.paused-color : root.service-status-color;
                     font-size: max(9px, root.text-size - 4px);
                     overflow: elide;
-                    Tooltip { text: @markdown("\{root.paused ? root.pause-tooltip : root.bubble-tip}"); }
+                    // 暂停分支文案在 Rust 侧 format_bubble_tip 处理
+                    //（Tooltip 无 visible 属性、@markdown 只收字面量，分支只能后端做）
+                    Tooltip { text: @markdown("\{root.bubble-tip}"); }
                 }
-                pause-row := Rectangle {
+                Text {
                     height: 18px;
-                    width: 100%;
-                    pause-button := Rectangle {
-                        // 与首行状态、末行流量共用右列左基线；不要单独右推，
-                        // 否则同一列会出现三种对齐方式（旧版 46px 悬浮按钮的残留）。
-                        x: 0;
-                        width: 34px;
-                        height: 18px;
-                        border-width: 1px;
-                        border-radius: 5px;
-                        border-color: root.pause-enabled
-                            ? root.skin-border-color.with-alpha(0.75)
-                            : root.skin-border-color.with-alpha(0.35);
-                        background: root.paused
-                            ? root.paused-color.with-alpha(0.12)
-                            : root.label-color.with-alpha(0.07);
-                        Text {
-                            width: 100%;
-                            height: 100%;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            text: root.pause-text;
-                            color: root.pause-enabled
-                                ? (root.paused ? root.paused-color : root.label-color)
-                                : root.hb-color.with-alpha(0.55);
-                            font-size: max(9px, root.text-size - 4px);
-                            Tooltip { text: @markdown("\{root.pause-tooltip}"); }
-                        }
-                    }
+                    vertical-alignment: center;
+                    text: root.last-event;
+                    color: root.hb-color;
+                    font-size: max(9px, root.text-size - 4px);
+                    overflow: elide;
+                    Tooltip { text: @markdown("最近一次卡顿时间（本地时区）；今日卡顿总数见中列，点击可查看明细"); }
                 }
                 // 「今日 ↑x ↓y」既是当日累计流量，也是「历史流量统计」入口：
                 // 悬浮加深 + 1px 下划线（与 ClickableValue 同款提示），
@@ -472,11 +438,12 @@ export component Overlay inherits Window {
                 }
             }
 
-            // 可选吉祥物（皮肤 mascot；未配置时不占宽度）
-            Image {
-                visible: root.mascot-visible;
+            // 可选吉祥物（皮肤 mascot）。必须用条件元素而不是 visible: false：
+            // 后者虽然宽 0，仍会参与布局并吃掉一个 spacing（默认 8px），
+            // 在右列后面形成一条看不见的空白带。
+            if root.mascot-visible : Image {
                 source: root.mascot-image;
-                width: root.mascot-visible ? 32px : 0px;
+                width: 32px;
                 height: 100%;
                 image-fit: contain;
             }
@@ -2140,7 +2107,7 @@ struct TrafficRow {
     up: string,         // 上传（已格式化，如 "1.05 GB"）
     down: string,       // 下载
     total: string,      // 总流量
-    ratio: float,       // 0..1，图表列横向条比例
+    ratio: float,       // 0..1，图表列条形长度比例（0 表示不画条）
 }
 
 // 日历一格（42 格；day 为 0 表示尚未填充的占位格）
@@ -2148,108 +2115,169 @@ struct CalCell {
     day: int,           // 日号（1..31）
     level: int,         // -1 = 当日无样本；0..4 = 流量档位
     in-month: bool,     // 是否属于当前显示的月份
+    is-today: bool,     // 今天：2px accent 描边
+    total-text: string, // 右上角紧凑流量（如 "3.2G"；无数据为空串）
 }
 
-// 日历单格：左上角日号 + 按档位着色的底色
+// ================================================================
+// 设计令牌（颜色 / 度量）统一在 TrafficStats 根组件声明（c-* / m-*），
+// 子组件通过属性注入引用，不再各写裸色值；子组件只接受语义名，
+// 不感知业务含义，整体调色时只需要改根组件那一处。
+// ================================================================
+
+// 日历单格：左上角日号 + 右上角当日流量 + 按档位着色的底色
 component CalDayCell inherits Rectangle {
     in property <CalCell> data;
-    // 高度固定 56px：行高由父布局写死（见日历网格处注释），不用 height:100%
-    // 或 min-height —— 与父 stretch 组合会互相拉扯，把最后一行挤扁。
-    height: 56px;
+    // 5 档填充色（由根组件注入，与右侧图例同源）
+    in property <color> lv0;
+    in property <color> lv1;
+    in property <color> lv2;
+    in property <color> lv3;
+    in property <color> lv4;
+    in property <color> fg-color;      // 格内文字（统一深色，不再用白字）
+    in property <color> muted-fg;      // 非本月日号
+    in property <color> empty-bg;      // 本月但无数据
+    in property <color> ring-color;    // 今天描边
+    in property <color> edge-color;    // 普通格 1px 描边
+
+    // 高度跟随父行（父行 min-height 56px，多余空间由 6 行均分），
+    // 这里写 100% 而不是固定 56px，否则行被拉高后格子会顶部对齐留白
+    height: 100%;
     horizontal-stretch: 1;
-    border-radius: 3px;
-    border-width: 1px;
-    border-color: data.in-month ? #eceef3 : transparent;
-    background: !data.in-month ? transparent : (data.level == -1 ? #fafafa : self.level-bg());
-    // 档位配色（与右侧图例同源）
+    border-radius: 6px;
+    border-width: data.is-today ? 2px : 1px;
+    border-color: data.is-today ? ring-color : (data.in-month ? edge-color : transparent);
+    background: !data.in-month ? transparent : (data.level == -1 ? empty-bg : self.level-bg());
+
     function level-bg() -> color {
-        if (data.level == 0) { return #7ec8f0; }
-        if (data.level == 1) { return #7fbf5f; }
-        if (data.level == 2) { return #f2d24b; }
-        if (data.level == 3) { return #f2845c; }
-        if (data.level == 4) { return #b03a2e; }
-        return #fafafa;
+        if (data.level == 0) { return lv0; }
+        if (data.level == 1) { return lv1; }
+        if (data.level == 2) { return lv2; }
+        if (data.level == 3) { return lv3; }
+        if (data.level == 4) { return lv4; }
+        return empty-bg;
     }
-    // 前景色：深色档位用白字，浅色档位用深字，非本月/无数据用灰字
-    function level-fg() -> color {
-        if (!data.in-month) { return #c8c8cc; }
-        if (data.level >= 3) { return #ffffff; }
-        if (data.level >= 0) { return #1e1e2e; }
-        return #a0a0a8;
+    function text-color() -> color {
+        if (!data.in-month) { return muted-fg; }
+        return fg-color;
     }
+
+    // 左上角日号
     Text {
-        x: 5px;
-        y: 3px;
+        x: 6px;
+        y: 5px;
         text: data.day > 0 ? "\{data.day}" : "";
-        color: root.level-fg();
+        color: root.text-color();
+        font-size: 11px;
+    }
+    // 右上角当日流量（弱化到 70%，不与日号抢注意力）
+    Text {
+        x: 6px;
+        y: 5px;
+        width: parent.width - 12px;
+        horizontal-alignment: right;
+        text: data.total-text;
+        color: root.text-color().with-alpha(0.7);
         font-size: 11px;
     }
 }
 
-// 视图切换标签（选中：白底 + 下边框高亮；未选中：浅灰无底）
+// 视图切换标签（分段控件里的一格）
 component TrafficTab inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
+    in property <color> active-bg;
+    in property <color> active-border;
+    in property <color> strong;
+    in property <color> muted;
     callback picked();
-    height: 28px;
-    width: 96px;
-    background: root.active ? #ffffff : transparent;
-    border-radius: 4px;
+
+    height: 26px;
+    width: 88px;
+    border-radius: 6px;
+    background: root.active ? root.active-bg : transparent;
+    border-width: root.active ? 1px : 0px;
+    border-color: root.active-border;
+
     Text {
         width: 100%;
         height: 100%;
         horizontal-alignment: center;
         vertical-alignment: center;
         text: root.label;
-        color: root.active ? #1e1e2e : #909098;
-        font-size: 13px;
+        color: root.active ? root.strong : root.muted;
+        font-size: 12px;
         font-weight: root.active ? 600 : 400;
-    }
-    Rectangle {
-        visible: root.active;
-        x: 8px;
-        y: parent.height - 2px;
-        width: parent.width - 16px;
-        height: 2px;
-        background: #f0a020;
-        border-radius: 1px;
     }
     TouchArea {
         clicked => { root.picked(); }
     }
 }
 
-// 列表视图一行（22px：日期左对齐，数值右对齐，末列横向条）
+// 月份导航按钮（自绘：1px 描边 + hover 底色，替代系统 Button）
+component NavButton inherits Rectangle {
+    in property <string> label;
+    in property <length> btn-width: 28px;
+    in property <color> text-color;
+    // 不能叫 border-color：Rectangle 已有同名内置属性，Slint 禁止覆盖。
+    in property <color> edge-color;
+    in property <color> hover-bg;
+    callback picked();
+
+    width: root.btn-width;
+    height: 28px;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: root.edge-color;
+    background: nav-ta.has-hover ? root.hover-bg : transparent;
+
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: root.text-color;
+        font-size: 12px;
+    }
+    nav-ta := TouchArea {
+        clicked => { root.picked(); }
+    }
+}
+
+// 列表视图一行：日期左对齐、三个数值右对齐、末列「基线 + 渐变条」
 component TrafficListRow inherits Rectangle {
     in property <TrafficRow> data;
-    height: 22px;
+    in property <bool> alternate: false;
+    in property <color> strong;
+    in property <color> fg-color;
+    in property <color> divider;
+    in property <color> alt-bg;
+
+    height: 24px;
+    // 斑马纹只做底色差，不加 hover：ListView 里的 TouchArea 会吃掉按下事件，
+    // 使「按住拖动滚动」失效。桌面端虽有滚轮，仍按「先保滚动」取舍。
+    background: root.alternate ? root.alt-bg : transparent;
+
     HorizontalLayout {
         height: 100%;
-        padding-left: 6px;
-        padding-right: 6px;
-        spacing: 6px;
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 8px;
+
         Text {
-            width: 130px;
+            width: 132px;
             text: data.label;
-            color: #1e1e2e;
+            color: root.fg-color;
             font-size: 12px;
             vertical-alignment: center;
             horizontal-alignment: left;
             overflow: elide;
         }
         Text {
-            width: 110px;
+            width: 120px;
             text: data.up;
-            color: #2e7d32;
-            font-size: 12px;
-            vertical-alignment: center;
-            horizontal-alignment: right;
-            overflow: elide;
-        }
-        Text {
-            width: 110px;
-            text: data.down;
-            color: #1565c0;
+            color: root.fg-color;
             font-size: 12px;
             vertical-alignment: center;
             horizontal-alignment: right;
@@ -2257,25 +2285,39 @@ component TrafficListRow inherits Rectangle {
         }
         Text {
             width: 120px;
+            text: data.down;
+            color: root.fg-color;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+        Text {
+            width: 132px;
             text: data.total;
-            color: #1e1e2e;
+            color: root.strong;
             font-size: 12px;
             font-weight: 600;
             vertical-alignment: center;
             horizontal-alignment: right;
             overflow: elide;
         }
-        // 图表列：浅色槽 + amber 条形（比例很低时保底 2px 可见）
+        // 图表列：垂直居中一条 1px 基线，条形叠在基线上（不再铺满整列的灰槽）
         Rectangle {
             horizontal-stretch: 1;
-            height: 14px;
-            background: #f2f3f7;
-            border-radius: 2px;
+            height: 8px;
+
             Rectangle {
-                width: data.ratio > 0 ? max(2px, parent.width * data.ratio) : 0px;
+                y: (parent.height - 1px) / 2;
+                width: 100%;
+                height: 1px;
+                background: root.divider;
+            }
+            Rectangle {
+                width: data.ratio > 0 ? parent.width * data.ratio : 0px;
                 height: 100%;
-                background: #f0c040;
-                border-radius: 2px;
+                background: @linear-gradient(90deg, #f2c56b 0%, #e8912e 100%);
+                border-radius: 4px;
             }
         }
     }
@@ -2299,11 +2341,39 @@ export component TrafficStats inherits Window {
     in property <color> skin-panel-bg: #fafbfc;
     in property <color> skin-panel-border: #e2e4ea;
 
+    // === 设计令牌：中性色 ===
+    in property <color> c-panel: #f8f9fb;
+    in property <color> c-panel-border: #e9ebf0;
+    in property <color> c-divider: #eef0f4;
+    in property <color> c-text-strong: #1f2328;
+    in property <color> c-text: #3d424b;
+    in property <color> c-text-muted: #8b919b;
+    in property <color> c-row-alt: #fbfcfe;
+    // === 设计令牌：强调色 ===
+    in property <color> c-accent: #e89a2e;
+    in property <color> c-accent-soft: #fdf3e3;
+    // === 设计令牌：日历 5 档（降饱和，统一深色字）===
+    in property <color> c-cal-0: #a8d3ee;
+    in property <color> c-cal-1: #a9d3a2;
+    in property <color> c-cal-2: #f3dd9a;
+    in property <color> c-cal-3: #f0b392;
+    in property <color> c-cal-4: #d97a72;
+    in property <color> c-cal-fg: #2e333a;
+    in property <color> c-cal-muted: #c2c6ce;
+    in property <color> c-cal-empty: #fafbfc;
+    // === 设计令牌：度量 ===
+    in property <length> m-pad: 16px;
+    in property <length> m-gap: 12px;
+
     // === 数据（Rust 端写：rows / cells 在 UI 线程由纯函数重算，查库在后台）===
     in property <[TrafficRow]> rows: [];
     in property <[CalCell]> cells: [];
-    in property <string> summary-text: "";
-    in property <string> cal-summary-text: "";
+    // 列表汇总：主行（"共 12 条 · 累计 356.59 GB"）+ 次要行（"上传 … · 下载 …"）
+    in property <string> summary-main: "";
+    in property <string> summary-sub: "";
+    // 日历汇总：同上两段（主行含「本月总流量」标签）
+    in property <string> cal-summary-main: "";
+    in property <string> cal-summary-sub: "";
     in property <string> month-text: "";
     // 0=列表 / 1=日历（slint 端本地翻转后回调 Rust）
     in-out property <int> view-index: 0;
@@ -2330,14 +2400,22 @@ export component TrafficStats inherits Window {
         border-radius: root.skin-border-radius;
         border-width: 1px;
         border-color: root.skin-border-color;
+        clip: true;
 
         VerticalLayout {
-            padding: 6px;
-            spacing: 6px;
+            padding: 0;
+            spacing: 0;
 
-            // === 标题栏：标题 + 关闭（整条可拖动）===
+            // ===== 标题栏（44px，整条可拖动，底部 1px 分隔）=====
             Rectangle {
-                height: 30px;
+                height: 44px;
+
+                Rectangle {
+                    y: parent.height - 1px;
+                    width: 100%;
+                    height: 1px;
+                    background: root.c-divider;
+                }
                 TouchArea {
                     z: 0;
                     moved => {
@@ -2346,279 +2424,404 @@ export component TrafficStats inherits Window {
                 }
                 HorizontalLayout {
                     z: 1;
-                    height: 30px;
-                    spacing: 8px;
+                    height: 100%;
+                    padding-left: 16px;
+                    padding-right: 12px;
+                    spacing: 10px;
+
+                    // accent 竖条：标题的视觉锚点
+                    Rectangle {
+                        width: 4px;
+                        height: 16px;
+                        border-radius: 2px;
+                        background: root.c-accent;
+                    }
                     Text {
                         text: "历史流量统计";
-                        color: root.skin-text-color;
+                        color: root.c-text-strong;
                         font-size: 14px;
                         font-weight: 600;
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
-                    Button {
-                        text: "关闭";
-                        clicked => { root.close-requested(); }
+
+                    // 自绘关闭按钮：28×28，hover 出浅底 + 红色叉
+                    Rectangle {
+                        width: 28px;
+                        height: 100%;
+                        Rectangle {
+                            x: 0;
+                            y: (parent.height - 28px) / 2;
+                            width: 28px;
+                            height: 28px;
+                            border-radius: 6px;
+                            background: close-ta.has-hover ? #f3f4f6 : transparent;
+                            Path {
+                                x: (parent.width - 12px) / 2;
+                                y: (parent.height - 12px) / 2;
+                                width: 12px;
+                                height: 12px;
+                                fill: transparent;
+                                commands: "M 0 0 L 12 12 M 12 0 L 0 12";
+                                stroke: close-ta.has-hover ? #d03030 : root.c-text-muted;
+                                stroke-width: 1.6px;
+                                stroke-line-cap: round;
+                            }
+                        }
+                        close-ta := TouchArea {
+                            clicked => { root.close-requested(); }
+                        }
                     }
                 }
             }
 
-            // === 视图标签页 ===
-            HorizontalLayout {
-                height: 28px;
-                spacing: 6px;
-                TrafficTab {
-                    label: "列表视图";
-                    active: root.view-index == 0;
-                    picked => {
-                        root.view-index = 0;
-                        root.view-changed(0);
-                    }
-                }
-                TrafficTab {
-                    label: "日历视图";
-                    active: root.view-index == 1;
-                    picked => {
-                        root.view-index = 1;
-                        root.view-changed(1);
-                    }
-                }
-                Rectangle { horizontal-stretch: 1; }
-            }
-
-            // === 视图内容区 ===
-            // 两种视图放进同一个容器、各自 width/height 100%，靠 visible 切换：
-            // 若让两个视图各自作为外层 VerticalLayout 的拉伸子项，不可见的那个仍会
-            // 参与高度分配，把可见视图挤成一半（实测列表表体只剩两行高）。
+            // ===== 内容区 =====
             Rectangle {
                 vertical-stretch: 1;
-
-                // === 列表视图 ===
                 VerticalLayout {
-                    visible: root.view-index == 0;
-                    width: 100%;
-                    height: 100%;
-                    spacing: 6px;
+                    padding: root.m-pad;
+                    spacing: root.m-gap;
 
-                // 工具栏：统计方式 / 图表显示比例
-                Rectangle {
-                    height: 30px;
-                    background: root.skin-panel-bg;
-                    border-radius: 6px;
-                    border-width: 1px;
-                    border-color: root.skin-panel-border;
-                    HorizontalLayout {
-                        padding-left: 6px;
-                        padding-right: 6px;
-                        spacing: 6px;
-                        Text {
-                            text: "统计方式：";
-                            color: root.skin-subtext-color;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        ComboBox {
-                            width: 110px;
-                            model: ["日视图", "周视图", "月视图"];
-                            current-index: root.stats-mode;
-                            selected(v) => {
-                                root.stats-mode-changed(v == "周视图" ? 1 : (v == "月视图" ? 2 : 0));
-                            }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                        Text {
-                            text: "图表显示比例：";
-                            color: root.skin-subtext-color;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        ComboBox {
-                            width: 110px;
-                            model: ["对数比例", "线性比例"];
-                            current-index: root.scale-mode;
-                            selected(v) => {
-                                root.scale-mode-changed(v == "线性比例" ? 1 : 0);
-                            }
-                        }
-                    }
-                }
-
-                // 表头（列宽与 TrafficListRow 严格一致）
-                Rectangle {
-                    height: 24px;
-                    background: #f0f2f6;
-                    border-radius: 4px;
-                    HorizontalLayout {
-                        padding-left: 6px;
-                        padding-right: 6px;
-                        spacing: 6px;
-                        Text { width: 130px; text: "日期"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: left; }
-                        Text { width: 110px; text: "上传"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
-                        Text { width: 110px; text: "下载"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
-                        Text { width: 120px; text: "总流量"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
-                        Text { horizontal-stretch: 1; text: "图表"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: left; }
-                    }
-                }
-
-                // 表体
-                Rectangle {
-                    vertical-stretch: 1;
-                    background: #ffffff;
-                    border-radius: 6px;
-                    border-width: 1px;
-                    border-color: root.skin-panel-border;
-                    clip: true;
-                    ListView {
-                        width: 100%;
-                        height: 100%;
-                        for row in root.rows : TrafficListRow {
-                            data: row;
-                        }
-                    }
-                    Text {
-                        visible: !root.has-data;
-                        text: "暂无流量数据（服务未采集或数据库为空）";
-                        color: #909098;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // 汇总
-                Text {
-                    height: 20px;
-                    text: root.summary-text;
-                    color: root.skin-subtext-color;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-            }
-
-                // === 日历视图 ===
-                HorizontalLayout {
-                    visible: root.view-index == 1;
-                    width: 100%;
-                    height: 100%;
-                    spacing: 10px;
-
-                    VerticalLayout {
-                        // 左侧日历列占据除图例（140px）外的全部宽度：
-                        // 写死 480px 会让 7 列只铺满一半，右侧留大片空白。
-                        horizontal-stretch: 1;
-                        height: 100%;
-                        spacing: 4px;
-
-                        // 工具栏：< 年月 本月 >
+                    // 视图切换：分段控件（panel 底槽 + 选中白底）
+                    Rectangle {
+                        width: 184px;
+                        height: 32px;
+                        background: root.c-panel;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: root.c-panel-border;
                         HorizontalLayout {
-                            height: 30px;
-                            spacing: 6px;
-                            Button {
-                                text: "<";
-                                width: 34px;
-                                clicked => { root.month-step(-1); }
-                            }
-                            Text {
-                                min-width: 96px;
-                                text: root.month-text;
-                                color: root.skin-text-color;
-                                font-size: 13px;
-                                font-weight: 600;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            Button {
-                                text: "本月";
-                                width: 60px;
-                                clicked => { root.month-reset(); }
-                            }
-                            Button {
-                                text: ">";
-                                width: 34px;
-                                clicked => { root.month-step(1); }
-                            }
-                            Rectangle { horizontal-stretch: 1; }
-                        }
-
-                        // 星期表头（周日开头）
-                        HorizontalLayout {
-                            height: 22px;
+                            padding: 2px;
                             spacing: 2px;
-                            for n in ["日", "一", "二", "三", "四", "五", "六"] : Text {
-                                horizontal-stretch: 1;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                                text: n;
-                                color: n == "日" ? #d03030 : (n == "六" ? #1565c0 : #606066);
-                                font-size: 12px;
+                            TrafficTab {
+                                label: "列表视图";
+                                active: root.view-index == 0;
+                                active-bg: #ffffff;
+                                active-border: root.c-panel-border;
+                                strong: root.c-text-strong;
+                                muted: root.c-text-muted;
+                                picked => {
+                                    root.view-index = 0;
+                                    root.view-changed(0);
+                                }
                             }
-                        }
-
-                        // 6 × 7 = 42 格：行高固定 56px。
-                        // 试过 vertical-stretch 均分：slint 下前 5 行会把空间吃光、
-                        // 第 6 行被压成一条（880×620 实测两次皆是），故保持固定行高，
-                        // 剩余纵向空间由下方垫片吸收。
-                        for r in 6 : HorizontalLayout {
-                            height: 56px;
-                            spacing: 2px;
-                            for c in 7 : CalDayCell {
-                                data: root.cells[r * 7 + c];
+                            TrafficTab {
+                                label: "日历视图";
+                                active: root.view-index == 1;
+                                active-bg: #ffffff;
+                                active-border: root.c-panel-border;
+                                strong: root.c-text-strong;
+                                muted: root.c-text-muted;
+                                picked => {
+                                    root.view-index = 1;
+                                    root.view-changed(1);
+                                }
                             }
-                        }
-
-                        Rectangle { vertical-stretch: 1; }
-
-                        Text {
-                            height: 20px;
-                            text: root.cal-summary-text;
-                            color: root.skin-subtext-color;
-                            font-size: 12px;
-                            vertical-alignment: center;
                         }
                     }
 
-                    // 右侧图例（竖排 5 档，与格子配色同源）
-                    VerticalLayout {
-                        width: 140px;
-                        height: 100%;
-                        spacing: 8px;
-                        Text {
-                            text: "图例";
-                            color: root.skin-text-color;
-                            font-size: 12px;
-                            font-weight: 700;
+                    // ===== 视图内容区（两视图共享同一容器，靠 visible 切换）=====
+                    Rectangle {
+                        vertical-stretch: 1;
+
+                        // ---------- 列表视图 ----------
+                        VerticalLayout {
+                            visible: root.view-index == 0;
+                            width: 100%;
+                            height: 100%;
+                            spacing: 10px;
+
+                            // 工具栏：左侧统计方式，右侧图表比例
+                            Rectangle {
+                                height: 32px;
+                                background: root.c-panel;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: root.c-panel-border;
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    Text {
+                                        text: "统计方式";
+                                        color: root.c-text-muted;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        width: 104px;
+                                        model: ["日视图", "周视图", "月视图"];
+                                        current-index: root.stats-mode;
+                                        selected(v) => {
+                                            root.stats-mode-changed(v == "周视图" ? 1 : (v == "月视图" ? 2 : 0));
+                                        }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                    Text {
+                                        text: "图表显示比例";
+                                        color: root.c-text-muted;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
+                                    ComboBox {
+                                        width: 104px;
+                                        model: ["对数比例", "线性比例"];
+                                        current-index: root.scale-mode;
+                                        selected(v) => {
+                                            root.scale-mode-changed(v == "线性比例" ? 1 : 0);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 表头：无底色，仅底部 1px 分隔线（列宽与数据行严格一致）
+                            Rectangle {
+                                height: 28px;
+                                Rectangle {
+                                    y: parent.height - 1px;
+                                    width: 100%;
+                                    height: 1px;
+                                    background: root.c-divider;
+                                }
+                                HorizontalLayout {
+                                    padding-left: 16px;
+                                    padding-right: 16px;
+                                    spacing: 8px;
+                                    Text { width: 132px; text: "日期"; color: root.c-text-muted; font-size: 11px; font-weight: 500; vertical-alignment: center; horizontal-alignment: left; }
+                                    Text { width: 120px; text: "上传"; color: root.c-text-muted; font-size: 11px; font-weight: 500; vertical-alignment: center; horizontal-alignment: right; }
+                                    Text { width: 120px; text: "下载"; color: root.c-text-muted; font-size: 11px; font-weight: 500; vertical-alignment: center; horizontal-alignment: right; }
+                                    Text { width: 132px; text: "总流量"; color: root.c-text-muted; font-size: 11px; font-weight: 500; vertical-alignment: center; horizontal-alignment: right; }
+                                    Text { horizontal-stretch: 1; text: "图表"; color: root.c-text-muted; font-size: 11px; font-weight: 500; vertical-alignment: center; horizontal-alignment: left; }
+                                }
+                            }
+
+                            // 表体
+                            Rectangle {
+                                vertical-stretch: 1;
+                                background: #ffffff;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: root.c-panel-border;
+                                clip: true;
+
+                                ListView {
+                                    width: 100%;
+                                    height: 100%;
+                                    for row[idx] in root.rows : TrafficListRow {
+                                        data: row;
+                                        alternate: Math.mod(idx, 2) == 1;
+                                        strong: root.c-text-strong;
+                                        fg-color: root.c-text;
+                                        divider: root.c-divider;
+                                        alt-bg: root.c-row-alt;
+                                    }
+                                }
+
+                                // 空状态：两行文案，主次分明
+                                VerticalLayout {
+                                    visible: !root.has-data;
+                                    width: 100%;
+                                    height: 100%;
+                                    alignment: center;
+                                    spacing: 6px;
+                                    Text {
+                                        text: "暂无流量数据";
+                                        color: root.c-text-muted;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "服务未采集或数据库为空";
+                                        color: #aab0ba;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+
+                            // 汇总：右对齐两行（主行加粗，明细弱化另起一行）
+                            VerticalLayout {
+                                height: 34px;
+                                spacing: 1px;
+                                Text {
+                                    width: 100%;
+                                    horizontal-alignment: right;
+                                    text: root.summary-main;
+                                    color: root.c-text-strong;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    width: 100%;
+                                    horizontal-alignment: right;
+                                    text: root.summary-sub;
+                                    color: root.c-text-muted;
+                                    font-size: 11px;
+                                }
+                            }
                         }
-                        HorizontalLayout {
-                            height: 18px;
-                            spacing: 6px;
-                            Rectangle { width: 14px; height: 14px; background: #7ec8f0; border-radius: 2px; }
-                            Text { text: "0~1GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+
+                        // ---------- 日历视图 ----------
+                        VerticalLayout {
+                            visible: root.view-index == 1;
+                            width: 100%;
+                            height: 100%;
+                            spacing: 10px;
+
+                            // 月份导航：自绘按钮（‹ / 本月 / ›），整条与列表工具栏同高
+                            HorizontalLayout {
+                                height: 32px;
+                                spacing: 8px;
+                                NavButton {
+                                    label: "‹";
+                                    text-color: root.c-text;
+                                    edge-color: root.c-panel-border;
+                                    hover-bg: root.c-panel;
+                                    picked => { root.month-step(-1); }
+                                }
+                                Rectangle {
+                                    width: 108px;
+                                    height: 100%;
+                                    Text {
+                                        width: 100%;
+                                        height: 100%;
+                                        text: root.month-text;
+                                        color: root.c-text-strong;
+                                        font-size: 14px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                NavButton {
+                                    label: "本月";
+                                    btn-width: 52px;
+                                    text-color: root.c-text;
+                                    edge-color: root.c-panel-border;
+                                    hover-bg: root.c-panel;
+                                    picked => { root.month-reset(); }
+                                }
+                                NavButton {
+                                    label: "›";
+                                    text-color: root.c-text;
+                                    edge-color: root.c-panel-border;
+                                    hover-bg: root.c-panel;
+                                    picked => { root.month-step(1); }
+                                }
+                                Rectangle { horizontal-stretch: 1; }
+                            }
+
+                            // 日历网格 + 右侧图例
+                            HorizontalLayout {
+                                vertical-stretch: 1;
+                                spacing: 16px;
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    spacing: 8px;
+
+                                    // 星期表头（周日开头；统一弱化色，不用红蓝）
+                                    HorizontalLayout {
+                                        height: 20px;
+                                        spacing: 4px;
+                                        for n in ["日", "一", "二", "三", "四", "五", "六"] : Text {
+                                            horizontal-stretch: 1;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            text: n;
+                                            color: root.c-text-muted;
+                                            font-size: 11px;
+                                        }
+                                    }
+
+                                    // 6 × 7 = 42 格（行高以 56px 为下限，剩余空间均分，
+                                    // 避免窗口固定 620 高时网格下方留出空洞）
+                                    for r in 6 : HorizontalLayout {
+                                        min-height: 56px;
+                                        vertical-stretch: 1;
+                                        spacing: 4px;
+                                        for c in 7 : CalDayCell {
+                                            data: root.cells[r * 7 + c];
+                                            lv0: root.c-cal-0;
+                                            lv1: root.c-cal-1;
+                                            lv2: root.c-cal-2;
+                                            lv3: root.c-cal-3;
+                                            lv4: root.c-cal-4;
+                                            fg-color: root.c-cal-fg;
+                                            muted-fg: root.c-cal-muted;
+                                            empty-bg: root.c-cal-empty;
+                                            ring-color: root.c-accent;
+                                            edge-color: root.c-panel-border;
+                                        }
+                                    }
+                                }
+
+                                // 图例：132px 固定列，顶部与网格顶部对齐（星期 20 + 间距 8）
+                                VerticalLayout {
+                                    width: 132px;
+                                    padding-top: 28px;
+                                    spacing: 10px;
+                                    Text {
+                                        text: "图例";
+                                        color: root.c-text;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                    }
+                                    HorizontalLayout {
+                                        height: 16px;
+                                        spacing: 8px;
+                                        Rectangle { width: 12px; height: 12px; border-radius: 3px; background: root.c-cal-0; border-width: 1px; border-color: root.c-panel-border; }
+                                        Text { text: "0~1GB"; color: root.c-text-muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    HorizontalLayout {
+                                        height: 16px;
+                                        spacing: 8px;
+                                        Rectangle { width: 12px; height: 12px; border-radius: 3px; background: root.c-cal-1; border-width: 1px; border-color: root.c-panel-border; }
+                                        Text { text: "1GB~10GB"; color: root.c-text-muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    HorizontalLayout {
+                                        height: 16px;
+                                        spacing: 8px;
+                                        Rectangle { width: 12px; height: 12px; border-radius: 3px; background: root.c-cal-2; border-width: 1px; border-color: root.c-panel-border; }
+                                        Text { text: "10GB~100GB"; color: root.c-text-muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    HorizontalLayout {
+                                        height: 16px;
+                                        spacing: 8px;
+                                        Rectangle { width: 12px; height: 12px; border-radius: 3px; background: root.c-cal-3; border-width: 1px; border-color: root.c-panel-border; }
+                                        Text { text: "100GB~1TB"; color: root.c-text-muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    HorizontalLayout {
+                                        height: 16px;
+                                        spacing: 8px;
+                                        Rectangle { width: 12px; height: 12px; border-radius: 3px; background: root.c-cal-4; border-width: 1px; border-color: root.c-panel-border; }
+                                        Text { text: "1TB~"; color: root.c-text-muted; font-size: 11px; vertical-alignment: center; }
+                                    }
+                                    Rectangle { vertical-stretch: 1; }
+                                }
+                            }
+
+                            // 本月汇总：右对齐两行（主数值加粗，明细弱化另起一行）
+                            VerticalLayout {
+                                height: 34px;
+                                spacing: 1px;
+                                Text {
+                                    width: 100%;
+                                    horizontal-alignment: right;
+                                    text: root.cal-summary-main;
+                                    color: root.c-text-strong;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    width: 100%;
+                                    horizontal-alignment: right;
+                                    text: root.cal-summary-sub;
+                                    color: root.c-text-muted;
+                                    font-size: 11px;
+                                }
+                            }
                         }
-                        HorizontalLayout {
-                            height: 18px;
-                            spacing: 6px;
-                            Rectangle { width: 14px; height: 14px; background: #7fbf5f; border-radius: 2px; }
-                            Text { text: "1GB~10GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
-                        }
-                        HorizontalLayout {
-                            height: 18px;
-                            spacing: 6px;
-                            Rectangle { width: 14px; height: 14px; background: #f2d24b; border-radius: 2px; }
-                            Text { text: "10GB~100GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
-                        }
-                        HorizontalLayout {
-                            height: 18px;
-                            spacing: 6px;
-                            Rectangle { width: 14px; height: 14px; background: #f2845c; border-radius: 2px; }
-                            Text { text: "100GB~1TB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
-                        }
-                        HorizontalLayout {
-                            height: 18px;
-                            spacing: 6px;
-                            Rectangle { width: 14px; height: 14px; background: #b03a2e; border-radius: 2px; }
-                            Text { text: "1TB~"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
-                        }
-                        Rectangle { vertical-stretch: 1; }
                     }
                 }
             }

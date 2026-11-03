@@ -9,7 +9,7 @@
 # 布局模式：bubble（绿色气泡）；card 为默认三列白卡
 layout = "bubble"
 
-width = 334.0
+width = 314.0
 height = 70.0
 background_color = "#EAF6E8"
 border_color = "#BFE3B8"

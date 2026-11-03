@@ -461,14 +461,8 @@ pub fn run() -> anyhow::Result<()> {
         }
     });
 
-    // 3a3) 悬浮窗右下角暂停按钮 → 真正切换暂停状态（slint 端已翻转按钮文字，
-    //      这里翻转共享状态；1Hz tick 在 paused 时冻结指标显示与卡顿通知）
-    let state_for_pause = state.clone();
-    ui.on_toggle_pause(move || {
-        let mut s = state_for_pause.lock();
-        s.paused = !s.paused;
-        log::info!("暂停按钮: {}", if s.paused { "暂停" } else { "恢复" });
-    });
+    // 3a3) 暂停入口已收敛到右键菜单 / 托盘；悬浮窗本体不再有可点击暂停区，
+    //      避免右列整行热区误触。
 
     // 3b) P1：系统托盘图标（后台线程 + win32 消息循环；失败不阻塞 GUI）
     let tray: Option<std::sync::Arc<crate::tray::Tray>> =
