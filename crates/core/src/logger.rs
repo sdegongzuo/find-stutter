@@ -2,9 +2,10 @@ use crate::types::{
     ProcessModule, RootCauseReport, Sample, StackSample, StorageConfig, StutterEvent,
     WindowsEventRecord,
 };
-use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use log::warn;
 use rusqlite::{params, Connection};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -889,6 +890,93 @@ pub fn sum_network_traffic(
     Ok((sent.max(0) as u64, recv.max(0) as u64))
 }
 
+/// 某一天（本地时区）的累计网络流量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DailyTraffic {
+    /// 本地日期
+    pub date: NaiveDate,
+    /// 上传字节（已做降采样补偿）
+    pub sent: u64,
+    /// 下载字节（已做降采样补偿）
+    pub recv: u64,
+}
+
+/// 按**本地时区日期**聚合 `samples` 中 `timestamp >= since` 的累计网络流量，
+/// 结果按日期升序。
+///
+/// 与 [`sum_network_traffic`] 同一口径（速率列求和即累计字节），区别只在两点：
+/// **降采样补偿**与**归本地日**。
+///
+/// ## 为什么分钟行要 ×60
+///
+/// 超过 `hot_retention_days` 的原始 1Hz 行会被 [`Logger::downsample_cold_samples`]
+/// 聚合为每分钟一行，速率列取 `MAX(net_sent_bps)`——即「该分钟内峰值那一秒的字节数」，
+/// 是降采样后唯一可得的分钟代表值。因此求和时必须把分钟行的值乘 60 还原成
+/// 「一分钟累计」量级，否则超过热保留期的历史流量会只有真实值的约 1/60。
+/// 注意这是**估算**：`MAX` 在平稳时段会高估（把峰值当成整分钟的平均速率），
+/// 在突发时段会低估（一分钟内多次突发只取最大值）。原始行不做补偿。
+///
+/// ## 为什么先按 UTC 小时桶再归本地日
+///
+/// 全表可到数十万行，逐行拉到 Rust 侧解析时区代价过高，故 SQL 先按
+/// `substr(timestamp, 1, 13)`（"YYYY-MM-DDTHH"）聚成 UTC 小时桶，Rust 侧再把
+/// 每个整点换算成本地日期。整点偏移的时区（如东八区 UTC+8、UTC-5）下，
+/// 一小时桶完整落在同一本地日内，**零误差**；非整点偏移时区（如 UTC+5:30、
+/// UTC+5:45）的本地日边界会切在某小时桶中间，该桶被整体归到桶起点对应的
+/// 本地日，跨边界的当天最多偏差一小时的流量（这是本实现已知的限制，
+/// 换取的是 O(天数×24) 而非 O(行数) 的解析开销）。
+///
+/// ## `length(timestamp) > 19` 的判别依据
+///
+/// 原始行 timestamp 为 `to_rfc3339()`，带小数秒与时区后缀，长度恒 > 19；
+/// 降采样行是分钟对齐的 `YYYY-MM-DDTHH:MM:SS`，长度恰为 19。该谓词与
+/// `downsample_cold_samples` 的幂等谓词完全一致，因此补偿口径与清洗口径不会错位。
+pub fn daily_network_traffic(conn: &Connection, since: &str) -> anyhow::Result<Vec<DailyTraffic>> {
+    // 按 UTC 小时预聚合降维：分钟行（length == 19）×60 补偿，原始行原样累加；
+    // 两列都可能为 NULL（采样缺失），用 COALESCE 兜底为 0。
+    let mut stmt = conn.prepare(
+        "SELECT substr(timestamp, 1, 13) AS utc_hour, \
+                COALESCE(SUM(CASE WHEN length(timestamp) > 19 THEN net_sent_bps ELSE net_sent_bps * 60 END), 0), \
+                COALESCE(SUM(CASE WHEN length(timestamp) > 19 THEN net_recv_bps ELSE net_recv_bps * 60 END), 0) \
+         FROM samples \
+         WHERE timestamp >= ?1 \
+         GROUP BY utc_hour",
+    )?;
+    let rows = stmt.query_map(params![since], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut by_date: BTreeMap<NaiveDate, (u64, u64)> = BTreeMap::new();
+    for row in rows {
+        let (utc_hour, sent, recv) = row?;
+        // "2026-11-03T14" → 整点 DateTime<Utc> → 本地日期
+        let naive = match chrono::NaiveDateTime::parse_from_str(
+            &format!("{utc_hour}:00:00"),
+            "%Y-%m-%dT%H:%M:%S",
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("每日流量聚合跳过无法解析的小时桶 {utc_hour:?}: {e}");
+                continue;
+            }
+        };
+        let date = Utc.from_utc_datetime(&naive).with_timezone(&Local).date_naive();
+        let slot = by_date.entry(date).or_insert((0, 0));
+        // 负值（网卡计数回绕等异常）clamp 到 0，避免 u64 溢出
+        slot.0 = slot.0.saturating_add(sent.max(0) as u64);
+        slot.1 = slot.1.saturating_add(recv.max(0) as u64);
+    }
+
+    Ok(by_date
+        .into_iter()
+        .map(|(date, (sent, recv))| DailyTraffic { date, sent, recv })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1160,6 +1248,105 @@ mod tests {
 
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 每日流量专用的裸库 + 最小 samples 表（只含本功能需要的三列）。
+    fn daily_traffic_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE samples (
+                timestamp TEXT NOT NULL,
+                net_sent_bps INTEGER,
+                net_recv_bps INTEGER
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// 降采样补偿：整日都是分钟行（长度 19）时，每行贡献 = 值 × 60。
+    /// 用「全天分钟行」而非「单行」，断言的是总量口径而与本地时区无关
+    /// （任意时区偏移下 24 个 UTC 小时桶都会落在 1~2 个本地日，但总和不变）。
+    #[test]
+    fn daily_traffic_compensates_downsampled_minutes() {
+        let conn = daily_traffic_conn();
+        for h in 0..24 {
+            conn.execute(
+                "INSERT INTO samples (timestamp, net_sent_bps, net_recv_bps) VALUES (?1, 100, 10)",
+                params![format!("2026-10-30T{h:02}:00:00")],
+            )
+            .unwrap();
+        }
+
+        let days = daily_network_traffic(&conn, "2026-10-29T00:00:00").unwrap();
+        let (sent, recv) = days
+            .iter()
+            .fold((0_u64, 0_u64), |acc, d| (acc.0 + d.sent, acc.1 + d.recv));
+        assert_eq!(sent, 24 * 100 * 60, "分钟行需 ×60 补偿");
+        assert_eq!(recv, 24 * 10 * 60);
+    }
+
+    /// 空表：返回空 Vec，不报错。
+    #[test]
+    fn daily_traffic_empty_returns_empty() {
+        let conn = daily_traffic_conn();
+        let days = daily_network_traffic(&conn, "2026-01-01T00:00:00").unwrap();
+        assert!(days.is_empty());
+    }
+
+    /// 混合数据（原始行 + 分钟行 + NULL 列 + 负值）：各日 sent/recv 之和必须等于
+    /// 「逐行补偿值之和」。与时区无关，用于防止分桶丢数据。
+    #[test]
+    fn daily_traffic_sums_conserved() {
+        let conn = daily_traffic_conn();
+        for (ts, sent, recv) in [
+            // 分钟行（19 字符）：×60
+            ("2026-10-28T03:10:00", Some(5_i64), Some(7_i64)), // 300 / 420
+            ("2026-10-28T03:11:00", Some(2), None),            // 120 / 0
+            ("2026-10-28T03:12:00", Some(-3), Some(4)),        // -180 / 240
+            // 原始行（带小数秒与时区后缀）：原样
+            ("2026-10-29T05:10:30.123456+00:00", Some(9), Some(11)),
+            ("2026-10-29T05:10:31.123456+00:00", None, Some(13)),
+            ("2026-10-30T05:10:30.123456+00:00", Some(20), Some(1)),
+            ("2026-10-30T05:10:31.123456+00:00", Some(-5), Some(2)),
+        ] {
+            conn.execute(
+                "INSERT INTO samples (timestamp, net_sent_bps, net_recv_bps) VALUES (?1, ?2, ?3)",
+                params![ts, sent, recv],
+            )
+            .unwrap();
+        }
+
+        let days = daily_network_traffic(&conn, "2026-10-27T00:00:00").unwrap();
+        let (sent, recv) = days
+            .iter()
+            .fold((0_u64, 0_u64), |acc, d| (acc.0 + d.sent, acc.1 + d.recv));
+        // 逐行补偿值：分钟行 (5+2-3)*60=240, 原始行 9+20-5=24 → 264
+        assert_eq!(sent, 264, "分桶不得丢数据（含 NULL 记 0、负值抵消）");
+        // 分钟行 (7+0+4)*60=660, 原始行 11+13+1+2=27 → 687
+        assert_eq!(recv, 687);
+    }
+
+    /// 多天数据：返回按日期升序，且各日 bucket 唯一。
+    #[test]
+    fn daily_traffic_sorted_ascending() {
+        let conn = daily_traffic_conn();
+        // 逆序插入，避免依赖插入顺序
+        for day in (1..=4).rev() {
+            conn.execute(
+                "INSERT INTO samples (timestamp, net_sent_bps, net_recv_bps) VALUES (?1, 10, 20)",
+                params![format!("2026-09-0{day}T12:00:30.000001+00:00")],
+            )
+            .unwrap();
+        }
+
+        let days = daily_network_traffic(&conn, "2026-09-01T00:00:00").unwrap();
+        assert!(!days.is_empty());
+        for w in days.windows(2) {
+            assert!(w[0].date < w[1].date, "结果必须按本地日期升序");
+        }
+        let sent: u64 = days.iter().map(|d| d.sent).sum();
+        assert_eq!(sent, 40, "4 天 × 10 字节");
     }
 
     fn make_sample() -> Sample {

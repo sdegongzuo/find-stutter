@@ -14,8 +14,8 @@ use find_stutter_ui::skin::SkinConfig;
 #[test]
 fn skin_default_dimensions() {
     let skin = SkinConfig::default();
-    assert_eq!(skin.width, 360.0);
-    assert_eq!(skin.height, 78.0);
+    assert_eq!(skin.width, 314.0);
+    assert_eq!(skin.height, 70.0);
     assert_eq!(skin.font_size, 13.0);
     assert_eq!(skin.border_radius, 8.0);
 }
@@ -37,8 +37,8 @@ fn skin_default_colors() {
 #[test]
 fn skin_load_nonexistent_returns_default() {
     let skin = SkinConfig::load("nonexistent_skin_12345");
-    assert_eq!(skin.width, 360.0);
-    assert_eq!(skin.height, 78.0);
+    assert_eq!(skin.width, 314.0);
+    assert_eq!(skin.height, 70.0);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn overlay_state_clone() {
 #[test]
 fn format_service_status_includes_chinese_label() {
     let (text, _) = overlay::format_service_status(ServiceHealth::Running);
-    assert!(text.as_str().contains("服务运行中"));
+    assert!(text.as_str().contains("运行中"));
     let (text, _) = overlay::format_service_status(ServiceHealth::Stale);
     assert!(text.as_str().contains("数据延迟"));
     let (text, _) = overlay::format_service_status(ServiceHealth::Stopped);

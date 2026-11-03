@@ -77,7 +77,7 @@ pub fn format_service_status(health: ServiceHealth) -> (SharedString, Brush) {
         ServiceHealth::Stopped | ServiceHealth::NoDatabase => Color::from_rgb_u8(0xc4, 0x4c, 0x4c),
     });
     let text = match health {
-        ServiceHealth::Running => SharedString::from("● 服务运行中"),
+        ServiceHealth::Running => SharedString::from("● 运行中"),
         ServiceHealth::Stale => SharedString::from("● 数据延迟"),
         ServiceHealth::Stopped => SharedString::from("● 服务已停止"),
         ServiceHealth::NoDatabase => {
@@ -167,19 +167,24 @@ pub fn format_event_count(count: u32) -> String {
     format!("今日卡顿 {count}")
 }
 
-/// 心跳显示为用户本地时间，避免把数据库里的 UTC 直接截成 HH:MM:SS
+/// 心跳时间显示为用户本地时间，避免把数据库里的 UTC 直接截成 HH:MM:SS
 /// （东八区会凭空慢 8 小时，截图中的 03:54:29 即此问题）。
-pub fn format_heartbeat_text(raw: Option<&str>) -> String {
+pub fn format_heartbeat_time(raw: Option<&str>) -> String {
     let Some(raw) = raw else {
-        return "最近心跳 --".to_string();
+        return "--".to_string();
     };
     match chrono::DateTime::parse_from_rfc3339(raw) {
-        Ok(ts) => format!(
-            "最近心跳 {}",
-            ts.with_timezone(&chrono::Local).format("%H:%M:%S")
-        ),
-        Err(_) => "最近心跳 --".to_string(),
+        Ok(ts) => ts
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string(),
+        Err(_) => "--".to_string(),
     }
+}
+
+/// tooltip 中的完整心跳说明；主区只显示时间，与服务状态合并为一行。
+pub fn format_heartbeat_text(raw: Option<&str>) -> String {
+    format!("最近心跳 {}", format_heartbeat_time(raw))
 }
 
 /// 「当日上行累计流量」短文本（紧凑单位，无额外空格）。
@@ -386,8 +391,8 @@ pub fn apply_metrics(ui: &crate::Overlay, state: &mut OverlayState) {
     ui.set_event_color(event_count_color(state.today_event_count, event_neutral));
     ui.set_bubble_tip(SharedString::from(format_bubble_tip(state)));
 
-    // 5) 最近心跳：转本地时区后显示；无心跳/格式异常统一显示 `--`。
-    ui.set_last_heartbeat(SharedString::from(format_heartbeat_text(
+    // 5) 最近心跳：主区只显示本地时间，与服务状态合并；完整说明见 tooltip。
+    ui.set_last_heartbeat(SharedString::from(format_heartbeat_time(
         state.last_heartbeat.as_deref(),
     )));
 
@@ -410,7 +415,7 @@ mod tests {
     #[test]
     fn format_service_status_running() {
         let (text, _) = format_service_status(ServiceHealth::Running);
-        assert_eq!(text.as_str(), "● 服务运行中");
+        assert_eq!(text.as_str(), "● 运行中");
     }
 
     #[test]
@@ -591,9 +596,11 @@ mod tests {
             .with_timezone(&chrono::Local)
             .format("%H:%M:%S")
             .to_string();
+        assert_eq!(format_heartbeat_time(Some(raw)), local.to_string());
+        assert_eq!(format_heartbeat_time(None), "--");
+        assert_eq!(format_heartbeat_time(Some("not-a-timestamp")), "--");
         assert_eq!(format_heartbeat_text(Some(raw)), format!("最近心跳 {local}"));
         assert_eq!(format_heartbeat_text(None), "最近心跳 --");
-        assert_eq!(format_heartbeat_text(Some("not-a-timestamp")), "最近心跳 --");
     }
 
     /// 当周 tooltip：含总量、上传、下载三段，且换行分两行。
@@ -684,7 +691,7 @@ mod tests {
         s.last_heartbeat = Some("2026-10-01T03:54:44Z".to_string());
         s.today_net_bytes = (7 * 1024 * 1024, 4 * 1024 * 1024 * 1024_u64);
         let tip = format_bubble_tip(&s);
-        assert!(tip.contains("服务运行中"), "{tip}");
+        assert!(tip.contains("运行中"), "{tip}");
         assert!(tip.contains("今日卡顿 52"), "{tip}");
         assert!(tip.contains("最近心跳 "), "{tip}");
         assert!(!tip.contains("T03:54:44"), "不应直接显示 UTC ISO 串: {tip}");

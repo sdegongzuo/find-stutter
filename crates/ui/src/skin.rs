@@ -46,8 +46,8 @@ pub struct SkinConfig {
     pub mascot_file: Option<PathBuf>,
 }
 
-fn default_width() -> f32 { 360.0 }
-fn default_height() -> f32 { 78.0 }
+fn default_width() -> f32 { 314.0 }
+fn default_height() -> f32 { 70.0 }
 fn default_layout() -> String { "card".into() }
 fn default_bg() -> String { "#FFFFFF".into() }
 fn default_border() -> String { "#C0C0C8".into() }
@@ -64,8 +64,8 @@ fn default_label_color() -> String { "#546E7A".into() }
 impl Default for SkinConfig {
     fn default() -> Self {
         Self {
-            width: 360.0,
-            height: 78.0,
+            width: 314.0,
+            height: 70.0,
             background_color: "#FFFFFF".into(),
             border_color: "#C0C0C8".into(),
             border_radius: 8.0,
@@ -140,8 +140,8 @@ mod tests {
     #[test]
     fn default_field_values() {
         let skin = SkinConfig::default();
-        assert_eq!(skin.width, 360.0);
-        assert_eq!(skin.height, 78.0);
+        assert_eq!(skin.width, 314.0);
+        assert_eq!(skin.height, 70.0);
         assert_eq!(skin.background_color, "#FFFFFF");
         assert_eq!(skin.border_color, "#C0C0C8");
         assert_eq!(skin.border_radius, 8.0);
@@ -218,6 +218,6 @@ mod tests {
         // 优先命中 CWD 的真实皮肤，所以这里只验证 toml::from_str 的 fallback 路径）
         let content = "width = not-a-number\n";
         let skin: SkinConfig = toml::from_str(content).unwrap_or_default();
-        assert_eq!(skin.width, 360.0);
+        assert_eq!(skin.width, 314.0);
     }
 }

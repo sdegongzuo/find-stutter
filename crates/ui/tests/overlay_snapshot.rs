@@ -86,10 +86,12 @@ fn render_overlay_snapshot() {
     ui.set_net_today_up("↑ 4.1 GB".into());
     ui.set_net_today_down("↓ 12.6 GB".into());
     ui.set_event_count("今日卡顿 2".into());
-    ui.set_last_heartbeat("最近心跳 14:52:31".into());
-    ui.set_service_status("● 服务运行中".into());
+    ui.set_last_heartbeat("14:52:31".into());
+    ui.set_service_status("● 运行中".into());
+    ui.set_skin_width(334.0);
+    ui.set_skin_height(70.0);
 
-    let (w, h) = (380u32, 100u32);
+    let (w, h) = (334u32, 70u32);
     window.set_size(PhysicalSize::new(w, h));
     ui.show().unwrap();
     window.request_redraw();

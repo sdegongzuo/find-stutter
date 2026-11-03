@@ -16,7 +16,7 @@
 //! - `NoDatabase`：stutter.db 不存在
 //!
 //! UI 反应：
-//! - `Running` → 顶部状态条绿色 "● 服务运行中"
+//! - `Running` → 右列首行绿色 "● 运行中 · HH:MM:SS"
 //! - `Stale`   → 黄色 "● 数据延迟"
 //! - `Stopped` / `NoDatabase` → 红色 "● 服务已停止"
 //! - 暂停按钮在非 Running 时禁用
@@ -34,6 +34,7 @@ pub mod process_list;
 pub mod reader;
 pub mod skin;
 pub mod taskbar;
+pub mod traffic;
 pub mod tray;
 pub mod window;
 
@@ -260,6 +261,12 @@ pub fn run() -> anyhow::Result<()> {
     > = std::sync::Arc::new(std::sync::Mutex::new(None));
     let analysis_win_for_menu = analysis_win.clone();
     let analysis_win_for_event = analysis_win.clone();
+    // 历史流量统计窗口：同款「首次创建 + 复用 + refresh」模式（悬浮窗「今日 ↑x ↓y」入口）
+    let traffic_win: std::sync::Arc<
+        std::sync::Mutex<Option<std::sync::Arc<crate::traffic::TrafficStatsWindow>>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let traffic_win_for_event = traffic_win.clone();
+    let traffic_db_path = config.storage.db_path.clone();
 
     // 3a2b) 资源区左键点击：点悬浮窗 CPU / 内存 / 网络文字区 → 新开一个精简列
     //        进程弹窗，按点击维度排序（cpu/mem/net）。每次点击都是独立窗口，
@@ -335,6 +342,28 @@ pub fn run() -> anyhow::Result<()> {
                 Ok(w) => *guard = Some(std::sync::Arc::new(w)),
                 Err(e) => {
                     log::warn!("卡顿分析窗口打开失败: {}", e);
+                    return;
+                }
+            }
+        }
+        if let Some(w) = guard.as_ref() {
+            w.refresh();
+        }
+    });
+
+    // 3a2d) 点悬浮窗「今日 ↑x ↓y」→ 打开历史流量统计窗口（与「今日卡顿」同构：
+    // 首次创窗，之后只 refresh + 前置，不重复建窗）。查库全在窗口内部的后台线程，
+    // 这里只做窗口编排。
+    ui.on_traffic_clicked(move || {
+        log::info!("今日流量点击: 打开历史流量统计");
+        let mut guard = traffic_win_for_event.lock().unwrap();
+        if guard.is_none() {
+            match crate::traffic::TrafficStatsWindow::show(std::path::PathBuf::from(
+                traffic_db_path.clone(),
+            )) {
+                Ok(w) => *guard = Some(std::sync::Arc::new(w)),
+                Err(e) => {
+                    log::warn!("历史流量统计窗口打开失败: {}", e);
                     return;
                 }
             }
@@ -541,6 +570,7 @@ pub fn run() -> anyhow::Result<()> {
     let taskbar_for_tick = taskbar.clone();
     let process_win_for_tick = process_win.clone();
     let analysis_win_for_tick = analysis_win.clone();
+    let traffic_win_for_tick = traffic_win.clone();
     let resource_wins_for_tick = resource_wins.clone();
     let resource_closed_for_tick = resource_closed.clone();
 
@@ -617,6 +647,10 @@ pub fn run() -> anyhow::Result<()> {
                 }
                 if let Some(aw) = analysis_win_for_tick.lock().unwrap().as_ref() {
                     crate::window::ensure_app_window_for(aw.window());
+                }
+                // 历史流量统计窗口同为普通应用窗口（留在任务栏 / Alt-Tab）
+                if let Some(tw) = traffic_win_for_tick.lock().unwrap().as_ref() {
+                    crate::window::ensure_app_window_for(tw.window());
                 }
                 // 资源区弹窗：先移除已关闭的（drop 停采样线程），再守护剩余
                 {

@@ -13,8 +13,8 @@
 # 布局模式：card = 三列白卡（本皮肤）；bubble = 绿色三列完整指标（见 skins/bubble/）
 layout = "card"
 
-width = 360.0
-height = 78.0
+width = 314.0
+height = 70.0
 background_color = "#FFFFFF"
 border_color = "#C0C0C8"
 border_radius = 8.0

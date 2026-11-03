@@ -1,17 +1,17 @@
 // find-stutter overlay（沉浸式三列网格）
 //
-//   ┌──────────────────────────────────────────────┐
-//   │ CPU 23%     上传 2.7 KB/s   ● 服务运行中  暂停 │
-//   │ 内存 94%    下载 2.4 KB/s   最近心跳 12:49:57   │
-//   │ GPU --      今日卡顿 1      今日 ↑439M ↓2.7G    │
-//   └──────────────────────────────────────────────┘
+//   ┌────────────────────────────────────────────┐
+//   │ CPU 23%    ↑ 2.7 KB/s   ● 运行中 · 12:49:57 │
+//   │ 内存 94%   ↓ 2.4 KB/s                  暂停 │
+//   │ GPU --     今日卡顿 1    今日 ↑439M ↓2.7G   │
+//   └────────────────────────────────────────────┘
 //
 // 设计要点：
 //   - card / bubble 共用同一三列三行网格，仅由皮肤改变配色、尺寸和吉祥物；
 //     避免两套布局的基线、命中区和文案各自漂移。
 //   - 标签弱化、数值加粗；CPU / 内存按 80% 预警、90%/95% 严重分级着色。
 //   - 今日卡顿 0 时弱化，非 0 才用琥珀色强调，不与真实资源危险抢注意力。
-//   - 暂停按钮固定在右侧垂直居中，文案明确为“暂停/恢复”；后台服务继续采集。
+//   - 服务状态与心跳合并；暂停按钮占右列第二行，不再独占右侧 46px。
 //   - 心跳由 Rust 转为本地时区后显示，避免 UTC 直出导致慢 8 小时。
 //
 // 皮肤：颜色/字号/尺寸均由 Rust 端按 skin.toml 注入。
@@ -78,8 +78,8 @@ export component Overlay inherits Window {
     // 配色风格对齐进程详情页（ProcessList）：白底 + 1px 边框 + 8px 圆角 + 深色文字。
     // 字段保留 in property 是为了让 skin.toml 仍可覆盖（边框颜色/半径/背景色都在
     // skin.toml 的 SkinConfig 里）。
-    in property <length> skin-width: 360px;
-    in property <length> skin-height: 78px;
+    in property <length> skin-width: 314px;
+    in property <length> skin-height: 70px;
     in property <brush> skin-bg: #ffffff;
     in property <color> skin-border-color: #c0c0c0;
     in property <length> skin-border-radius: 8px;
@@ -120,7 +120,8 @@ export component Overlay inherits Window {
     // 当周（周一起）流量明细 tooltip 文本（多行；鼠标悬浮任一流量文本时显示）
     in property <string> net-week-tip: "";
     in property <string> event-count: "今日卡顿 0";
-    in property <string> last-heartbeat: "最近心跳 --";
+    // 仅显示本地时间；完整「最近心跳 HH:MM:SS」保留在 bubble-tip。
+    in property <string> last-heartbeat: "--";
 
     // card 与 bubble 共用同一三列网格，皮肤只改变配色、尺寸和可选吉祥物。
     in property <string> bubble-tip: "";
@@ -136,9 +137,6 @@ export component Overlay inherits Window {
     out property <string> pause-tooltip: root.paused
         ? "点击恢复界面刷新；暂停期间后台服务仍持续采集"
         : "仅暂停界面刷新与卡顿通知，后台服务仍持续采集";
-    out property <string> heartbeat-tooltip: root.paused
-        ? root.pause-tooltip
-        : "最近一次服务心跳时间（已转为本地时区）";
     callback toggle-pause();
 
     // === 拖动 + 右键菜单 ===
@@ -160,6 +158,8 @@ export component Overlay inherits Window {
     callback resource-clicked(string);
     // 点「今日卡顿」→ 打开卡顿分析窗口（默认今日范围）。
     callback event-count-clicked();
+    // 点「今日 ↑x ↓y」→ 打开历史流量统计窗口。
+    callback traffic-clicked();
 
     // === 资源区命中判定（全窗口 TouchArea 用坐标判定，见 ta.clicked）===
     // card / bubble 共用同一网格，只有数字（ClickableValue）矩形可点；
@@ -187,15 +187,20 @@ export component Overlay inherits Window {
         return root.in-col(x, main-col2.absolute-position.x, main-col2.width)
             && root.in-elem(x, y, main-event-text.absolute-position.x, main-event-text.absolute-position.y, main-event-text.width, main-event-text.height);
     }
+    // 「今日 ↑x ↓y」入口热区（右列）：同样先限定在所属列内，避免窄窗口下
+    // 文字溢出到相邻列时误判。
+    function traffic-hit(x: length, y: length) -> bool {
+        return root.in-col(x, main-col3.absolute-position.x, main-col3.width)
+            && root.in-elem(x, y, main-net-today-text.absolute-position.x, main-net-today-text.absolute-position.y, main-net-today-text.width, main-net-today-text.height);
+    }
     // 数字悬浮高亮：元素自身矩形内
     function hovering(el-x: length, el-y: length, el-w: length, el-h: length) -> bool {
         return ta.has-hover && root.in-elem(ta.mouse-x, ta.mouse-y, el-x, el-y, el-w, el-h);
     }
-    // 暂停按钮热区：card / bubble 均固定在右侧垂直居中。
-    // 热区略大于视觉按钮（34×24），保证高 DPI 下仍容易点中。
+    // 暂停热区覆盖右列整个第二行，视觉按钮虽只有 34×18，点击区域仍足够大；
+    // 不向上下行扩展，避免与状态文字、今日流量入口抢点击。
     function pause-hit(x: length, y: length) -> bool {
-        return x >= root.width - 46px && x <= root.width - 4px
-            && y >= (root.height - 32px) / 2 && y <= (root.height + 32px) / 2;
+        return root.in-elem(x, y, pause-row.absolute-position.x, pause-row.absolute-position.y, pause-row.width, pause-row.height);
     }
 
     // 命名 ta 供 bubble 暂停悬浮区引用（has-hover / mouse-x）
@@ -223,6 +228,8 @@ export component Overlay inherits Window {
                 root.toggle-pause();
             } else if (root.event-count-hit(self.pressed-x, self.pressed-y)) {
                 root.event-count-clicked();
+            } else if (root.traffic-hit(self.pressed-x, self.pressed-y)) {
+                root.traffic-clicked();
             } else {
                 // 仅命中资源区（CPU/内存/网络）才发回调，其余空白/GPU 区忽略
                 if (root.resource-kind(self.pressed-x, self.pressed-y) != "") {
@@ -242,14 +249,14 @@ export component Overlay inherits Window {
         border-radius: root.skin-border-radius;
 
         // 统一三列三行网格：card / bubble 共用，仅皮肤配色与尺寸不同。
-        // 行高 18px×3 + 行距 4px×2 = 62px；外层垂直居中，任意高度上下留白一致。
-        // 右侧预留 46px 给暂停按钮，避免文字与操作区重叠。
+        // 行高 18px×3 + 行距 4px×2 = 62px；70px 总高下上下各留 4px。
+        // 暂停按钮已放入右列第二行，不再额外预留右侧按钮区域。
         HorizontalLayout {
             y: (parent.height - 62px) / 2;
             height: 62px;
             width: 100%;
             padding-left: 12px;
-            padding-right: 46px;
+            padding-right: 12px;
             spacing: 8px;
 
             // 左列：CPU / 内存 / GPU
@@ -377,45 +384,91 @@ export component Overlay inherits Window {
                 main-event-text := ClickableValue {
                     text: root.event-count;
                     text-color: root.event-color;
-                    font-size: max(11px, root.text-size - 2px);
+                    // 与「内存」等标签同为 10px：它是次级入口，不应比资源标签更醒目。
+                    font-size: max(10px, root.text-size - 3px);
                     font-weight: 400;
                     tooltip-text: "今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析";
                     hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
 
-            // 右列：服务状态 / 最近心跳 / 今日累计流量
+            // 右列：服务状态+心跳 / 暂停 / 今日累计流量
             // 吉祥物可见时（32px + 8px 间距）从右列扣，否则中列会被挤到 min-width 以下，
             // 网络速率又回到「压右列」的老问题。
-            VerticalLayout {
+            main-col3 := VerticalLayout {
                 width: root.mascot-visible ? 30% : 38%;
                 spacing: 4px;
                 Text {
                     height: 18px;
                     vertical-alignment: center;
-                    text: root.service-status;
-                    color: root.service-status-color;
+                    text: root.paused ? "显示已暂停 · 后台采集" : root.service-status + " · " + root.last-heartbeat;
+                    color: root.paused ? root.paused-color : root.service-status-color;
                     font-size: max(9px, root.text-size - 4px);
                     overflow: elide;
-                    Tooltip { text: @markdown("\{root.bubble-tip}"); }
+                    Tooltip { text: @markdown("\{root.paused ? root.pause-tooltip : root.bubble-tip}"); }
                 }
-                Text {
+                pause-row := Rectangle {
                     height: 18px;
-                    vertical-alignment: center;
-                    text: root.paused ? "显示已暂停 · 后台采集" : root.last-heartbeat;
-                    color: root.paused ? root.paused-color : root.hb-color;
-                    font-size: max(9px, root.text-size - 4px);
-                    overflow: elide;
-                    Tooltip { text: @markdown("\{root.heartbeat-tooltip}"); }
+                    width: 100%;
+                    pause-button := Rectangle {
+                        // 与首行状态、末行流量共用右列左基线；不要单独右推，
+                        // 否则同一列会出现三种对齐方式（旧版 46px 悬浮按钮的残留）。
+                        x: 0;
+                        width: 34px;
+                        height: 18px;
+                        border-width: 1px;
+                        border-radius: 5px;
+                        border-color: root.pause-enabled
+                            ? root.skin-border-color.with-alpha(0.75)
+                            : root.skin-border-color.with-alpha(0.35);
+                        background: root.paused
+                            ? root.paused-color.with-alpha(0.12)
+                            : root.label-color.with-alpha(0.07);
+                        Text {
+                            width: 100%;
+                            height: 100%;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            text: root.pause-text;
+                            color: root.pause-enabled
+                                ? (root.paused ? root.paused-color : root.label-color)
+                                : root.hb-color.with-alpha(0.55);
+                            font-size: max(9px, root.text-size - 4px);
+                            Tooltip { text: @markdown("\{root.pause-tooltip}"); }
+                        }
+                    }
                 }
-                Text {
+                // 「今日 ↑x ↓y」既是当日累计流量，也是「历史流量统计」入口：
+                // 悬浮加深 + 1px 下划线（与 ClickableValue 同款提示），
+                // tooltip 保留当周明细并追加点击说明。
+                main-net-today-text := Rectangle {
                     height: 18px;
-                    vertical-alignment: center;
-                    text: "今日 " + root.net-today-up + " " + root.net-today-down;
-                    color: root.net-color;
-                    font-size: max(9px, root.text-size - 4px);
-                    overflow: elide;
-                    Tooltip { text: @markdown("\{root.net-week-tip}"); }
+                    width: 100%;
+                    background: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height)
+                        ? root.net-color.with-alpha(0.12)
+                        : transparent;
+                    border-radius: 3px;
+                    Text {
+                        // 不再内缩 3px：首行状态从列左边界起排，这里也必须同基线。
+                        x: 0;
+                        width: 100%;
+                        height: 100%;
+                        vertical-alignment: center;
+                        horizontal-alignment: left;
+                        text: "今日 " + root.net-today-up + " " + root.net-today-down;
+                        color: root.net-color;
+                        font-size: max(9px, root.text-size - 4px);
+                        overflow: elide;
+                        Tooltip { text: @markdown("\{root.net-week-tip}\n\n点击查看历史流量统计"); }
+                    }
+                    Rectangle {
+                        visible: root.hovering(main-net-today-text.absolute-position.x, main-net-today-text.absolute-position.y, main-net-today-text.width, main-net-today-text.height);
+                        x: 0;
+                        y: parent.height - 2px;
+                        width: 100%;
+                        height: 1px;
+                        background: root.net-color;
+                    }
                 }
             }
 
@@ -429,34 +482,6 @@ export component Overlay inherits Window {
             }
         }
 
-        // 暂停/恢复：card / bubble 共用，固定在右侧垂直居中。
-        // 用文字而非 “⏸” Emoji，避免 Windows 渲染成亮蓝色 Emoji 方块。
-        Rectangle {
-            x: root.width - 42px;
-            y: (root.height - 24px) / 2;
-            width: 34px;
-            height: 24px;
-            border-width: 1px;
-            border-radius: 5px;
-            border-color: root.pause-enabled
-                ? root.skin-border-color.with-alpha(0.75)
-                : root.skin-border-color.with-alpha(0.35);
-            background: root.paused
-                ? root.paused-color.with-alpha(0.12)
-                : root.label-color.with-alpha(0.07);
-            Text {
-                width: 100%;
-                height: 100%;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                text: root.pause-text;
-                color: root.pause-enabled
-                    ? (root.paused ? root.paused-color : root.label-color)
-                    : root.hb-color.with-alpha(0.55);
-                font-size: max(9px, root.text-size - 4px);
-                Tooltip { text: @markdown("\{root.pause-tooltip}"); }
-            }
-        }
     }
 }
 
@@ -2090,6 +2115,511 @@ export component Analysis inherits Window {
                                     Text { text: root.rc-saved-status; color: #2c7a3d; font-size: 11px; wrap: word-wrap; }
                                 }
                             }
+                }
+            }
+        }
+    }
+}
+
+// ================================================================
+// 历史流量统计窗口（悬浮窗「今日 ↑x ↓y」点击打开）
+//
+// 与 Analysis 同款窗口模式：no-frame + 透明背景 + 白底背板 + 自绘标题栏
+// （拖动经 callback drag-moved 交给 Rust 调 window.set_position）。
+// 数据全部由 Rust 侧后台线程查库后注入：本文件只做展示与交互状态，
+// 任何聚合/换算都不在本组件里发生（UI 线程绝不碰 sqlite）。
+//
+// 两种视图共用同一份「日聚合」缓存：
+//   - 列表视图：日 / 周 / 月三种聚合 + 比例条
+//   - 日历视图：当前月 6×7 格按流量分档着色
+// ================================================================
+
+// 列表视图一行（Rust 端按此结构填充 rows）
+struct TrafficRow {
+    label: string,      // 日期标签（"2026-11-03" / "2026/第 45 周" / "2026/11"）
+    up: string,         // 上传（已格式化，如 "1.05 GB"）
+    down: string,       // 下载
+    total: string,      // 总流量
+    ratio: float,       // 0..1，图表列横向条比例
+}
+
+// 日历一格（42 格；day 为 0 表示尚未填充的占位格）
+struct CalCell {
+    day: int,           // 日号（1..31）
+    level: int,         // -1 = 当日无样本；0..4 = 流量档位
+    in-month: bool,     // 是否属于当前显示的月份
+}
+
+// 日历单格：左上角日号 + 按档位着色的底色
+component CalDayCell inherits Rectangle {
+    in property <CalCell> data;
+    // 高度固定 56px：行高由父布局写死（见日历网格处注释），不用 height:100%
+    // 或 min-height —— 与父 stretch 组合会互相拉扯，把最后一行挤扁。
+    height: 56px;
+    horizontal-stretch: 1;
+    border-radius: 3px;
+    border-width: 1px;
+    border-color: data.in-month ? #eceef3 : transparent;
+    background: !data.in-month ? transparent : (data.level == -1 ? #fafafa : self.level-bg());
+    // 档位配色（与右侧图例同源）
+    function level-bg() -> color {
+        if (data.level == 0) { return #7ec8f0; }
+        if (data.level == 1) { return #7fbf5f; }
+        if (data.level == 2) { return #f2d24b; }
+        if (data.level == 3) { return #f2845c; }
+        if (data.level == 4) { return #b03a2e; }
+        return #fafafa;
+    }
+    // 前景色：深色档位用白字，浅色档位用深字，非本月/无数据用灰字
+    function level-fg() -> color {
+        if (!data.in-month) { return #c8c8cc; }
+        if (data.level >= 3) { return #ffffff; }
+        if (data.level >= 0) { return #1e1e2e; }
+        return #a0a0a8;
+    }
+    Text {
+        x: 5px;
+        y: 3px;
+        text: data.day > 0 ? "\{data.day}" : "";
+        color: root.level-fg();
+        font-size: 11px;
+    }
+}
+
+// 视图切换标签（选中：白底 + 下边框高亮；未选中：浅灰无底）
+component TrafficTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback picked();
+    height: 28px;
+    width: 96px;
+    background: root.active ? #ffffff : transparent;
+    border-radius: 4px;
+    Text {
+        width: 100%;
+        height: 100%;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        text: root.label;
+        color: root.active ? #1e1e2e : #909098;
+        font-size: 13px;
+        font-weight: root.active ? 600 : 400;
+    }
+    Rectangle {
+        visible: root.active;
+        x: 8px;
+        y: parent.height - 2px;
+        width: parent.width - 16px;
+        height: 2px;
+        background: #f0a020;
+        border-radius: 1px;
+    }
+    TouchArea {
+        clicked => { root.picked(); }
+    }
+}
+
+// 列表视图一行（22px：日期左对齐，数值右对齐，末列横向条）
+component TrafficListRow inherits Rectangle {
+    in property <TrafficRow> data;
+    height: 22px;
+    HorizontalLayout {
+        height: 100%;
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 6px;
+        Text {
+            width: 130px;
+            text: data.label;
+            color: #1e1e2e;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            overflow: elide;
+        }
+        Text {
+            width: 110px;
+            text: data.up;
+            color: #2e7d32;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+        Text {
+            width: 110px;
+            text: data.down;
+            color: #1565c0;
+            font-size: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+        Text {
+            width: 120px;
+            text: data.total;
+            color: #1e1e2e;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            overflow: elide;
+        }
+        // 图表列：浅色槽 + amber 条形（比例很低时保底 2px 可见）
+        Rectangle {
+            horizontal-stretch: 1;
+            height: 14px;
+            background: #f2f3f7;
+            border-radius: 2px;
+            Rectangle {
+                width: data.ratio > 0 ? max(2px, parent.width * data.ratio) : 0px;
+                height: 100%;
+                background: #f0c040;
+                border-radius: 2px;
+            }
+        }
+    }
+}
+
+export component TrafficStats inherits Window {
+    width: 880px;
+    height: 620px;
+    // 同 Analysis：普通窗口，不置顶（窗口样式由 Rust 侧 ensure_app_window_for 守护）
+    always-on-top: false;
+    title: "find-stutter - 历史流量统计";
+    no-frame: true;
+    background: transparent;
+
+    // === 皮肤（Rust 端注入，与 Analysis / ProcessList 一致）===
+    in property <brush> skin-bg: #ffffff;
+    in property <color> skin-border-color: #c0c0c0;
+    in property <length> skin-border-radius: 8px;
+    in property <color> skin-text-color: #1e1e2e;
+    in property <color> skin-subtext-color: #606066;
+    in property <color> skin-panel-bg: #fafbfc;
+    in property <color> skin-panel-border: #e2e4ea;
+
+    // === 数据（Rust 端写：rows / cells 在 UI 线程由纯函数重算，查库在后台）===
+    in property <[TrafficRow]> rows: [];
+    in property <[CalCell]> cells: [];
+    in property <string> summary-text: "";
+    in property <string> cal-summary-text: "";
+    in property <string> month-text: "";
+    // 0=列表 / 1=日历（slint 端本地翻转后回调 Rust）
+    in-out property <int> view-index: 0;
+    // 0=日 / 1=周 / 2=月
+    in-out property <int> stats-mode: 0;
+    // 0=对数 / 1=线性
+    in-out property <int> scale-mode: 0;
+    in property <bool> has-data: false;
+
+    callback close-requested();
+    callback drag-moved(length, length);
+    callback view-changed(int);
+    callback stats-mode-changed(int);
+    callback scale-mode-changed(int);
+    // 翻月：-1 / +1
+    callback month-step(int);
+    // 回到本月
+    callback month-reset();
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: root.skin-bg;
+        border-radius: root.skin-border-radius;
+        border-width: 1px;
+        border-color: root.skin-border-color;
+
+        VerticalLayout {
+            padding: 6px;
+            spacing: 6px;
+
+            // === 标题栏：标题 + 关闭（整条可拖动）===
+            Rectangle {
+                height: 30px;
+                TouchArea {
+                    z: 0;
+                    moved => {
+                        root.drag-moved(self.mouse-x - self.pressed-x, self.mouse-y - self.pressed-y);
+                    }
+                }
+                HorizontalLayout {
+                    z: 1;
+                    height: 30px;
+                    spacing: 8px;
+                    Text {
+                        text: "历史流量统计";
+                        color: root.skin-text-color;
+                        font-size: 14px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "关闭";
+                        clicked => { root.close-requested(); }
+                    }
+                }
+            }
+
+            // === 视图标签页 ===
+            HorizontalLayout {
+                height: 28px;
+                spacing: 6px;
+                TrafficTab {
+                    label: "列表视图";
+                    active: root.view-index == 0;
+                    picked => {
+                        root.view-index = 0;
+                        root.view-changed(0);
+                    }
+                }
+                TrafficTab {
+                    label: "日历视图";
+                    active: root.view-index == 1;
+                    picked => {
+                        root.view-index = 1;
+                        root.view-changed(1);
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            // === 视图内容区 ===
+            // 两种视图放进同一个容器、各自 width/height 100%，靠 visible 切换：
+            // 若让两个视图各自作为外层 VerticalLayout 的拉伸子项，不可见的那个仍会
+            // 参与高度分配，把可见视图挤成一半（实测列表表体只剩两行高）。
+            Rectangle {
+                vertical-stretch: 1;
+
+                // === 列表视图 ===
+                VerticalLayout {
+                    visible: root.view-index == 0;
+                    width: 100%;
+                    height: 100%;
+                    spacing: 6px;
+
+                // 工具栏：统计方式 / 图表显示比例
+                Rectangle {
+                    height: 30px;
+                    background: root.skin-panel-bg;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: root.skin-panel-border;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 6px;
+                        Text {
+                            text: "统计方式：";
+                            color: root.skin-subtext-color;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            width: 110px;
+                            model: ["日视图", "周视图", "月视图"];
+                            current-index: root.stats-mode;
+                            selected(v) => {
+                                root.stats-mode-changed(v == "周视图" ? 1 : (v == "月视图" ? 2 : 0));
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: "图表显示比例：";
+                            color: root.skin-subtext-color;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        ComboBox {
+                            width: 110px;
+                            model: ["对数比例", "线性比例"];
+                            current-index: root.scale-mode;
+                            selected(v) => {
+                                root.scale-mode-changed(v == "线性比例" ? 1 : 0);
+                            }
+                        }
+                    }
+                }
+
+                // 表头（列宽与 TrafficListRow 严格一致）
+                Rectangle {
+                    height: 24px;
+                    background: #f0f2f6;
+                    border-radius: 4px;
+                    HorizontalLayout {
+                        padding-left: 6px;
+                        padding-right: 6px;
+                        spacing: 6px;
+                        Text { width: 130px; text: "日期"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: left; }
+                        Text { width: 110px; text: "上传"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
+                        Text { width: 110px; text: "下载"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
+                        Text { width: 120px; text: "总流量"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: right; }
+                        Text { horizontal-stretch: 1; text: "图表"; color: #606066; font-size: 12px; vertical-alignment: center; horizontal-alignment: left; }
+                    }
+                }
+
+                // 表体
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: #ffffff;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: root.skin-panel-border;
+                    clip: true;
+                    ListView {
+                        width: 100%;
+                        height: 100%;
+                        for row in root.rows : TrafficListRow {
+                            data: row;
+                        }
+                    }
+                    Text {
+                        visible: !root.has-data;
+                        text: "暂无流量数据（服务未采集或数据库为空）";
+                        color: #909098;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                // 汇总
+                Text {
+                    height: 20px;
+                    text: root.summary-text;
+                    color: root.skin-subtext-color;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+            }
+
+                // === 日历视图 ===
+                HorizontalLayout {
+                    visible: root.view-index == 1;
+                    width: 100%;
+                    height: 100%;
+                    spacing: 10px;
+
+                    VerticalLayout {
+                        // 左侧日历列占据除图例（140px）外的全部宽度：
+                        // 写死 480px 会让 7 列只铺满一半，右侧留大片空白。
+                        horizontal-stretch: 1;
+                        height: 100%;
+                        spacing: 4px;
+
+                        // 工具栏：< 年月 本月 >
+                        HorizontalLayout {
+                            height: 30px;
+                            spacing: 6px;
+                            Button {
+                                text: "<";
+                                width: 34px;
+                                clicked => { root.month-step(-1); }
+                            }
+                            Text {
+                                min-width: 96px;
+                                text: root.month-text;
+                                color: root.skin-text-color;
+                                font-size: 13px;
+                                font-weight: 600;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            Button {
+                                text: "本月";
+                                width: 60px;
+                                clicked => { root.month-reset(); }
+                            }
+                            Button {
+                                text: ">";
+                                width: 34px;
+                                clicked => { root.month-step(1); }
+                            }
+                            Rectangle { horizontal-stretch: 1; }
+                        }
+
+                        // 星期表头（周日开头）
+                        HorizontalLayout {
+                            height: 22px;
+                            spacing: 2px;
+                            for n in ["日", "一", "二", "三", "四", "五", "六"] : Text {
+                                horizontal-stretch: 1;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                text: n;
+                                color: n == "日" ? #d03030 : (n == "六" ? #1565c0 : #606066);
+                                font-size: 12px;
+                            }
+                        }
+
+                        // 6 × 7 = 42 格：行高固定 56px。
+                        // 试过 vertical-stretch 均分：slint 下前 5 行会把空间吃光、
+                        // 第 6 行被压成一条（880×620 实测两次皆是），故保持固定行高，
+                        // 剩余纵向空间由下方垫片吸收。
+                        for r in 6 : HorizontalLayout {
+                            height: 56px;
+                            spacing: 2px;
+                            for c in 7 : CalDayCell {
+                                data: root.cells[r * 7 + c];
+                            }
+                        }
+
+                        Rectangle { vertical-stretch: 1; }
+
+                        Text {
+                            height: 20px;
+                            text: root.cal-summary-text;
+                            color: root.skin-subtext-color;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    // 右侧图例（竖排 5 档，与格子配色同源）
+                    VerticalLayout {
+                        width: 140px;
+                        height: 100%;
+                        spacing: 8px;
+                        Text {
+                            text: "图例";
+                            color: root.skin-text-color;
+                            font-size: 12px;
+                            font-weight: 700;
+                        }
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 6px;
+                            Rectangle { width: 14px; height: 14px; background: #7ec8f0; border-radius: 2px; }
+                            Text { text: "0~1GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 6px;
+                            Rectangle { width: 14px; height: 14px; background: #7fbf5f; border-radius: 2px; }
+                            Text { text: "1GB~10GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 6px;
+                            Rectangle { width: 14px; height: 14px; background: #f2d24b; border-radius: 2px; }
+                            Text { text: "10GB~100GB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 6px;
+                            Rectangle { width: 14px; height: 14px; background: #f2845c; border-radius: 2px; }
+                            Text { text: "100GB~1TB"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                        HorizontalLayout {
+                            height: 18px;
+                            spacing: 6px;
+                            Rectangle { width: 14px; height: 14px; background: #b03a2e; border-radius: 2px; }
+                            Text { text: "1TB~"; color: root.skin-subtext-color; font-size: 11px; vertical-alignment: center; }
+                        }
+                        Rectangle { vertical-stretch: 1; }
+                    }
                 }
             }
         }

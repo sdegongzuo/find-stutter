@@ -68,7 +68,7 @@ fn make_overlay(w: f32, h: f32) -> (find_stutter_ui::Overlay, Hit, Rc<RefCell<u3
     ui.set_net_send_value(slint::SharedString::from("1023.9 KB/s"));
     ui.set_net_recv_value(slint::SharedString::from("1023.9 MB/s"));
     ui.set_event_count(slint::SharedString::from("今日卡顿 12"));
-    ui.set_last_heartbeat(slint::SharedString::from("最近心跳 12:49:57"));
+    ui.set_last_heartbeat(slint::SharedString::from("12:49:57"));
     ui.show().unwrap();
 
     let hits: Hit = Rc::new(RefCell::new(Vec::new()));
@@ -111,10 +111,10 @@ impl Bounds {
 }
 
 // 布局常量，必须与 crates/ui/ui/overlay.slint 的 HorizontalLayout 一致：
-// padding-left 12 / padding-right 46（暂停按钮），左列 24%，右列 38%。
+// padding-left/right 12，左列 24%，右列 38%。
 // 改了 slint 的列宽就要同步这里，否则下面的越界断言会给出错误的通过/失败。
 const PAD_LEFT: f32 = 12.0;
-const PAD_RIGHT: f32 = 46.0;
+const PAD_RIGHT: f32 = 12.0;
 const LEFT_COL_PCT: f32 = 0.24;
 const RIGHT_COL_PCT: f32 = 0.38;
 
@@ -193,7 +193,7 @@ fn assert_hits_stay_in_columns(map: &std::collections::BTreeMap<String, Bounds>,
 #[test]
 fn overlay_card_only_number_clickable() {
     let window = setup();
-    let (ui, hits, pauses) = make_overlay(360.0, 78.0);
+    let (ui, hits, pauses) = make_overlay(314.0, 70.0);
 
     // 点标签（左列行首，CPU / 内存 文字）不应命中
     let n0 = hits.borrow().len();
@@ -203,15 +203,15 @@ fn overlay_card_only_number_clickable() {
     assert_eq!(*pauses.borrow(), 0, "标签点击不应触发暂停");
 
     // 全窗扫描：三个数字区都能命中，且命中矩形不越出自己的列
-    let got = sweep(&window, 360, 78, &hits);
+    let got = sweep(&window, 314, 70, &hits);
     eprintln!("card 命中包围盒: {:?}", got);
-    assert_hits_stay_in_columns(&got, 360.0);
+    assert_hits_stay_in_columns(&got, 314.0);
 
-    // 暂停按钮（右侧垂直居中）→ toggle-pause，且不触发资源区
+    // 暂停按钮（右列第二行）→ toggle-pause，且不触发资源区
     let before_hits = hits.borrow().len();
     let before_pauses = *pauses.borrow();
     let before_paused = ui.get_paused();
-    click(&window, 340.0, 39.0);
+    click(&window, 290.0, 35.0);
     assert_eq!(
         *pauses.borrow(),
         before_pauses + 1,
@@ -234,7 +234,7 @@ fn overlay_card_only_number_clickable() {
 #[test]
 fn overlay_bubble_only_number_clickable() {
     let window = setup();
-    let (ui, hits, pauses) = make_overlay(380.0, 78.0);
+    let (ui, hits, pauses) = make_overlay(334.0, 70.0);
     let event_clicks = Rc::new(RefCell::new(0u32));
     let event_clicks_cb = event_clicks.clone();
     ui.on_event_count_clicked(move || {
@@ -247,15 +247,15 @@ fn overlay_bubble_only_number_clickable() {
     click(&window, 16.0, 39.0);
     assert_eq!(hits.borrow().len(), n0, "标签区不应触发 resource-clicked");
 
-    let got = sweep(&window, 380, 78, &hits);
+    let got = sweep(&window, 334, 70, &hits);
     eprintln!("bubble 命中包围盒: {:?}", got);
-    assert_hits_stay_in_columns(&got, 380.0);
+    assert_hits_stay_in_columns(&got, 334.0);
 
     // 暂停按钮在 bubble 下同样可点，且不与资源区混淆。
     // 全窗扫描本身会扫过暂停热区，故用点击前后的增量断言。
     let before_hits = hits.borrow().len();
     let before_pauses = *pauses.borrow();
-    click(&window, 360.0, 39.0);
+    click(&window, 300.0, 35.0);
     assert_eq!(
         *pauses.borrow(),
         before_pauses + 1,
