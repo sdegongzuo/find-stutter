@@ -3092,13 +3092,22 @@ impl ProcessListWindow {
             }
         });
 
-        // 排序：点击列头 → 切换排序列 / 方向 + 用缓存重绘
+        // 排序：点击列头 → 切换排序列 / 方向 + 用缓存重绘 **并顺手采一帧**
+        //
+        // 排序结果取决于「点这一下」的数据：缓存可能已经陈旧（其余列默认
+        // 30s 才刷一次），只拿旧缓存排会排出过时的名次——用户点「按 CPU
+        // 降序」，榜首却还是几分钟前那个高占用进程。所以点列头顺带置位
+        // `sample_now`，采样线程立刻补一帧，到齐后自动按新值重排。
+        //
+        // 仍然不阻塞 UI：先用缓存给出顺序（点了就有反应），新数据回来
+        // 再换一次；不会像旧实现那样在 UI 线程死等采样。
         let sort_for_cb = sort.clone();
         let weak_sort_ui = ui.as_weak();
         let cache_sort = cache_tick.clone();
         let search_sort = search.clone();
         let expanded_sort = expanded.clone();
         let shared_sort = shared.clone();
+        let sample_now_sort = sample_now.clone();
         ui.on_sort_requested(move |column: slint::SharedString| {
             {
                 let mut g = sort_for_cb.lock().unwrap();
@@ -3111,7 +3120,15 @@ impl ProcessListWindow {
                 log::info!("排序: {} {}", g.0, if g.1 { "升序" } else { "降序" });
             }
             if let Some(ui) = weak_sort_ui.upgrade() {
-                render(&ui, &cache_sort, &sort_for_cb, &search_sort, &expanded_sort, &shared_sort);
+                request_immediate_refresh(
+                    &ui,
+                    &cache_sort,
+                    &sort_for_cb,
+                    &search_sort,
+                    &expanded_sort,
+                    &shared_sort,
+                    &sample_now_sort,
+                );
             }
         });
 
