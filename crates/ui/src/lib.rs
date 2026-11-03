@@ -508,7 +508,7 @@ pub fn run() -> anyhow::Result<()> {
     {
         let reader_for_thread = reader.clone();
         let prof_thread = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
-        std::thread::Builder::new()
+        let spawned = std::thread::Builder::new()
             .name("db-poller".into())
             .spawn(move || loop {
                 let t0 = std::time::Instant::now();
@@ -527,8 +527,12 @@ pub fn run() -> anyhow::Result<()> {
                 if spent < POLL_INTERVAL {
                     std::thread::sleep(POLL_INTERVAL - spent);
                 }
-            })
-            .ok();
+            });
+        // 线程创建失败绝不能静默：UI 只 try_recv，收不到数据时界面会一直
+        // 显示空数据且日志里毫无痕迹，排障无从下手。
+        if let Err(e) = spawned {
+            log::error!("db-poller 线程创建失败: {}（界面将收不到任何 DB 数据）", e);
+        }
     }
     let timer = Timer::default();
     let weak_ui = ui.as_weak();

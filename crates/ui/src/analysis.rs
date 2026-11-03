@@ -1065,11 +1065,11 @@ impl AnalysisWindow {
                 .set_position(slint::PhysicalPosition::new(rect.0, rect.1));
         }
         ui.show()?;
-        // 推算失败（拿不到工作区）才退回「显示后夹取」：会有一帧跳动，
-        // 但至少保证整窗可见。
-        if planned.is_none() {
-            crate::window::fit_window_to_work(ui.window());
-        }
+        // 兜底夹取（无条件跑）：`fit_window_to_work` 幂等——窗口已完整落在
+        // 工作区内时直接返回 false，不动窗口，成本几乎为零。推算落点若有
+        // 一点偏差（多屏 DPI、工作区变化），这里是唯一能自动纠正的地方；
+        // 不跑的话窗口会一直露一截在屏幕外，没有人管。
+        crate::window::fit_window_to_work(ui.window());
         // 卡顿分析页是普通应用窗口（留在任务栏 / Alt-Tab），且不置顶
         crate::window::ensure_app_window_for(ui.window());
         // 打开即前置（不置顶的窗口在别的 APP 前台时可能被压在后面）
@@ -1079,6 +1079,9 @@ impl AnalysisWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 crate::window::ensure_app_window_for(ui.window());
+                // 500ms 再兜底夹取一次：show 瞬间 HWND/尺寸常未就绪（fit 空转），
+                // 这里补做。窗口已可见时 fit 是纯比较，无操作、无跳动。
+                crate::window::fit_window_to_work(ui.window());
             }
         });
 

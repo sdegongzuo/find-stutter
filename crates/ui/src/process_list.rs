@@ -662,8 +662,12 @@ impl ProcessSampler {
             // 内存双口径（任务管理器对齐，一次 GetProcessMemoryInfo 取全）：
             // - 提交大小（Commit Size = PagefileUsage）→「详细信息」页「内存」列
             // - 专用工作集（Private Working Set = PrivateWorkingSetSize）→「进程」页「内存」列
-            // 取不到（DACL 拒绝的受保护/SYSTEM 进程）时回退免句柄内核快照
-            // （口径近似：提交大小同义，工作集是全 WS 略大于专用工作集），
+            // 取不到（DACL 拒绝的受保护/SYSTEM 进程）时回退免句柄内核快照：
+            // 提交大小同义；「专用工作集」用 `PrivatePageCount` 近似——它只数
+            // 私有页（含被换出的，故略大于专用工作集），但**不含共享页**，
+            // 远比全工作集 `WorkingSetSize` 接近「专用」口径。若用全工作集，
+            // Hn*/SYSTEM 这类共享页大户会数值虚高，按「内存」排序时被错误
+            // 抬高、`physical_mem_pct` 高亮也会误标红。
             // 快照也没有（已退出等）再回退 sysinfo 工作集，避免错误显示 0。
             let ws = p.memory();
             let (mem, pws) = match detail {
@@ -673,7 +677,7 @@ impl ProcessSampler {
                         mem_fallback = Some(system_process_memory_snapshot());
                     }
                     match mem_fallback.as_ref().and_then(|m| m.get(&pid_u32)) {
-                        Some(&(commit, working_set, _)) => (commit, working_set),
+                        Some(&(commit, _working_set, private_pages)) => (commit, private_pages),
                         None => (ws, ws),
                     }
                 }
@@ -2393,6 +2397,9 @@ fn process_io_and_memory(_pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
 ///
 /// 返回 pid → (提交大小 `PagefileUsage`，工作集 `WorkingSetSize`，
 /// 专用页 `PrivatePageCount`)。用 crate 自带结构体，不手写布局。
+///
+/// 三个值中「专用页」是 DACL 拒绝场景下「专用工作集」列的兜底口径
+/// （见 [`ProcessSampler::sample`] 处注释）：只数私有页、不含共享页。
 #[cfg(windows)]
 fn system_process_memory_snapshot() -> HashMap<u32, (u64, u64, u64)> {
     use windows::Wdk::System::SystemInformation::{
@@ -3440,13 +3447,12 @@ impl ProcessListWindow {
         });
 
         ui.show()?;
-        // 落点已在 show 之前算好（planned）——正常情况下这里什么都不做，
-        // 窗口首帧就是终态。只有推算失败（拿不到锚点矩形 / 工作区）时，
-        // 才退回「显示后夹取」：会有一帧跳动，但至少保证整窗可见。
-        let need_fallback_fit = planned.is_none();
-        if need_fallback_fit {
-            crate::window::fit_window_to_work(ui.window());
-        }
+        // 落点已在 show 之前算好（planned）——推算成功时窗口首帧就是终态。
+        // 兜底夹取**无条件跑**：`fit_window_to_work` 幂等，窗口已在工作区内
+        // 时是零操作的纯比较，不会产生跳动；只有推算有偏差（多屏 DPI、
+        // 分辨率/工作区在 show 前后变化）时它才真正动窗口——这正是需要的
+        // 自动纠正，否则窗口会一直露一截在屏幕外，没有人管。
+        crate::window::fit_window_to_work(ui.window());
         // 安装原生边缘缩放命中测试：WM_NCHITTEST 子类化让 Windows 直接驱动
         // 尺寸拖拽循环（绕开 Slint TouchArea 的按压状态机——实测其对
         // 「窗口随拖拽连续变形」场景不可靠：首个拖拽后重复按压热区大概率
@@ -3473,12 +3479,11 @@ impl ProcessListWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 ensure_window_style(ui.window(), is_popup);
-                // 只有推算落点失败时才走「显示后夹取」兜底：show 瞬间常取不到
-                // HWND（fit 空转），这里补一次。正常路径（planned 有值）不重试，
-                // 否则用户刚拖走窗口就被拉回来，又是一次跳动。
-                if need_fallback_fit {
-                    crate::window::fit_window_to_work(ui.window());
-                }
+                // 兜底夹取再补一次：show 瞬间常取不到 HWND / 尺寸未就绪
+                // （上面那次 fit 空转），500ms 后窗口已落地，这次是真正的
+                // 校验窗口。fit 幂等：窗口已完整可见时是零操作（不动窗口、
+                // 不跳动），只有在工作区外才会被拉回来。
+                crate::window::fit_window_to_work(ui.window());
                 // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）。
                 // install 幂等，且顺带补齐 WS_THICKFRAME——winit 在 show 时会
                 // 重写 GWL_STYLE，把它抹掉，这次重试正好补回来。

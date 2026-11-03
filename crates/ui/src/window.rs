@@ -39,13 +39,53 @@ use crate::Overlay;
 /// 用途：拖拽期间窗口尺寸由用户手指驱动，任何定时重绘 / 几何对账都只是在
 /// 同一线程上抢帧——只会把拖拽拖慢，不会让用户看到更正确的画面。
 ///
-/// 进程级单一标志足够：鼠标捕获是进程内独占的，同一时刻只可能有一个窗口
-/// 处于拖拽循环中。
+/// **作用域**：本标志只反映 *原生模态循环*（主窗口 / 进程详情页的边缘缩放，
+/// 由 `native_resize_proc` 子类接管）。悬浮窗 / 伪任务栏走 Slint 自绘拖拽
+/// （TouchArea + set_position），**不会**置位本标志——不要把它当成
+/// 「进程内是否有任何拖拽」的总开关。
+///
+/// 进程级单一标志仍然够用：原生模态循环同一时刻只可能有一个（前台窗口独占
+/// 鼠标捕获），且 Slint 自绘拖拽根本不读这个标志，互不干扰。
 static SIZE_MOVE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 进入原生拖拽循环的时刻（UNIX 毫秒时间戳；0 = 不在拖拽）。
+/// 与 [`SIZE_MOVE_ACTIVE`] 成对维护，仅供 [`size_move_active`] 的超时兜底使用。
+static SIZE_MOVE_STARTED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `WM_EXITSIZEMOVE` 丢失兜底阈值。真实拖拽（移动 / 缩放一个窗口）不可能
+/// 持续 30 秒；超过即认定退出消息已丢失，见 [`size_move_active`]。
+const SIZE_MOVE_STALE_MS: u64 = 30_000;
+
 /// 原生拖拽（移动 / 缩放）模态循环是否进行中。
+///
+/// 带**超时自愈**：`WM_EXITSIZEMOVE` 可能永远不送（拖拽中窗口被关闭、DPI
+/// 变化时窗口重建、子类回调路径 panic），标志一旦卡在 true，所有依赖本函数
+/// 提前返回的定时器（1Hz 主 tick、进程列表刷新、样式守护）会**永久停摆**，
+/// 表现为整个程序假死。因此超过 [`SIZE_MOVE_STALE_MS`] 视为丢失并强制复位。
 pub fn size_move_active() -> bool {
-    SIZE_MOVE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+    if !SIZE_MOVE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let started = SIZE_MOVE_STARTED_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if started != 0 && unix_millis().saturating_sub(started) > SIZE_MOVE_STALE_MS {
+        SIZE_MOVE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        SIZE_MOVE_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+        log::warn!(
+            "拖拽标志超过 {}s 未收到 WM_EXITSIZEMOVE，疑似丢失，强制复位（定时器恢复刷新）",
+            SIZE_MOVE_STALE_MS / 1000
+        );
+        return false;
+    }
+    true
+}
+
+/// 当前 UNIX 时间（毫秒）。`SystemTime` 早于纪元等异常情况返回 0，
+/// 此时超时兜底不生效（退化为旧行为），不影响正确性。
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// 设置/取消点击穿透
@@ -443,7 +483,9 @@ pub fn monitor_work_area_at_cursor() -> Option<(i32, i32, i32, i32)> {
     None
 }
 
-/// 系统 DPI 缩放比（未创建窗口时唯一能拿到的 scale，用于估算逻辑→物理尺寸）。
+/// 系统 DPI 缩放比（`GetDpiForSystem`，返回的是**主屏 / 系统级**缩放）。
+/// 仅作 [`monitor_scale_at`] 失败时的兜底——多屏不同缩放时它是错的，
+/// 不要在新代码里直接用它推算屏幕几何。
 #[cfg(windows)]
 fn system_scale() -> f32 {
     use windows::Win32::UI::HiDpi::GetDpiForSystem;
@@ -456,6 +498,35 @@ fn system_scale() -> f32 {
 #[cfg(not(windows))]
 fn system_scale() -> f32 {
     1.0
+}
+
+/// 屏幕物理坐标 `(x, y)` 所在显示器的**有效 DPI 缩放比**（per-monitor）。
+///
+/// 为什么不用 `GetDpiForSystem`：多屏各自缩放时系统 DPI 只反映主屏，
+/// 例如主屏 100% + 副屏 150%，光标在副屏时按系统 DPI 推算窗口物理尺寸
+/// 会**低估 1/3**，居中位置偏移、夹取边界也按偏小尺寸计算，窗口实际仍越界。
+/// `GetDpiForMonitor(MDT_EFFECTIVE_DPI)` 才是目标屏真实缩放。
+#[cfg(windows)]
+fn monitor_scale_at(x: i32, y: i32) -> Option<f32> {
+    use windows::Win32::Graphics::Gdi::{MonitorFromPoint, MONITOR_DEFAULTTONEAREST};
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+
+    // SAFETY：纯查询；MonitorFromPoint 失败时返回 None 由调用方兜底
+    unsafe {
+        let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = 0u32;
+        let mut dpi_y = 0u32;
+        GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).ok()?;
+        if dpi_x == 0 {
+            return None;
+        }
+        Some(dpi_x as f32 / 96.0)
+    }
+}
+
+#[cfg(not(windows))]
+fn monitor_scale_at(_x: i32, _y: i32) -> Option<f32> {
+    None
 }
 
 /// 推算弹窗在**显示之前**应有的矩形（物理像素）。
@@ -489,12 +560,19 @@ pub fn plan_popup_rect_near(
 }
 
 /// 推算无锚点窗口在**显示之前**应有的矩形：光标所在显示器工作区居中。
+///
+/// 尺寸换算用**光标所在屏**的有效 DPI（`monitor_scale_at`）：光标在 150%
+/// 副屏而系统 100% 时，按系统 DPI 算出的物理尺寸会低估 1/3，窗口会越界。
+/// 拿不到 per-monitor DPI 时退回系统 DPI（单屏场景两者一致，无损失）。
 pub fn plan_centered_rect(
     win_logical_w: f32,
     win_logical_h: f32,
 ) -> Option<(i32, i32, i32, i32)> {
-    let work = monitor_work_area_at_cursor()?;
-    let scale = system_scale();
+    let mut p = POINT::default();
+    // SAFETY：p 为合法输出结构；只读光标位置
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut p).ok()? };
+    let work = monitor_work_area_at(p.x, p.y)?;
+    let scale = monitor_scale_at(p.x, p.y).unwrap_or_else(system_scale);
     let w = (win_logical_w * scale).round() as i32;
     let h = (win_logical_h * scale).round() as i32;
     if w <= 1 || h <= 1 {
@@ -1130,7 +1208,9 @@ unsafe extern "system" fn native_resize_proc(
     let prof = PROF_ENABLED.get_or_init(|| {
         std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1")
     });
-    let t0 = std::time::Instant::now();
+    // 探针关闭时不取时间戳：本过程对每条窗口消息都会进来一次，几十纳秒
+    // 也是白花的热路径开销（PROF_ENABLED 已缓存，t0 跟着条件化）。
+    let t0 = if *prof { Some(std::time::Instant::now()) } else { None };
     // SAFETY：本回调由系统在窗口线程上调用；全部裸调用仅操作本窗口的
     // 矩形/尺寸信息，不跨线程共享可变状态
     let result = unsafe { native_resize_handle(hwnd, msg, wparam, lparam) };
@@ -1139,10 +1219,12 @@ unsafe extern "system" fn native_resize_proc(
     // - `WM_NCLBUTTONDOWN`：我们直通 `DefWindowProcW` 的那条
     // - `WM_SYSCOMMAND`：`DefWindowProcW` 内部把按下翻译成 `SC_SIZE`/`SC_MOVE`
     //   后再次进入同一个循环
-    if *prof && msg != WM_NCLBUTTONDOWN && msg != WM_SYSCOMMAND {
-        let ms = t0.elapsed().as_millis();
-        if ms >= 50 {
-            log::warn!("[PROF] 窗口线程 msg=0x{:04X} 处理 {}ms", msg, ms);
+    if let Some(t0) = t0 {
+        if msg != WM_NCLBUTTONDOWN && msg != WM_SYSCOMMAND {
+            let ms = t0.elapsed().as_millis();
+            if ms >= 50 {
+                log::warn!("[PROF] 窗口线程 msg=0x{:04X} 处理 {}ms", msg, ms);
+            }
         }
     }
     result
@@ -1192,10 +1274,15 @@ unsafe fn native_resize_handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
         // 必须继续传递）。
         WM_ENTERSIZEMOVE => {
             SIZE_MOVE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            SIZE_MOVE_STARTED_MS.store(
+                unix_millis(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_EXITSIZEMOVE => {
             SIZE_MOVE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+            SIZE_MOVE_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_GETMINMAXINFO => {
@@ -1229,6 +1316,11 @@ unsafe fn native_resize_handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPA
 /// 命中测试再准也拖不动窗口。
 #[cfg(windows)]
 pub fn install_native_resize(win: &slint::Window) {
+    // 安装即复位拖拽标志：窗口（重）建时不可能正处于原生拖拽循环中，
+    // 若上一轮拖拽的 WM_EXITSIZEMOVE 已丢失（标志卡在 true），这里是
+    // 确定性的清零点，与 size_move_active 里的 30s 超时兜底双保险。
+    SIZE_MOVE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+    SIZE_MOVE_STARTED_MS.store(0, std::sync::atomic::Ordering::Relaxed);
     if let Some(hwnd) = extract_hwnd_from(win) {
         // SAFETY：hwnd 为当前线程上合法的 Slint 窗口；回调只读窗口矩形 /
         // 写 MINMAXINFO，不持有任何跨线程状态
