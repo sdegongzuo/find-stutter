@@ -150,6 +150,14 @@ const MIN_CPU_UPDATE: Duration = Duration::from_millis(220);
 /// 同窗口，才谈得上「数据对得上」。
 const CPU_REFRESH_MS: u64 = 1_000;
 
+/// 手动触发全量采样的最小间隔（节流）。
+///
+/// 刷新按钮、点列头排序、kill 后立即刷新都会置位 `sample_now`。一次全量
+/// 采样要枚举端口表 + 查 sqlite + 每进程 IO/内存，几十毫秒；而 500ms 内
+/// 的数据差别没有意义（CPU 另有 1s 独立通道）。连点列头时若每次都采，
+/// 采样线程会一直占着 `sampler`/`cache` 锁，反而拖慢 1s 的 CPU 通道。
+const MIN_MANUAL_SAMPLE_GAP: Duration = Duration::from_millis(500);
+
 /// 网络速率的平滑窗口（秒）：窗口内多行求平均，纯 1 秒瞬时值抖动太大。
 ///
 /// 不能只查这个窗口：服务端是「攒 10 行或满 5 秒」才 flush 一次，落库时刻天然
@@ -3001,12 +3009,27 @@ impl ProcessListWindow {
                 let mut svc_deadline = Instant::now(); // 首轮立即枚举服务
                 // 首轮全量采样刚建完 CPU 基线，CPU 通道顺延一个节拍
                 let mut cpu_deadline = Instant::now() + Duration::from_millis(CPU_REFRESH_MS);
+                // 上次全量采样时刻（手动触发的节流基准）
+                let mut last_sample_at: Option<Instant> = None;
                 loop {
                     if stop_thread.load(Ordering::SeqCst) {
                         break;
                     }
-                    let forced = sample_now_thread.swap(false, Ordering::SeqCst);
-                    if Instant::now() >= deadline || forced {
+                    // 手动触发（刷新按钮 / 点列头切换排序 / kill 后立即刷新）要节流：
+                    // 连点列头会连着置位，而一次全量采样要跑端口表 + sqlite 查询 +
+                    // 每进程 IO/内存（几十毫秒），500ms 内的数据差别没有意义。
+                    //
+                    // 注意**只 load 不 swap**：被节流时把请求留在原位，下一轮
+                    // （50ms 后）再看，避免「刚采完就点一下 → 请求被吞掉」。
+                    let forced = sample_now_thread.load(Ordering::SeqCst);
+                    let now = Instant::now();
+                    let forced_ready = forced
+                        && last_sample_at
+                            .is_none_or(|t| now.duration_since(t) >= MIN_MANUAL_SAMPLE_GAP);
+                    if now >= deadline || forced_ready {
+                        if forced {
+                            sample_now_thread.store(false, Ordering::SeqCst);
+                        }
                         let t_sample = Instant::now();
                         let rows = {
                             let mut s = sampler_thread.lock().unwrap();
@@ -3030,6 +3053,7 @@ impl ProcessListWindow {
                             );
                         // 全量采样已带最新 CPU，CPU 通道从此刻重新计时
                         cpu_deadline = Instant::now() + Duration::from_millis(CPU_REFRESH_MS);
+                        last_sample_at = Some(Instant::now());
                     } else if Instant::now() >= cpu_deadline {
                         // CPU 轻量刷新：只读 GetProcessTimes，几毫秒，把新值
                         // 合并进缓存行（不改行结构，render 时按 cpu 列排序自然跟上）。
