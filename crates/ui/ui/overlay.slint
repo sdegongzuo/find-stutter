@@ -2140,18 +2140,19 @@ component CalDayCell inherits Rectangle {
         return fg-color;
     }
 
-    // 左上角日号
+    // 左上角日号（热力格的信息锚点，比右上角流量小字更醒目）
     Text {
         x: 6px;
         y: 5px;
         text: data.day > 0 ? "\{data.day}" : "";
         color: root.text-color();
-        font-size: 11px;
+        font-size: 12px;
+        font-weight: 600;
     }
     // 右上角当日流量（弱化到 70%，不与日号抢注意力）
     Text {
         x: 6px;
-        y: 5px;
+        y: 6px;
         width: parent.width - 12px;
         horizontal-alignment: right;
         text: data.total-text;
@@ -2162,11 +2163,13 @@ component CalDayCell inherits Rectangle {
 
 // 视图切换标签（分段控件里的一格）
 // 选中态只有白底、无边框：外层槽已有 1px 描边，tab 再画一圈就是双重边框
-//（实测截图如此）。层次靠 白底 vs 透明槽底 + 字重 600/400 区分。
+//（实测截图如此）。层次靠 白底 vs 透明槽底 + 字重 600/400 区分；
+// 未选中 hover 给浅底，提供「可以点」的预期。
 component TrafficTab inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
     in property <color> active-bg;
+    in property <color> hover-bg;
     in property <color> strong;
     in property <color> muted;
     callback picked();
@@ -2174,7 +2177,8 @@ component TrafficTab inherits Rectangle {
     height: 26px;
     width: 88px;
     border-radius: 6px;
-    background: root.active ? root.active-bg : transparent;
+    background: root.active ? root.active-bg
+        : (tab-ta.has-hover ? root.hover-bg : transparent);
 
     Text {
         width: 100%;
@@ -2186,7 +2190,7 @@ component TrafficTab inherits Rectangle {
         font-size: 12px;
         font-weight: root.active ? 600 : 400;
     }
-    TouchArea {
+    tab-ta := TouchArea {
         clicked => { root.picked(); }
     }
 }
@@ -2228,10 +2232,12 @@ component TrafficListRow inherits Rectangle {
     in property <bool> alternate: false;
     in property <color> strong;
     in property <color> fg-color;
+    in property <color> up-color;
+    in property <color> down-color;
     in property <color> divider;
     in property <color> alt-bg;
 
-    height: 24px;
+    height: 26px;
     // 斑马纹只做底色差，不加 hover：ListView 里的 TouchArea 会吃掉按下事件，
     // 使「按住拖动滚动」失效。桌面端虽有滚轮，仍按「先保滚动」取舍。
     background: root.alternate ? root.alt-bg : transparent;
@@ -2251,10 +2257,12 @@ component TrafficListRow inherits Rectangle {
             horizontal-alignment: left;
             overflow: elide;
         }
+        // 上传/下载用柔和语义色（绿/蓝低饱和），扫读时三个数字不再粘连；
+        // 饱和度压低到与整体灰白版式协调
         Text {
             width: 120px;
             text: data.up;
-            color: root.fg-color;
+            color: root.up-color;
             font-size: 12px;
             vertical-alignment: center;
             horizontal-alignment: right;
@@ -2263,7 +2271,7 @@ component TrafficListRow inherits Rectangle {
         Text {
             width: 120px;
             text: data.down;
-            color: root.fg-color;
+            color: root.down-color;
             font-size: 12px;
             vertical-alignment: center;
             horizontal-alignment: right;
@@ -2281,7 +2289,7 @@ component TrafficListRow inherits Rectangle {
         }
         // 图表列：垂直居中一条 1px 基线，条形叠在基线上（不再铺满整列的灰槽）。
         // 本列必须 height:100% 撑满行：HorizontalLayout 会把固定高度的子元素
-        // 顶对齐，8px 的小组件贴在 24px 行顶、条形骑在行边界上（实测截图如此）；
+        // 顶对齐，8px 的小组件贴在行顶、条形骑在行边界上（实测截图如此）；
         // 改为撑满后由内部两个矩形各自按行高垂直居中。
         Rectangle {
             horizontal-stretch: 1;
@@ -2294,11 +2302,11 @@ component TrafficListRow inherits Rectangle {
                 background: root.divider;
             }
             Rectangle {
-                y: (parent.height - 8px) / 2;
+                y: (parent.height - 10px) / 2;
                 width: data.ratio > 0 ? parent.width * data.ratio : 0px;
-                height: 8px;
+                height: 10px;
                 background: @linear-gradient(90deg, #f2c56b 0%, #e8912e 100%);
-                border-radius: 4px;
+                border-radius: 5px;
             }
         }
     }
@@ -2333,6 +2341,9 @@ export component TrafficStats inherits Window {
     // === 设计令牌：强调色 ===
     in property <color> c-accent: #e89a2e;
     in property <color> c-accent-soft: #fdf3e3;
+    // 上传/下载语义色（低饱和绿/蓝，与灰白版式协调；表头仍统一 muted）
+    in property <color> c-up: #3f7a4f;
+    in property <color> c-down: #3d6fa8;
     // === 设计令牌：日历 5 档（降饱和，统一深色字）===
     in property <color> c-cal-0: #a8d3ee;
     in property <color> c-cal-1: #a9d3a2;
@@ -2476,6 +2487,7 @@ export component TrafficStats inherits Window {
                                 label: "列表视图";
                                 active: root.view-index == 0;
                                 active-bg: #ffffff;
+                                hover-bg: root.c-panel-border;
                                 strong: root.c-text-strong;
                                 muted: root.c-text-muted;
                                 picked => {
@@ -2487,6 +2499,7 @@ export component TrafficStats inherits Window {
                                 label: "日历视图";
                                 active: root.view-index == 1;
                                 active-bg: #ffffff;
+                                hover-bg: root.c-panel-border;
                                 strong: root.c-text-strong;
                                 muted: root.c-text-muted;
                                 picked => {
@@ -2589,18 +2602,32 @@ export component TrafficStats inherits Window {
                                         alternate: Math.mod(idx, 2) == 1;
                                         strong: root.c-text-strong;
                                         fg-color: root.c-text;
-                                        divider: root.c-divider;
+                                        up-color: root.c-up;
+                                        down-color: root.c-down;
+                                        divider: root.c-panel-border;
                                         alt-bg: root.c-row-alt;
                                     }
                                 }
 
-                                // 空状态：两行文案，主次分明
+                                // 空状态：简笔柱状图 icon + 两行文案，主次分明
                                 VerticalLayout {
                                     visible: !root.has-data;
                                     width: 100%;
                                     height: 100%;
                                     alignment: center;
                                     spacing: 6px;
+                                    Rectangle {
+                                        height: 40px;
+                                        // 三根柱子的极简 icon（空态视觉锚点）
+                                        Path {
+                                            x: (parent.width - 36px) / 2;
+                                            y: (parent.height - 24px) / 2;
+                                            width: 36px;
+                                            height: 24px;
+                                            fill: root.c-divider;
+                                            commands: "M 0 24 L 0 12 L 8 12 L 8 24 Z M 14 24 L 14 4 L 22 4 L 22 24 Z M 28 24 L 28 16 L 36 16 L 36 24 Z";
+                                        }
+                                    }
                                     Text {
                                         text: "暂无流量数据";
                                         color: root.c-text-muted;
