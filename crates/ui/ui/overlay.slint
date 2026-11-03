@@ -543,7 +543,8 @@ struct ProcessRowData {
     cpu-high: bool,        // CPU 超过高亮阈值（标红加粗）
     mem: string,           // "512 MB"（提交大小 Commit Size）
     physical-mem: string,  // "420 MB"（物理内存/专用工作集）
-    mem-high: bool,        // 内存超过高亮阈值（标红加粗）
+    mem-high: bool,        // 内存（提交大小）超过高亮阈值（标红加粗）
+    physical-mem-high: bool, // 专用工作集超过高亮阈值（标红加粗）
     disk: string,          // "R 12K/s W 3K/s"（速率）
     disk-full: string,     // 磁盘完整详情
     net: string,           // 网络速率 "1.2M/s"
@@ -674,14 +675,15 @@ component ProcessRow inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 物理内存（专用工作集；右对齐；精简列模式隐藏）
+        // 物理内存（专用工作集；高占用标红加粗；右对齐；精简列模式隐藏）
         Text {
             visible: !root.compact;
             min-width: 76px;
             max-width: 76px;
             height: 100%;
             text: data.physical-mem;
-            color: #1e1e2e;
+            color: data.physical-mem-high ? #c44c4c : #1e1e2e;
+            font-weight: data.physical-mem-high ? 700 : 400;
             font-size: 12px;
             overflow: elide;
             horizontal-alignment: right;
@@ -777,8 +779,22 @@ export component ProcessList inherits Window {
     // 全列宽度 = padding 12 + 列宽 800（56+184+56+64+76+132+56+66+110）+ 8 个列间距 64
     // = 876，再留 ~24px 给滚动条，故 900。精简列模式只是右侧留白，不影响可读性。
     // （原来 870 时全列会差 6px，端口列贴边被裁）
-    width: 900px;
-    height: 506px;
+    //
+    // ⚠ 这里必须用 `preferred-*` + `min/max-*`，**不能用 `width`/`height`**：
+    // Slint 文档明确「Setting the width will result in a fixed width」——写死
+    // width/height 会让窗口的布局约束变成 min == max，winit 据此把窗口标成
+    // 不可缩放（样式里没有 WS_THICKFRAME），而且**每次外部改尺寸都会被布局
+    // 约束拉回 900×506**，表现为「拖边缘光标会变、窗口纹丝不动，日志里一直
+    // 报 Slint 布局与原生窗口几何脱节」。改成 preferred + min/max 后
+    // min < max，窗口才真正可缩放，初始尺寸仍是 900×506。
+    // min/max 必须与 Rust 端 `RESIZE_MIN_W/H`、`RESIZE_MAX_W/H`
+    // （process_list.rs）以及 `WM_GETMINMAXINFO` 的夹取范围保持一致。
+    preferred-width: 900px;
+    preferred-height: 506px;
+    min-width: 500px;
+    min-height: 300px;
+    max-width: 1200px;
+    max-height: 900px;
     // 不置顶：这是普通窗口，点别的 APP 就该被压到后面（只有 Overlay /
     // Taskbar 保持置顶）。切回入口是任务栏按钮 / Alt-Tab / 托盘菜单。
     always-on-top: false;

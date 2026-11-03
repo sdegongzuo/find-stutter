@@ -1,14 +1,16 @@
-//! 开发用验证工具：真实 Win32 路径验证「进程详情窗口靠近屏幕边界时被夹回工作区」。
+//! 开发用验证工具：真实 Win32 路径验证「弹窗首帧即终态」。
 //!
 //! ## 背景
 //!
-//! 资源区点击（CPU/内存/网络）打开的进程详情窗口位置固定为「悬浮窗左下方
-//! 8px」，屏幕右下角打开时窗口会有一截跑到工作区外看不见。修复后：
-//! 下方放不下 → 翻到锚点上方；横向/纵向越界 → 夹进所在显示器工作区。
+//! 早期实现是「先 show 到 winit 默认位置，再夹进工作区 / 贴到悬浮窗下方」——
+//! 用户看到的是**先露一截、再跳到完整位置**的闪动。现在改为在 `show()` **之前**
+//! 用 `plan_popup_rect_near` 算好落点并交给 `Window::set_position`，窗口创建时
+//! 就在终态，不存在中途移动。
 //!
-//! 单测覆盖了纯函数（clamp_rect_to_work / place_popup_rect），本工具补的是
-//! **真实窗口链路**：SetWindowPos 写回 → GetWindowRect 读回 → 是否真的落在
-//! rcWork 内。
+//! 本工具验证三件事（单测只覆盖纯函数，这里跑真实窗口链路）：
+//! 1. 弹窗实际落点 == 显示前算出的计划矩形（set_position 被窗口创建采用）；
+//! 2. 整窗在所在显示器工作区内；
+//! 3. 锚点贴屏幕底边时，弹窗翻到锚点**上方**（不遮挡锚点）。
 //!
 //! **必须在 Slint 事件循环里跑**：`ui.show()` 只是登记，原生 HWND 要等事件
 //! 循环启动后才真正创建，`window_handle()` 在此之前恒为 Err。
@@ -30,67 +32,85 @@ fn main() {
 fn main() {
     use find_stutter_ui::process_list::ProcessListWindow;
     use find_stutter_ui::window::{
-        monitor_work_area_for_window, native_rect, place_popup_rect, set_window_rect,
+        monitor_work_area_for_window, native_rect, plan_popup_rect_near, set_window_rect,
     };
     use std::sync::Arc;
     use std::time::Duration;
 
-    let win = match ProcessListWindow::show(70.0, 1000, false, true, "cpu", None) {
+    // 锚点窗口（模拟悬浮窗）：无锚点开局 → 光标所在显示器居中
+    let anchor_win = match ProcessListWindow::show(70.0, 2000, false, true, "cpu", None, None) {
         Ok(w) => Arc::new(w),
         Err(e) => {
-            eprintln!("窗口创建失败: {}", e);
+            eprintln!("锚点窗口创建失败: {}", e);
             std::process::exit(2);
         }
     };
 
-    // 等 show 后的 500ms 定时器（工具窗口样式 / 打开时夹取）跑完再验
-    let timer_win = win.clone();
+    // 等 show 后的 500ms 定时器（窗口样式）跑完
+    let a1 = anchor_win.clone();
     slint::Timer::single_shot(Duration::from_millis(900), move || {
-        let window = timer_win.window();
-        let Some(rect0) = native_rect(window) else {
-            eprintln!("FAIL: 取不到窗口矩形（HWND 未就绪）");
-            std::process::exit(1);
-        };
-        println!("打开时原生矩形 = {:?}", rect0);
-        let Some(work) = monitor_work_area_for_window(window) else {
-            eprintln!("FAIL: 取不到工作区（rcWork）");
-            std::process::exit(1);
-        };
+        let window = a1.window();
+        let rect = native_rect(window).expect("锚点窗口矩形");
+        let work = monitor_work_area_for_window(window).expect("工作区");
         println!("工作区 rcWork = {:?}", work);
+        println!("锚点窗口原始矩形 = {:?}", rect);
 
-        // 锚点模拟「贴着屏幕右下角的悬浮窗」：右下角留 420×64 的框
-        let anchor = (work.2 - 420, work.3 - 64 - 8, 420, 64);
-        let (_, _, w, h) = rect0;
-        let target = place_popup_rect(anchor, w, h, work, 8);
-        println!("计算目标矩形 = {:?}（锚点 {:?}）", target, anchor);
-        set_window_rect(window, target.0, target.1, target.2, target.3);
+        // 把锚点缩成悬浮窗的真实比例（380×78 逻辑 = 760×156 @200%）再挪到
+        // 屏幕右下角——真实场景里锚点就是这个小悬浮窗，贴边才是会抛锚的位置
+        let aw = 760;
+        let ah = 156;
+        let ax = work.2 - aw;
+        let ay = work.3 - ah;
+        set_window_rect(window, ax, ay, aw, ah);
 
-        // 写回是同步的，读回前给 winit 一拍处理 WM_WINDOWPOSCHANGED
-        let check_win = timer_win.clone();
-        let anchor_check = anchor;
-        let work_check = work;
-        slint::Timer::single_shot(Duration::from_millis(250), move || {
-            let window = check_win.window();
-            let got = native_rect(window).expect("读回窗口矩形");
-            println!("实际窗口矩形 = {:?}", got);
-            let inside = got.0 >= work_check.0
-                && got.1 >= work_check.1
-                && got.0 + got.2 <= work_check.2
-                && got.1 + got.3 <= work_check.3;
-            // 锚点贴底 → 应翻到锚点上方（不遮挡锚点）
-            let above = got.1 + got.3 <= anchor_check.1;
-            println!("整窗在工作区内 = {}", inside);
-            println!("翻到锚点上方 = {}", above);
-            if inside && above {
-                println!("PASS");
-            } else {
-                println!("FAIL");
-                std::process::exit(1);
-            }
-            // 保持窗口 2 秒便于肉眼 / 截图核对，然后退出
-            let quit_win = check_win.clone();
-            slint::Timer::single_shot(Duration::from_millis(2000), move || {
-                drop(quit_win);
+        let a2 = a1.clone();
+        slint::Timer::single_shot(Duration::from_millis(300), move || {
+            let anchor_rect = native_rect(a2.window()).expect("锚点窗口矩形");
+            let work = monitor_work_area_for_window(a2.window()).expect("工作区");
+            println!("锚点贴右下角后 = {:?}", anchor_rect);
+
+            // 关键：计划矩形在「弹窗显示之前」算好，并作为 show 的锚点参数传入
+            let plan =
+                plan_popup_rect_near(a2.window(), 900.0, 506.0, 8.0).expect("显示前应能算出落点");
+            println!("显示前计划矩形 = {:?}", plan);
+
+            let b = match ProcessListWindow::show(
+                70.0,
+                2000,
+                false,
+                true,
+                "cpu",
+                None,
+                Some(&a2.window()),
+            ) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    eprintln!("FAIL: 弹窗创建失败: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            slint::Timer::single_shot(Duration::from_millis(400), move || {
+                let got = native_rect(b.window()).expect("弹窗矩形");
+                println!("弹窗实际矩形 = {:?}", got);
+
+                let same_as_plan = (got.0, got.1) == (plan.0, plan.1);
+                let inside = got.0 >= work.0
+                    && got.1 >= work.1
+                    && got.0 + got.2 <= work.2
+                    && got.1 + got.3 <= work.3;
+                // 锚点贴底 → 弹窗应翻到锚点上方（不遮挡）
+                let above_anchor = got.1 + got.3 <= anchor_rect.1;
+
+                println!("落点 == 计划（首帧即终态）= {}", same_as_plan);
+                println!("整窗在工作区内 = {}", inside);
+                println!("翻到锚点上方 = {}", above_anchor);
+                if same_as_plan && inside && above_anchor {
+                    println!("PASS");
+                } else {
+                    println!("FAIL");
+                    std::process::exit(1);
+                }
                 let _ = slint::quit_event_loop();
             });
         });

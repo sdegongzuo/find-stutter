@@ -25,6 +25,14 @@ use crate::analytics::{
     TrendBucket,
 };
 
+/// 窗口初始尺寸（逻辑像素，与 `overlay.slint` 的 `Analysis` 声明同源）。
+///
+/// 只在「显示之前推算落点」时用：那一刻窗口还没创建，拿不到它自己的尺寸，
+/// 只能拿声明值换算。改 .slint 里的 width/height 必须同步改这里，否则居中
+/// 会算偏（贴边时露出一截）。
+const ANALYSIS_LOGICAL_W: f32 = 880.0;
+const ANALYSIS_LOGICAL_H: f32 = 720.0;
+
 /// 卡顿分析窗口句柄。
 pub struct AnalysisWindow {
     ui: crate::Analysis,
@@ -1047,11 +1055,21 @@ impl AnalysisWindow {
             }
         });
 
+        // 首帧即终态：显示之前把落点算好（光标所在显示器工作区居中）。
+        // 放到 show 之后夹取的话，窗口会先按 winit 默认位置画一帧，
+        // 用户看到「先露一截、再跳到完整位置」的闪动。
+        // 只设位置不设尺寸——尺寸由 .slint 根组件声明（880×720 逻辑）决定。
+        let planned = crate::window::plan_centered_rect(ANALYSIS_LOGICAL_W, ANALYSIS_LOGICAL_H);
+        if let Some(rect) = planned {
+            ui.window()
+                .set_position(slint::PhysicalPosition::new(rect.0, rect.1));
+        }
         ui.show()?;
-        // 打开即夹进工作区：窗口按声明尺寸（880×720 逻辑像素）出现在 winit
-        // 选定的位置，若落在屏幕右/下边缘附近会有一截跑出工作区（看不见）。
-        // 与进程详情窗口（ProcessList）同一套处理。
-        crate::window::fit_window_to_work(ui.window());
+        // 推算失败（拿不到工作区）才退回「显示后夹取」：会有一帧跳动，
+        // 但至少保证整窗可见。
+        if planned.is_none() {
+            crate::window::fit_window_to_work(ui.window());
+        }
         // 卡顿分析页是普通应用窗口（留在任务栏 / Alt-Tab），且不置顶
         crate::window::ensure_app_window_for(ui.window());
         // 打开即前置（不置顶的窗口在别的 APP 前台时可能被压在后面）
@@ -1061,9 +1079,6 @@ impl AnalysisWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 crate::window::ensure_app_window_for(ui.window());
-                // 首次 show 后 HWND 常还取不到 → 上一处 fit 拿不到原生矩形，
-                // 这里补一次（幂等：已在工作区内则不动）
-                crate::window::fit_window_to_work(ui.window());
             }
         });
 

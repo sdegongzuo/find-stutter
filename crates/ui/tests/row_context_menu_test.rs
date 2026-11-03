@@ -57,6 +57,7 @@ fn row(pid: i32, name: &str) -> find_stutter_ui::ProcessRowData {
         mem: "0 B".into(),
         physical_mem: "0 B".into(),
         mem_high: false,
+        physical_mem_high: false,
         disk: "R 0 B/s W 0 B/s".into(),
         disk_full: String::new().into(),
         net: "0 B/s".into(),

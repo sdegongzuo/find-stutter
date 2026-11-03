@@ -235,19 +235,33 @@ pub fn run() -> anyhow::Result<()> {
     let resource_wins_cb = resource_wins.clone();
     let resource_closed_cb = resource_closed.clone();
     ui.on_resource_clicked(move |kind: slint::SharedString| {
-        let sort = match kind.as_str() {
-            "cpu" | "mem" | "net" => kind.to_string(),
-            _ => return, // 未命中资源区（返回空串）
+        // 维度映射（含「点内存 → 专用工作集 + 全列」的取舍）在
+        // `process_list::resource_sort` 里，纯函数、有单测；这里只做窗口编排。
+        // 悬浮窗上那个「内存 xx%」是全机物理内存使用率（总-可用），不是各进程
+        // 专用工作集求和——两者只在"看谁占得多"这个取向上保持一致。
+        let Some(target) = crate::process_list::resource_sort(kind.as_str()) else {
+            return; // 未命中资源区（返回空串）
         };
-        // 内存维度要回答「谁占的、占的是专用工作集还是提交」，光看提交大小不够，
-        // 所以点击内存时不走精简列（保留专用工作集 / 磁盘 / 累计网络 / 端口）。
-        // CPU / 网络保持精简列，避免弹窗过宽遮住悬浮窗下方的内容。
-        let compact = sort != "mem";
+        let sort = target.key.to_string();
+        let compact = !target.full_columns;
+        // 日志给中文列名 + 内部 key：排障时看 "pmem/专用工作集" 不用二次翻译，
+        // 但 key 才是列头箭头比对、sort_groups 分支的真正输入，两者都留。
+        let sort_label = match sort.as_str() {
+            "cpu" => "CPU",
+            "pmem" => "专用工作集",
+            "net" => "网络",
+            _ => sort.as_str(),
+        };
         log::info!(
-            "资源区点击: 打开进程弹窗（按 {} 排序，{}）",
+            "资源区点击: 打开进程弹窗（按 {} 排序[{}]，{}）",
+            sort_label,
             sort,
             if compact { "精简列" } else { "全列" }
         );
+        // 落点在 ProcessListWindow::show 内部、**显示之前**算好：贴悬浮窗下方
+        // （放下不翻上方）并夹进工作区。放到 show 之后再做，会先画出一帧
+        // 默认位置，用户看到「先露一截、再跳到完整位置」的闪动。
+        let anchor = weak_ui_for_res.upgrade();
         let w = match crate::process_list::ProcessListWindow::show(
             proc_highlight_pct,
             proc_refresh_ms,
@@ -255,6 +269,7 @@ pub fn run() -> anyhow::Result<()> {
             true, // 资源区临时弹窗：不占任务栏
             &sort,
             Some(std::path::PathBuf::from(proc_db_path_for_res.clone())),
+            anchor.as_ref().map(|u| u.window()),
         ) {
             Ok(w) => w,
             Err(e) => {
@@ -262,24 +277,6 @@ pub fn run() -> anyhow::Result<()> {
                 return;
             }
         };
-        // 位置：悬浮窗左下方偏移 8px，避免遮挡悬浮窗。
-        // 下方/右侧空间不足时（悬浮窗贴屏幕底边或右边）翻到上方 / 左移，
-        // 并整体夹进所在显示器工作区——否则窗口会有一截跑到屏幕外看不见。
-        if let Some(ui) = weak_ui_for_res.upgrade() {
-            if !crate::window::place_popup_near(w.window(), ui.window(), 8.0) {
-                // 兜底：取不到原生矩形（HWND 尚未就绪）时按 Slint 几何摆放。
-                // 此时 fit 往往也拿不到 HWND（同一原因），真正兜底的是
-                // ProcessListWindow::show 里 500ms 的重试——最迟半秒内纠正。
-                let win = ui.window();
-                let scale = win.scale_factor();
-                let pos = win.position();
-                let size = win.size();
-                let x = pos.x;
-                let y = pos.y + size.height as i32 + (8.0 * scale) as i32;
-                w.window().set_position(slint::PhysicalPosition::new(x, y));
-                crate::window::fit_window_to_work(w.window());
-            }
-        }
         let w = std::sync::Arc::new(w);
         let wid = w.id();
         let closed = resource_closed_cb.clone();
@@ -345,6 +342,7 @@ pub fn run() -> anyhow::Result<()> {
                             false, // 主进程详情页：普通应用窗口
                             "cpu",
                             Some(std::path::PathBuf::from(proc_db_path_for_menu.clone())),
+                            Some(&ui.window()), // 贴悬浮窗打开（首个窗口才定位）
                         ) {
                             Ok(w) => {
                                 log::info!("进程详情窗口已打开");
@@ -467,27 +465,39 @@ pub fn run() -> anyhow::Result<()> {
     let resource_wins_for_tick = resource_wins.clone();
     let resource_closed_for_tick = resource_closed.clone();
 
-    // 测试钩子：FIND_STUTTER_TEST_OPEN_PROCESS=1 时启动即打开进程详情窗口，
-    // 供自动化回归直连（绕开右键菜单的模拟点击不可靠问题）
+    // 测试钩子：FIND_STUTTER_TEST_OPEN_PROCESS=1 时启动后打开进程详情窗口，
+    // 供自动化回归直连（绕开右键菜单的模拟点击不可靠问题）。
+    //
+    // **延迟 1s 再开**：Slint 的 show() 是异步建窗，紧随其后的几百毫秒里悬浮窗
+    // 的 HWND 还取不到（`window_handle()` 返回 Err），落点算不出来；真实使用中
+    // 这段空窗由用户操作耗时覆盖，测试必须模拟同样的时序，否则量到的是异常路径。
     if std::env::var("FIND_STUTTER_TEST_OPEN_PROCESS").as_deref() == Ok("1") {
-        log::info!("[TEST] 环境变量命中：自动打开进程详情窗口");
-        let mut guard = process_win.lock().unwrap();
-        if guard.is_none() {
-            match crate::process_list::ProcessListWindow::show(
-                proc_highlight_pct,
-                proc_refresh_ms,
-                false,
-                false, // 主进程详情页：普通应用窗口
-                "cpu",
-                Some(std::path::PathBuf::from(proc_db_path.clone())),
-            ) {
-                Ok(w) => {
-                    log::info!("[TEST] 进程详情窗口已打开");
-                    *guard = Some(std::sync::Arc::new(w));
+        log::info!("[TEST] 环境变量命中：1s 后打开进程详情窗口");
+        let weak_for_test = ui.as_weak();
+        let process_win_test = process_win.clone();
+        slint::Timer::single_shot(Duration::from_millis(1000), move || {
+            let Some(ui) = weak_for_test.upgrade() else {
+                return;
+            };
+            let mut guard = process_win_test.lock().unwrap();
+            if guard.is_none() {
+                match crate::process_list::ProcessListWindow::show(
+                    proc_highlight_pct,
+                    proc_refresh_ms,
+                    false,
+                    false, // 主进程详情页：普通应用窗口
+                    "cpu",
+                    Some(std::path::PathBuf::from(proc_db_path.clone())),
+                    Some(&ui.window()),
+                ) {
+                    Ok(w) => {
+                        log::info!("[TEST] 进程详情窗口已打开");
+                        *guard = Some(std::sync::Arc::new(w));
+                    }
+                    Err(e) => log::warn!("[TEST] 进程详情窗口打开失败: {}", e),
                 }
-                Err(e) => log::warn!("[TEST] 进程详情窗口打开失败: {}", e),
             }
-        }
+        });
     }
     timer.start(
         slint::TimerMode::Repeated,

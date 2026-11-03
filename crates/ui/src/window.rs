@@ -18,15 +18,15 @@
 use raw_window_handle::HasWindowHandle;
 use slint::ComponentHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW,
-    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, IsIconic, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE, HTBOTTOM,
-    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT,
-    WM_GETMINMAXINFO, WM_NCHITTEST, WM_NCLBUTTONDOWN, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-    WS_EX_TRANSPARENT, MINMAXINFO,
+    GetWindowLongPtrW, GetWindowRect, GWL_EXSTYLE, GWL_STYLE, IsIconic,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_RESTORE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
+    HTTOPLEFT, HTTOPRIGHT, WM_GETMINMAXINFO, WM_NCHITTEST, WM_NCLBUTTONDOWN,
+    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_THICKFRAME, MINMAXINFO,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
@@ -411,6 +411,102 @@ pub fn monitor_work_area_at(_x: i32, _y: i32) -> Option<(i32, i32, i32, i32)> {
     None
 }
 
+/// 光标所在显示器的工作区（物理像素）。无锚点窗口（如卡顿分析页）用它选屏。
+#[cfg(windows)]
+pub fn monitor_work_area_at_cursor() -> Option<(i32, i32, i32, i32)> {
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut p = POINT::default();
+    // SAFETY：p 为合法输出结构；只读光标位置
+    unsafe { GetCursorPos(&mut p).ok()? };
+    monitor_work_area_at(p.x, p.y)
+}
+
+#[cfg(not(windows))]
+pub fn monitor_work_area_at_cursor() -> Option<(i32, i32, i32, i32)> {
+    None
+}
+
+/// 系统 DPI 缩放比（未创建窗口时唯一能拿到的 scale，用于估算逻辑→物理尺寸）。
+#[cfg(windows)]
+fn system_scale() -> f32 {
+    use windows::Win32::UI::HiDpi::GetDpiForSystem;
+
+    // SAFETY：无参数纯查询
+    let dpi = unsafe { GetDpiForSystem() };
+    if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 }
+}
+
+#[cfg(not(windows))]
+fn system_scale() -> f32 {
+    1.0
+}
+
+/// 推算弹窗在**显示之前**应有的矩形（物理像素）。
+///
+/// 为什么必须在 show 之前算：窗口一旦显示，winit 会先按默认位置画出一帧，
+/// 之后再 SetWindowPos 移动，用户看到的就是「先露一截、再跳到完整位置」的闪动。
+/// 把这个位置在 `show()` 之前交给 `Window::set_position`，窗口**创建时**就
+/// 落在终态，首帧即终态（实测：show 之前设的位置会被采用；尺寸设了没用，
+/// 会被 .slint 根组件声明的尺寸在窗口创建时覆盖，所以这里只算位置）。
+///
+/// 只依赖锚点窗口的原生矩形 + 目标窗口的**逻辑**尺寸，不碰目标窗口的 HWND
+/// （此刻它还不存在）。返回 `None` 表示拿不到几何，调用方退回「show 后夹取」。
+pub fn plan_popup_rect_near(
+    anchor_win: &slint::Window,
+    win_logical_w: f32,
+    win_logical_h: f32,
+    gap_logical: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    let anchor = native_rect(anchor_win)?;
+    let scale = anchor_win.scale_factor();
+    let w = (win_logical_w * scale).round() as i32;
+    let h = (win_logical_h * scale).round() as i32;
+    if w <= 1 || h <= 1 {
+        return None;
+    }
+    // 工作区取「锚点中心」所在显示器：目标窗口此刻可能还在别的屏上
+    let (cx, cy) = (anchor.0 + anchor.2 / 2, anchor.1 + anchor.3 / 2);
+    let work = monitor_work_area_at(cx, cy)?;
+    let gap = (gap_logical * scale).round() as i32;
+    Some(place_popup_rect(anchor, w, h, work, gap))
+}
+
+/// 推算无锚点窗口在**显示之前**应有的矩形：光标所在显示器工作区居中。
+pub fn plan_centered_rect(
+    win_logical_w: f32,
+    win_logical_h: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    let work = monitor_work_area_at_cursor()?;
+    let scale = system_scale();
+    let w = (win_logical_w * scale).round() as i32;
+    let h = (win_logical_h * scale).round() as i32;
+    if w <= 1 || h <= 1 {
+        return None;
+    }
+    let (l, t, r, b) = work;
+    let x = l + ((r - l) - w) / 2;
+    let y = t + ((b - t) - h) / 2;
+    Some(clamp_rect_to_work(x, y, w, h, work))
+}
+
+/// 窗口隐藏后重新显示**之前**，把上次的位置夹回工作区（换屏 / 改分辨率后可能
+/// 已越界）。同样只设位置：show 之后再挪会闪一帧。返回是否调整过。
+pub fn clamp_position_before_show(win: &slint::Window) -> bool {
+    let (Some((x, y, w, h)), Some(work)) = (
+        native_rect(win),
+        monitor_work_area_for_window(win),
+    ) else {
+        return false;
+    };
+    let (nx, ny, _nw, _nh) = clamp_rect_to_work(x, y, w, h, work);
+    if (nx, ny) == (x, y) {
+        return false;
+    }
+    win.set_position(slint::PhysicalPosition::new(nx, ny));
+    true
+}
+
 /// 把矩形夹进工作区（纯函数，单位均为物理像素）：
 /// - 尺寸超过工作区 → 缩到工作区大小（不小于 1px）；
 /// - 位置越界 → 平移回工作区内（不改变尺寸）。
@@ -442,9 +538,9 @@ pub fn clamp_rect_to_work(
 
 /// 子窗口相对锚点窗口的摆放矩形（纯函数，单位均为物理像素）。
 ///
-/// 优先放在锚点**下方** `gap` 处；下方空间不足时翻到**上方**；上下都放不下
-/// （子窗口比屏幕还高）才退回下方并把位置交给 [`clamp_rect_to_work`]。
-/// 横向与锚点左对齐，越界由 clamp 收回工作区。
+/// 优先放在锚点**下方** `gap` 处；下方空间不足时翻到**上方**；两边都放不下
+/// （窗口比任一侧剩余空间都高）时挑**空间更大的一侧**——至少让锚点露出来，
+/// 而不是整个盖住它；最后统一交给 [`clamp_rect_to_work`] 收尾。
 ///
 /// `anchor`：锚点窗口矩形 `(x, y, w, h)`；`win_w`/`win_h`：子窗口尺寸。
 pub fn place_popup_rect(
@@ -458,9 +554,12 @@ pub fn place_popup_rect(
     let (_l, t, _r, b) = work;
     let below = ay + ah + gap;
     let above = ay - gap - win_h;
-    let y = if below + win_h <= b {
+    let below_room = b - below; // 下方剩余可用高度
+    let above_room = ay - gap - t; // 上方剩余可用高度
+    let y = if below_room >= win_h {
         below
-    } else if above >= t {
+    } else if above_room >= win_h || above_room > below_room {
+        // 上方放得下；或两边都放不下但上方空间更大——至少让锚点露出来
         above
     } else {
         below
@@ -914,6 +1013,44 @@ const NATIVE_RESIZE_EDGE_LOGICAL: i32 = 8;
 /// 角落热区宽度（逻辑像素，与 slint 端右下角扁平热区一致）
 const NATIVE_RESIZE_CORNER_LOGICAL: i32 = 24;
 
+/// `WS_THICKFRAME`（= `WS_SIZEBOX`，0x00040000）数值化：尺寸边框样式位。
+const WS_SIZEBOX_BIT: isize = WS_THICKFRAME.0 as isize;
+
+/// 补上尺寸边框样式位（幂等）：**Windows 原生尺寸拖拽循环的前置条件**。
+///
+/// 只有带 `WS_THICKFRAME` 的窗口，`DefWindowProc` 收到
+/// `WM_NCLBUTTONDOWN(HTLEFT/…)` 时才会进入系统级拖拽循环；缺这一位时
+/// 命中码照样返回、光标照样是斜向箭头，但**拖不动**（2026-11-03 实测：
+/// 进程详情窗口 style=0x16ca0000 无 0x40000，拖右边缘窗口纹丝不动；
+/// 手工置位后同一位置拖拽立即生效）。
+///
+/// ## 为什么这一位会丢
+///
+/// 这一位由 winit 按 `WindowFlags::RESIZABLE` 生成，而 Slint 的 winit 后端把
+/// 「根元素布局约束 min < max」当作可缩放判据（`window_is_resizable`）。
+/// `ProcessList` 根节点写了固定 `width: 900px; height: 506px`，算出来 min == max，
+/// 于是 winit 认为窗口不可缩放、样式里根本没有这位——**Slint 端声明的
+/// `resize-margin` 热区在 Windows 上实际是死的**，我们只能自己补。
+///
+/// 只置位、不清位；winit 在 show / 约束变化时会整份重写 GWL_STYLE，补的位会被
+/// 抹掉，故调用点分两处：安装子类时断言一次，**每次边缘按下时**再断言一次
+/// （按下到 `DefWindowProc` 进入循环之间没有别的样式写入，这是最可靠的自愈点）。
+fn ensure_sizebox_style(hwnd: HWND) {
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+        let new_style = with_sizebox_style(style);
+        if new_style != style {
+            SetWindowLongPtrW(hwnd, GWL_STYLE, new_style);
+            log::info!("补齐 WS_THICKFRAME（原生边缘缩放前置样式位），style={:#x}", style);
+        }
+    }
+}
+
+/// 纯位运算：补 `WS_THICKFRAME`（幂等，不清任何既有位）。供单测锚定语义。
+fn with_sizebox_style(style: isize) -> isize {
+    style | WS_SIZEBOX_BIT
+}
+
 /// 按屏幕坐标（物理像素）判定命中区，返回 WM_NCHITTEST 应答码
 /// （HTLEFT/HTRIGHT/…/HTCLIENT 的 Win32 数值）。纯函数便于单测。
 /// `edge`/`corner` 为换算 DPI 后的物理像素热区宽度；角区优先于边区，
@@ -996,12 +1133,21 @@ unsafe extern "system" fn native_resize_proc(
             // 尺寸类命中码转成原生尺寸拖拽模态循环（winit 会吞掉这条消息）
             let ht = wparam.0 as u32;
             if (HTLEFT..=HTBOTTOMRIGHT).contains(&ht) {
+                // 进入循环前必须已带 WS_THICKFRAME（缺位时 DefWindowProc 直接
+                // 忽略，表现为「光标能变、拖不动」）。winit 会重写样式，这里
+                // 每次按下都自愈一次，幂等且只在缺位时写。
+                ensure_sizebox_style(hwnd);
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_GETMINMAXINFO => {
-            // 原生尺寸循环的 min/max 夹取（逻辑常量 × DPI → 物理像素）
+            // 原生尺寸循环的 min/max 夹取（逻辑常量 × DPI → 物理像素）。
+            //
+            // ⚠ 这三个范围必须与 `overlay.slint` 里 `ProcessList` 根节点的
+            // `min-width/min-height/max-width/max-height` 一致（那里是 Slint
+            // 布局约束的真相源，winit 会据此 set_min/max_inner_size；这里
+            // 拦在前面用同一组数值，保证约束传播偶尔滞后时也不会拖出怪尺寸）。
             let dpi = GetDpiForWindow(hwnd).max(96) as i32;
             let mmi = lparam.0 as *mut MINMAXINFO;
             (*mmi).ptMinTrackSize = POINT {
@@ -1021,6 +1167,9 @@ unsafe extern "system" fn native_resize_proc(
 
 /// 给窗口安装原生边缘缩放命中测试（幂等：同 ID 重复安装只更新回调）。
 /// 仅 Windows 生效；其余平台无边框缩放仍走 Slint 热区（若保留）。
+///
+/// 安装时顺带补 `WS_THICKFRAME`（见 [`ensure_sizebox_style`]）——没有这一位，
+/// 命中测试再准也拖不动窗口。
 #[cfg(windows)]
 pub fn install_native_resize(win: &slint::Window) {
     if let Some(hwnd) = extract_hwnd_from(win) {
@@ -1034,39 +1183,14 @@ pub fn install_native_resize(win: &slint::Window) {
                 0,
             );
         }
+        ensure_sizebox_style(hwnd);
     } else {
         log::warn!("原生边缘缩放子类化失败：无法提取 HWND（500ms 后重试）");
     }
 }
 
-/// 摘掉原生边缘缩放命中测试（详情面板打开期间：面板为全窗遮罩，边缘热区
-/// 应让位给面板交互）。与 [`install_native_resize`] 成对，且作用于**当前
-/// 窗口的 HWND**：
-///
-/// - 面板打开即摘、关闭即装，状态由子类的装/卸直接表达，天然按窗口隔离，
-///   不存在跨窗口串扰（历史实现用进程级 `AtomicBool`，任一窗口关窗时漏复位
-///   会让所有窗口的原生缩放永久失效）；
-/// - 无需在窗口销毁时额外复位——子类随 HWND 一并消失，不会泄漏。
-#[cfg(windows)]
-pub fn uninstall_native_resize(win: &slint::Window) {
-    if let Some(hwnd) = extract_hwnd_from(win) {
-        // SAFETY：hwnd 为当前线程上合法的 Slint 窗口；仅移除本模块以同 ID
-        // 注册的子类，不影响同一 HWND 上的其他子类
-        unsafe {
-            let _ = RemoveWindowSubclass(
-                hwnd,
-                Some(native_resize_proc),
-                NATIVE_RESIZE_SUBCLASS_ID,
-            );
-        }
-    }
-}
-
 #[cfg(not(windows))]
 pub fn install_native_resize(_win: &slint::Window) {}
-
-#[cfg(not(windows))]
-pub fn uninstall_native_resize(_win: &slint::Window) {}
 
 #[cfg(windows)]
 fn wide(s: &str) -> windows::core::PCWSTR {
@@ -1219,6 +1343,30 @@ mod tests {
         assert_eq!(toggle_tool_window_bits(app), tool);
     }
 
+    // ===== WS_THICKFRAME（原生尺寸拖拽循环的前置样式位）=====
+
+    /// 实测的进程详情窗口样式（CAPTION|SYSMENU|MINIMIZEBOX|CLIPSIBLINGS|
+    /// CLIPCHILDREN|VISIBLE = 0x16ca0000，**没有** WS_THICKFRAME）：补位后必须
+    /// 恰好多出 0x40000，且既有位一个不少——否则补样式 B 顺手弄坏 A。
+    #[test]
+    fn sizebox_added_to_real_detail_window_style() {
+        let style = 0x16ca0000isize;
+        let fixed = with_sizebox_style(style);
+        assert_eq!(fixed, 0x16ce0000);
+        assert_eq!(fixed & style, style, "既有样式位必须全部保留");
+        assert_ne!(fixed & WS_SIZEBOX_BIT, 0);
+    }
+
+    /// 幂等：已带该位时结果不变（ensure 里 `new_style != style` 才写回，
+    /// 保证周期性断言是零代价的）。
+    #[test]
+    fn sizebox_idempotent() {
+        let once = with_sizebox_style(0x16ca0000);
+        assert_eq!(with_sizebox_style(once), once);
+        // 空样式只补这一位
+        assert_eq!(with_sizebox_style(0), WS_SIZEBOX_BIT);
+    }
+
     // ===== NativeMenuCmd（右键原生菜单命令）=====
 
     /// 验证：命令码与 TrackPopupMenu 返回值映射一致（1/2/3/4/5/6）
@@ -1369,6 +1517,21 @@ mod tests {
         let anchor = (100, 200, 400, 62);
         let (x, y, w, h) = place_popup_rect(anchor, 900, 506, work, 8);
         assert_eq!((x, y, w, h), (100, 0, 900, 400));
+    }
+
+    /// 两边都放不下时挑空间更大的一侧：锚点贴底、弹窗与锚点同高
+    /// （上下都塞不进），选上方空间更大 → 弹窗贴顶，锚点仍在底部露出来，
+    /// 而不是整个被弹窗盖住（旧逻辑会盖住，覆盖同一矩形）。
+    #[test]
+    fn popup_picks_larger_side_instead_of_covering_anchor() {
+        // 工作区高 1040；锚点贴底 978..1040；上方剩余 970，下方剩 -8
+        let anchor = (100, 978, 900, 62);
+        let (x, y, w, h) = place_popup_rect(anchor, 900, 1012, WORK, 8);
+        assert_eq!((x, y, w, h), (100, 0, 900, 1012));
+        // 弹窗比工作区还高，注定要压住锚点一部分；关键是别「完全相同」地
+        // 整个盖住（旧逻辑会返回与锚点同一矩形，用户什么都看不到）
+        assert!(y + h <= WORK.3);
+        assert!((x, y, w, h) != anchor, "弹窗不能与锚点完全重合");
     }
 
     // ===== 几何对账（Slint 布局 vs 原生窗口矩形）=====

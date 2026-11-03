@@ -13,9 +13,14 @@
 //!   差分；首次采样无基线，速率显示 0
 //! - **搜索**：名称 / PID 过滤（大小写不敏感）
 //! - **停止按钮**：`Process::kill()`
-//! - **窗口缩放**：四边/四角热区 + 右下角手柄均可拖拽缩放（按下锁定
-//!   基准矩形与 scale_factor，拖动按「基准 + 累计位移」换算，一次
-//!   SetWindowPos 原子写回位置与尺寸，见 ResizeSession）
+//! - **窗口缩放**：Windows 走**原生边缘缩放**（`window::install_native_resize`
+//!   子类化 `WM_NCHITTEST`，四边 8px / 四角 24px 命中后交 Windows 自己驱动
+//!   尺寸循环；依赖 `WS_THICKFRAME` 样式位，见 `window::ensure_sizebox_style`）。
+//!   slint 端的 `ResizeZone` 热区 + `ResizeSession`（按下锁基准矩形与
+//!   scale_factor、按「基准 + 累计位移」一次 `SetWindowPos` 写回）保留为
+//!   非 Windows 平台与代码语义的兜底，Windows 上不再收到边缘事件。
+//!   详情面板打开期间**照旧**可缩放：面板卡片距窗口边 40–60px，与 8px
+//!   边缘热区不相交。
 //!
 //! ## 数据来源
 //!
@@ -56,8 +61,12 @@ pub struct ProcessRow {
     /// 共享的物理页；与任务管理器「进程」页「内存」列口径一致）。
     /// 「物理内存」列用；`memory_bytes` 是提交大小，两者并存展示。
     pub physical_mem_bytes: u64,
-    /// 内存占用百分比（相对全机物理内存；高亮判断用）
+    /// 内存占用百分比（提交大小 ÷ 全机物理内存；「内存」列高亮判断用）
     pub memory_pct: f32,
+    /// 专用工作集占比（÷ 全机物理内存；「专用工作集」列高亮判断用）。
+    /// 与 `memory_pct` 分开算：两列显示的是不同口径，各自超过阈值才标红，
+    /// 不能用提交大小的占比去染「专用工作集」列（反之亦然）。
+    pub physical_mem_pct: f32,
     /// 磁盘读速率（B/s）
     pub disk_read_bps: u64,
     /// 磁盘写速率（B/s）
@@ -612,6 +621,7 @@ impl ProcessSampler {
                 memory_bytes: mem,
                 physical_mem_bytes: pws,
                 memory_pct: mem_pct(mem, total_mem),
+                physical_mem_pct: mem_pct(pws, total_mem),
                 disk_read_bps: read_bps,
                 disk_write_bps: write_bps,
                 net_bps: net_stat.bps,
@@ -840,6 +850,10 @@ fn find_root_pid(
 /// 注意 `pid` 保持 root 的 pid（不取组内最小值）：组行的右键「结束进程树」
 /// 沿 parent_pid 枚举 root 的子树，若被 pid 回绕后更小的子进程顶替，
 /// 枚举出的就不是该组的主树了。
+///
+/// 另外 `memory_pct` / `physical_mem_pct` **不聚合**（保持 root 的原值，因为
+/// 占比要除以全机内存，本函数拿不到）：聚合行的百分比由 `group_display`
+/// 用字节数和 `total_mem` 重算。想读占比不要直接取这里的 pct 字段。
 pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
     let mut acc = g.root.clone();
     for r in &g.children {
@@ -857,7 +871,8 @@ pub fn group_aggregate(g: &GroupedProcess) -> ProcessRow {
 }
 
 /// 按列排序聚合组（任务管理器风格；纯函数，可单测）。
-/// `column`：pid / name / cpu / mem / disk / net / nettotal / status / port。
+/// `column`：pid / name / cpu / mem / pmem / disk / net / nettotal / status / port。
+/// （`mem` = 提交大小，`pmem` = 专用工作集；资源区点「内存」打开的弹窗用 pmem）
 ///
 /// 性能：key（聚合值 + 小写名）先对每个组预计算一次，再对索引排序，
 /// 最后单次重排——避免比较器内反复 `group_aggregate`（原实现把聚合成本
@@ -927,6 +942,43 @@ pub fn sort_groups(groups: &mut [GroupedProcess], column: &str, ascending: bool)
             visited[next] = true;
             cur = next;
         }
+    }
+}
+
+/// 悬浮窗资源区点击维度 → 进程表排序目标（纯函数，可单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResourceSort {
+    /// 传给 `ProcessListWindow::show` 的 `initial_sort`
+    pub key: &'static str,
+    /// 是否全列（false = 精简列：隐藏专用工作集 / 磁盘 / 累计网络 / 端口）
+    pub full_columns: bool,
+}
+
+/// 资源区点击（"cpu" / "mem" / "net"）→ 排序键 + 列模式；未命中返回 `None`。
+///
+/// - `cpu` / `net`：原样，走精简列（列少，不遮悬浮窗下方内容）；
+/// - `mem` → **`pmem`（专用工作集）+ 全列**。提交大小含已申请但没驻留物理内存
+///   的页，按它排出来的头名经常不是真占内存的那个；而精简列里恰好没有
+///   「专用工作集」列，所以点内存必须切全列，否则排了也看不见排的是谁。
+/// - 其它（slint 未命中资源区时回空串、点到 GPU 区）→ `None`，调用方直接返回。
+///
+/// 抽成纯函数的理由：这段映射原本埋在 GUI 回调闭包里，端到端只能靠实跑截图
+/// 取证；抽出来之后「点内存必须按专用工作集排序」就能被单测钉死。
+pub fn resource_sort(kind: &str) -> Option<ResourceSort> {
+    match kind {
+        "cpu" => Some(ResourceSort {
+            key: "cpu",
+            full_columns: false,
+        }),
+        "net" => Some(ResourceSort {
+            key: "net",
+            full_columns: false,
+        }),
+        "mem" => Some(ResourceSort {
+            key: "pmem",
+            full_columns: true,
+        }),
+        _ => None,
     }
 }
 
@@ -1453,8 +1505,12 @@ pub fn process_detail(pid: u32, name: &str, row: Option<&ProcessRow>, nb_cpus: u
 }
 
 /// 打开进程详情面板（双击行 / 行右键「查看详情」共用）：
-/// 按 pid 从当前快照取行 → 生成详情文本 → 显示全窗面板，
-/// 并摘掉本窗口的原生边缘缩放子类让位给面板交互。
+/// 按 pid 从当前快照取行 → 生成详情文本 → 显示全窗面板。
+///
+/// 面板**不动**原生边缘缩放子类：面板卡片距窗口边 40–60px，与 8px 边缘热区
+/// 完全不相交，缩放窗口不会抢面板的点击；反之若在面板打开期间摘掉子类，
+/// 边缘就落到 Slint TouchArea 那条已知不可靠的路径上，表现为「详情页里
+/// 拖边缘没反应」。
 fn open_process_detail(
     ui: &crate::ProcessList,
     pid: u32,
@@ -1472,9 +1528,6 @@ fn open_process_detail(
     ui.set_detail_title(SharedString::from(format!("{} (PID {})", name, pid)));
     ui.set_detail_text(SharedString::from(detail));
     ui.set_detail_visible(true);
-    // 详情面板为全窗遮罩：摘掉本窗口的原生边缘缩放子类，边缘热区
-    // 让位给面板交互（按窗口装/卸，无全局状态，关窗不会残留）
-    crate::window::uninstall_native_resize(ui.window());
 }
 
 /// 进程命令行（sysinfo `cmd()`；失败返回 None）。
@@ -2495,49 +2548,60 @@ pub fn format_mem(mem_bytes: u64) -> String {
     format!("{} MB", mb)
 }
 
+/// 一行要显示的内容（`row_to_slint` 的输入），字段与 slint `ProcessRowData`
+/// 一一对应。
+///
+/// 为什么不再用位置参数：签名涨到 20 个参数、其中 `mem_high` 与
+/// `physical_mem_high` 是**两个相邻 bool**，顺序写反照样编译通过（2026-11-03
+/// 加专用工作集高亮时就插错过一次，靠类型检查蒙混过关只有相邻 bool 互换这一种
+/// 情况）。改成命名结构体后，写错字段名 / 漏字段都是编译错误。
+#[derive(Debug, Clone, Default)]
+pub struct RowSpec {
+    pub pid: u32,
+    pub name: String,
+    pub name_full: String,
+    pub group_key: String,
+    pub cpu: String,
+    pub cpu_high: bool,
+    pub mem: String,
+    pub physical_mem: String,
+    pub mem_high: bool,
+    pub physical_mem_high: bool,
+    pub disk: String,
+    pub disk_full: String,
+    pub net: String,
+    pub net_full: String,
+    pub net_total: String,
+    pub net_total_full: String,
+    pub port: String,
+    pub port_full: String,
+    pub is_group: bool,
+    pub child_count: i32,
+}
+
 /// 构建 slint 行数据。
-#[allow(clippy::too_many_arguments)]
-pub fn row_to_slint(
-    pid: u32,
-    name: String,
-    name_full: String,
-    group_key: String,
-    cpu: String,
-    cpu_high: bool,
-    mem: String,
-    physical_mem: String,
-    mem_high: bool,
-    disk: String,
-    disk_full: String,
-    net: String,
-    net_full: String,
-    net_total: String,
-    net_total_full: String,
-    port: String,
-    port_full: String,
-    is_group: bool,
-    child_count: i32,
-) -> crate::ProcessRowData {
+pub fn row_to_slint(spec: RowSpec) -> crate::ProcessRowData {
     crate::ProcessRowData {
-        pid: pid as i32,
-        name: SharedString::from(name),
-        name_full: SharedString::from(name_full),
-        group_key: SharedString::from(group_key),
-        cpu: SharedString::from(cpu),
-        cpu_high,
-        mem: SharedString::from(mem),
-        physical_mem: SharedString::from(physical_mem),
-        mem_high,
-        disk: SharedString::from(disk),
-        disk_full: SharedString::from(disk_full),
-        net: SharedString::from(net),
-        net_full: SharedString::from(net_full),
-        net_total: SharedString::from(net_total),
-        net_total_full: SharedString::from(net_total_full),
-        port: SharedString::from(port),
-        port_full: SharedString::from(port_full),
-        is_group,
-        child_count,
+        pid: spec.pid as i32,
+        name: SharedString::from(spec.name),
+        name_full: SharedString::from(spec.name_full),
+        group_key: SharedString::from(spec.group_key),
+        cpu: SharedString::from(spec.cpu),
+        cpu_high: spec.cpu_high,
+        mem: SharedString::from(spec.mem),
+        physical_mem: SharedString::from(spec.physical_mem),
+        mem_high: spec.mem_high,
+        physical_mem_high: spec.physical_mem_high,
+        disk: SharedString::from(spec.disk),
+        disk_full: SharedString::from(spec.disk_full),
+        net: SharedString::from(spec.net),
+        net_full: SharedString::from(spec.net_full),
+        net_total: SharedString::from(spec.net_total),
+        net_total_full: SharedString::from(spec.net_total_full),
+        port: SharedString::from(spec.port),
+        port_full: SharedString::from(spec.port_full),
+        is_group: spec.is_group,
+        child_count: spec.child_count,
     }
 }
 
@@ -2559,31 +2623,33 @@ fn row_display(
     let cpu_pct = (r.cpu_usage / nb_cpus as f32).clamp(0.0, 100.0);
     let cpu_high = cpu_pct > highlight_pct;
     let mem_high = r.memory_pct > highlight_pct;
+    let physical_mem_high = r.physical_mem_pct > highlight_pct;
     let mut name = display.clone();
     if indent {
         name = format!("    {}", name);
     }
-    row_to_slint(
-        r.pid,
+    row_to_slint(RowSpec {
+        pid: r.pid,
         name,
-        full_name,
-        String::new(), // 普通行无 group-key
-        format!("{:.1}%", cpu_pct),
+        name_full: full_name,
+        group_key: String::new(), // 普通行无 group-key
+        cpu: format!("{:.1}%", cpu_pct),
         cpu_high,
-        format_mem(r.memory_bytes),
-        format_mem(r.physical_mem_bytes),
+        mem: format_mem(r.memory_bytes),
+        physical_mem: format_mem(r.physical_mem_bytes),
         mem_high,
-        format_disk_short(r),
-        format_disk_full(r),
-        format_net_short(r),
-        format_net_full(r),
-        format_net_total(r),
-        format_net_total_full(r),
-        format_ports_short(&r.ports),
-        format_ports_full(&r.ports),
-        false,
-        0,
-    )
+        physical_mem_high,
+        disk: format_disk_short(r),
+        disk_full: format_disk_full(r),
+        net: format_net_short(r),
+        net_full: format_net_full(r),
+        net_total: format_net_total(r),
+        net_total_full: format_net_total_full(r),
+        port: format_ports_short(&r.ports),
+        port_full: format_ports_full(&r.ports),
+        is_group: false,
+        child_count: 0,
+    })
 }
 
 /// 聚合组 → 父节点 slint 行。
@@ -2597,9 +2663,11 @@ fn group_display(
     total_mem: u64,
 ) -> crate::ProcessRowData {
     let cpu_pct = (agg.cpu_usage / nb_cpus as f32).clamp(0.0, 100.0);
-    let mem_pct = mem_pct(agg.memory_bytes, total_mem);
+    let mem_share = mem_pct(agg.memory_bytes, total_mem);
+    let physical_mem_share = mem_pct(agg.physical_mem_bytes, total_mem);
     let cpu_high = cpu_pct > highlight_pct;
-    let mem_high = mem_pct > highlight_pct;
+    let mem_high = mem_share > highlight_pct;
+    let physical_mem_high = physical_mem_share > highlight_pct;
     let count = g.total_count() as i32;
     // 展开键唯一化（exe:root_pid）：见 group_key 注释
     let gkey = group_key(g);
@@ -2656,27 +2724,28 @@ fn group_display(
         all_ports.push(c.ports.clone());
     }
     let merged_ports = merge_ports(&all_ports);
-    row_to_slint(
-        agg.pid,
-        title,
-        full_name,
+    row_to_slint(RowSpec {
+        pid: agg.pid,
+        name: title,
+        name_full: full_name,
         group_key,
-        format!("{:.1}%", cpu_pct),
+        cpu: format!("{:.1}%", cpu_pct),
         cpu_high,
-        format_mem(agg.memory_bytes),
-        format_mem(agg.physical_mem_bytes),
+        mem: format_mem(agg.memory_bytes),
+        physical_mem: format_mem(agg.physical_mem_bytes),
         mem_high,
-        format_disk_short(agg),
-        format_disk_full(agg),
-        format_net_short(agg),
-        format_net_full(agg),
-        format_net_total(agg),
-        format_net_total_full(agg),
-        format_ports_short(&merged_ports),
-        format_ports_full(&merged_ports),
-        true,
-        count,
-    )
+        physical_mem_high,
+        disk: format_disk_short(agg),
+        disk_full: format_disk_full(agg),
+        net: format_net_short(agg),
+        net_full: format_net_full(agg),
+        net_total: format_net_total(agg),
+        net_total_full: format_net_total_full(agg),
+        port: format_ports_short(&merged_ports),
+        port_full: format_ports_full(&merged_ports),
+        is_group: true,
+        child_count: count,
+    })
 }
 
 /// 资源区弹窗唯一 id 分配器（lib.rs 跟踪表用）
@@ -2743,6 +2812,11 @@ impl ProcessListWindow {
     /// **拖动延迟**：窗口由右键菜单弹出，`TrackPopupMenu` 的模态循环会
     /// 吞掉 MouseUp 事件，winit 误以为鼠标仍按住 → 新窗口一出现就被拖动
     /// 跟着鼠标走。因此创建后 300ms 内忽略 drag-moved。
+    ///
+    /// **落点**：`anchor` 为参照窗口（悬浮窗）。给了就在**显示之前**把窗口摆到
+    /// 它下方（放不下翻上方）并夹进工作区；不给则在光标所在显示器居中。
+    /// 定位必须发生在 `show()` 之前——show 之后再挪会先画出一帧默认位置，
+    /// 用户看到「先露一截再跳到完整位置」的闪动。
     pub fn show(
         highlight_pct: f32,
         refresh_ms: u64,
@@ -2750,10 +2824,35 @@ impl ProcessListWindow {
         is_popup: bool,
         initial_sort: &str,
         db_path: Option<std::path::PathBuf>,
+        anchor: Option<&slint::Window>,
     ) -> anyhow::Result<Self> {
         let id = NEXT_WINDOW_ID.fetch_add(1, Ordering::SeqCst);
         let ui = crate::ProcessList::new()?;
         ui.set_compact_columns(compact_columns);
+        // 首帧即终态：显示之前把落点算好并交给 Slint，窗口创建时就在这个位置。
+        // 只设位置不设尺寸——尺寸由 .slint 根组件声明（900×506 逻辑）决定，
+        // 这里 set_size 会被创建流程覆盖（实测）。
+        let planned = match anchor {
+            Some(a) => crate::window::plan_popup_rect_near(
+                a,
+                WINDOW_LOGICAL_W,
+                WINDOW_LOGICAL_H,
+                POPUP_GAP_LOGICAL,
+            ),
+            None => crate::window::plan_centered_rect(WINDOW_LOGICAL_W, WINDOW_LOGICAL_H),
+        };
+        if let Some(rect) = planned {
+            log::info!("窗口落点（显示前规划）: {:?}", rect);
+            ui.window()
+                .set_position(slint::PhysicalPosition::new(rect.0, rect.1));
+        } else {
+            // 拿不到锚点矩形（悬浮窗 HWND 尚未就绪）或工作区：只能退回
+            // 「显示后夹取」，那会有一帧跳动，日志留下便于排查是哪种原因
+            log::warn!(
+                "窗口落点规划失败（anchored={}），退回显示后夹取",
+                anchor.is_some()
+            );
+        }
         let sampler: Arc<Mutex<ProcessSampler>> = Arc::new(Mutex::new(ProcessSampler::new(
             db_path.as_deref(),
         )));
@@ -3123,8 +3222,6 @@ impl ProcessListWindow {
         ui.on_detail_close(move || {
             if let Some(ui) = weak_detail_ui.upgrade() {
                 ui.set_detail_visible(false);
-                // 面板关闭：重新装上本窗口的原生边缘缩放子类
-                crate::window::install_native_resize(ui.window());
             }
         });
 
@@ -3209,10 +3306,13 @@ impl ProcessListWindow {
         });
 
         ui.show()?;
-        // 打开即夹进工作区：窗口按声明尺寸（900×506 逻辑像素）出现在 winit
-        // 选定的位置，若落在屏幕右/下边缘附近会有一截跑出工作区（看不见）。
-        // 按所在显示器工作区夹取尺寸与位置，保证整窗可见。
-        crate::window::fit_window_to_work(ui.window());
+        // 落点已在 show 之前算好（planned）——正常情况下这里什么都不做，
+        // 窗口首帧就是终态。只有推算失败（拿不到锚点矩形 / 工作区）时，
+        // 才退回「显示后夹取」：会有一帧跳动，但至少保证整窗可见。
+        let need_fallback_fit = planned.is_none();
+        if need_fallback_fit {
+            crate::window::fit_window_to_work(ui.window());
+        }
         // 安装原生边缘缩放命中测试：WM_NCHITTEST 子类化让 Windows 直接驱动
         // 尺寸拖拽循环（绕开 Slint TouchArea 的按压状态机——实测其对
         // 「窗口随拖拽连续变形」场景不可靠：首个拖拽后重复按压热区大概率
@@ -3242,16 +3342,16 @@ impl ProcessListWindow {
         slint::Timer::single_shot(Duration::from_millis(500), move || {
             if let Some(ui) = weak_toolwin.upgrade() {
                 ensure_window_style(ui.window(), is_popup);
-                // 首次 show 后 HWND 常还取不到 → 上一处 fit 拿不到原生矩形，
-                // 这里补一次（幂等：已在工作区内则不动）
-                crate::window::fit_window_to_work(ui.window());
-                // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）。
-                // 但详情面板打开期间本就应保持「未安装」（见 on_row_clicked 的
-                // uninstall）——重试若无条件重装，会击穿 show 后 500ms 内开面板
-                // 的卸载，让面板打开期间边缘命中又被接管。故按面板可见态决定是否补装。
-                if !ui.get_detail_visible() {
-                    crate::window::install_native_resize(ui.window());
+                // 只有推算落点失败时才走「显示后夹取」兜底：show 瞬间常取不到
+                // HWND（fit 空转），这里补一次。正常路径（planned 有值）不重试，
+                // 否则用户刚拖走窗口就被拉回来，又是一次跳动。
+                if need_fallback_fit {
+                    crate::window::fit_window_to_work(ui.window());
                 }
+                // 原生缩放子类安装重试（首次 show 后 HWND 常不可提取）。
+                // install 幂等，且顺带补齐 WS_THICKFRAME——winit 在 show 时会
+                // 重写 GWL_STYLE，把它抹掉，这次重试正好补回来。
+                crate::window::install_native_resize(ui.window());
             }
         });
 
@@ -3356,6 +3456,9 @@ impl ProcessListWindow {
     /// 1s 快速 tick 在采样完成后自动补齐渲染。
     pub fn refresh(&self) {
         if !self.ui.window().is_visible() {
+            // 重新显示前先把上次的位置夹回工作区（隐藏期间可能换屏 / 改分辨率）。
+            // 必须在 show 之前——show 之后再夹，用户会先看到窗口在旧位置闪一下。
+            crate::window::clamp_position_before_show(self.ui.window());
             let _ = self.ui.show();
             // show 可能触发 winit 重算扩展样式 → 按窗口角色重新设置
             ensure_window_style(self.ui.window(), self.is_popup);
@@ -3365,8 +3468,8 @@ impl ProcessListWindow {
             slint::Timer::single_shot(Duration::from_millis(50), move || {
                 if let Some(ui) = weak_refresh.upgrade() {
                     crate::window::reconcile_geometry(ui.window());
-                    // 重新显示后同样夹一次：隐藏期间换了显示器 / 分辨率时
-                    // 旧位置可能已经落在工作区外
+                    // 位置已在 show 前夹好，这里只会命中「窗口比工作区还大、
+                    // 需要缩尺寸」的极端情况，正常情况下是纯比较不动作
                     crate::window::fit_window_to_work(ui.window());
                 }
             });
@@ -3420,6 +3523,17 @@ const RESIZE_MIN_W: f32 = 500.0;
 const RESIZE_MAX_W: f32 = 1200.0;
 const RESIZE_MIN_H: f32 = 300.0;
 const RESIZE_MAX_H: f32 = 900.0;
+
+/// 窗口初始尺寸（逻辑像素，与 `overlay.slint` 的 `ProcessList` 声明同源）。
+///
+/// 只在「显示之前推算落点」时用：那一刻窗口还没创建，拿不到它自己的尺寸，
+/// 只能拿声明值换算。改 .slint 里的 width/height 必须同步改这里，否则弹窗
+/// 落点会算偏（贴边时露出一截或离锚点过远）。
+const WINDOW_LOGICAL_W: f32 = 900.0;
+const WINDOW_LOGICAL_H: f32 = 506.0;
+
+/// 弹窗与锚点窗口（悬浮窗）之间的间距（逻辑像素）。
+const POPUP_GAP_LOGICAL: f32 = 8.0;
 
 /// 读取窗口当前矩形（逻辑像素 x, y, w, h）。
 /// Slint 的 position()/size() 返回物理像素；resize 全程用逻辑坐标换算，
@@ -3816,31 +3930,16 @@ fn render(
             let agg = group_aggregate(g);
             items.push(group_display(g, &agg, nb_cpus, highlight_pct, total_mem));
             if expanded_set.contains(&group_key(g)) {
-                // svchost：先展开服务列表
+                // svchost：先展开服务列表（服务行只有名字，其余列全空 →
+                // 用 RowSpec::default()，pid 0 / 无高亮 / 非聚合行）
                 if !g.services.is_empty() {
                     for svc in &g.services {
                         let full = format!("服务: {}", svc);
-                        items.push(row_to_slint(
-                            0,
-                            format!("  ▶ {}", svc),
-                            full,
-                            String::new(),
-                            String::new(),
-                            false,
-                            String::new(),
-                            String::new(),
-                            false,
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            String::new(),
-                            false,
-                            0,
-                        ));
+                        items.push(row_to_slint(RowSpec {
+                            name: format!("  ▶ {}", svc),
+                            name_full: full,
+                            ..RowSpec::default()
+                        }));
                     }
                 }
                 // 再展开子进程
@@ -3933,6 +4032,7 @@ mod tests {
             memory_bytes: mem_mb * 1024 * 1024,
             physical_mem_bytes: mem_mb * 1024 * 1024,
             memory_pct: 0.0,
+            physical_mem_pct: 0.0,
             disk_read_bps: 0,
             disk_write_bps: 0,
             net_bps: 0,
@@ -4676,6 +4776,97 @@ mod tests {
     }
 
     #[test]
+    fn sort_groups_by_pmem_ignores_commit_size() {
+        // 资源区点「内存」打开进程弹窗时排的是专用工作集（pmem）：提交大小最大
+        // 的那个未必真占物理内存。这里两个维度给出相反结论，锁住「拉 pmem 不拉 mem」。
+        let mut rows = vec![
+            row(1, "commit.exe", 10.0, 2048),   // 提交 2GB
+            row(2, "resident.exe", 10.0, 512),  // 提交 512MB
+        ];
+        rows[0].physical_mem_bytes = 100 * 1024 * 1024; // 只驻留 100MB
+        rows[1].physical_mem_bytes = 900 * 1024 * 1024; // 驻留 900MB
+        let mut by_pmem = group_processes(&rows, &no_services());
+        sort_groups(&mut by_pmem, "pmem", false);
+        assert_eq!(by_pmem[0].name, "resident.exe", "按专用工作集应把真占内存的排前面");
+        let mut by_mem = group_processes(&rows, &no_services());
+        sort_groups(&mut by_mem, "mem", false);
+        assert_eq!(by_mem[0].name, "commit.exe", "对照组：按提交大小排结果相反");
+    }
+
+    #[test]
+    fn memory_highlight_uses_each_column_own_pct() {
+        // 「内存」列按提交大小占比标红，「专用工作集」列按专用工作集占比标红，
+        // 两列各判各的：本行提交 25%、专用工作集 1.25%，阈值 5% → 前者红后者不红。
+        let mut r = row(1, "hog.exe", 10.0, 100);
+        r.memory_pct = 25.0;
+        r.physical_mem_pct = 1.25;
+        let d = row_display(&r, 8, 5.0, false);
+        assert!(d.mem_high, "提交大小 25% > 阈值 5%，应高亮");
+        assert!(!d.physical_mem_high, "专用工作集 1.25% < 阈值 5%，不应高亮");
+    }
+
+    #[test]
+    fn resource_click_mem_sorts_by_private_working_set_with_full_columns() {
+        // 资源区点「内存」→ 按专用工作集（pmem）排，且必须全列：
+        // 精简列里没有「专用工作集」列，排了也看不见排的是谁。
+        let mem = resource_sort("mem").expect("mem 应命中");
+        assert_eq!(mem.key, "pmem", "点内存要按专用工作集排序，不是提交大小");
+        assert!(mem.full_columns, "点内存要全列，否则专用工作集列被隐藏");
+
+        // CPU / 网络维持精简列
+        assert_eq!(
+            resource_sort("cpu").map(|r| (r.key, r.full_columns)),
+            Some(("cpu", false))
+        );
+        assert_eq!(
+            resource_sort("net").map(|r| (r.key, r.full_columns)),
+            Some(("net", false))
+        );
+
+        // 未命中（slint 回空串 / 点到 GPU 区）→ None，调用方什么都不做
+        assert!(resource_sort("").is_none());
+        assert!(resource_sort("gpu").is_none());
+    }
+
+    #[test]
+    fn row_spec_maps_to_slint_fields_without_swap() {
+        // 锁住映射函数本身：`mem` / `physical_mem` 相邻两个字符串、
+        // `mem_high` / `physical_mem_high` 相邻两个 bool，写反了单测会红。
+        let d = row_to_slint(RowSpec {
+            pid: 42,
+            name: "n".into(),
+            name_full: "nf".into(),
+            group_key: "gk".into(),
+            cpu: "12.5%".into(),
+            cpu_high: true,
+            mem: "111 MB".into(),
+            physical_mem: "222 MB".into(),
+            mem_high: true,
+            physical_mem_high: false,
+            disk: "d".into(),
+            disk_full: "df".into(),
+            net: "nt".into(),
+            net_full: "ntf".into(),
+            net_total: "tot".into(),
+            net_total_full: "totf".into(),
+            port: "80".into(),
+            port_full: "80, 443".into(),
+            is_group: true,
+            child_count: 3,
+        });
+        assert_eq!(d.pid, 42);
+        assert_eq!(d.name.as_str(), "n");
+        assert_eq!(d.mem.as_str(), "111 MB");
+        assert_eq!(d.physical_mem.as_str(), "222 MB");
+        assert!(d.mem_high, "提交大小列应高亮");
+        assert!(!d.physical_mem_high, "专用工作集列不应高亮");
+        assert_eq!(d.port.as_str(), "80");
+        assert_eq!(d.port_full.as_str(), "80, 443");
+        assert!(d.is_group);
+        assert_eq!(d.child_count, 3);
+    }
+
+    #[test]
     fn sort_groups_by_disk() {
         let mut a = row(1, "a.exe", 10.0, 100);
         a.disk_read_bps = 1000;
@@ -4881,6 +5072,7 @@ mod tests {
             memory_bytes: 0,
             physical_mem_bytes: 0,
             memory_pct: 0.0,
+            physical_mem_pct: 0.0,
             disk_read_bps: 0,
             disk_write_bps: 0,
             net_bps: 0,
