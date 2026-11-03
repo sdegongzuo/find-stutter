@@ -386,16 +386,23 @@ fn aggregate(daily: &[DailyTraffic], mode: i32) -> Vec<AggRow> {
 /// 图表条宽度比例。
 ///
 /// - 线性：`v / max`
-/// - 对数：`ln(1+v) / ln(1+max)`（用 ln(1+v) 避免 v=0 时 -inf）
-/// - `v == 0` 或 `max == 0` → 0.0；结果 clamp 到 [0,1]
-fn bar_ratio(value: u64, max: u64, log_scale: bool) -> f32 {
+/// - 对数：以**数据自身的最小非零值**为下界——`(ln v − ln min_nz) / (ln max − ln min_nz)`，
+///   让最小非零条为 0、最大条为 1、中间按对数分布。若用 `ln(1+v)/ln(1+max)` 这类
+///   以 0 为起点的口径，数据动态范围只有一两个数量级时（本机日流量 7~750 GB），
+///   所有条都会被压到 0.75 以上、几乎等长，对数比例就失去意义了（实测踩坑）。
+/// - `v == 0` 或 `max == 0` → 0.0；非零值全相等（max == min_nz）→ 1.0；结果 clamp 到 [0,1]
+fn bar_ratio(value: u64, min_nz: u64, max: u64, log_scale: bool) -> f32 {
     if value == 0 || max == 0 {
         return 0.0;
     }
     let v = value as f64;
     let m = max as f64;
     let r = if log_scale {
-        (1.0 + v).ln() / (1.0 + m).ln()
+        if max == min_nz {
+            1.0
+        } else {
+            ((v.ln() - (min_nz as f64).ln()) / (m.ln() - (min_nz as f64).ln())).max(0.0)
+        }
     } else {
         v / m
     };
@@ -565,6 +572,13 @@ fn recompute(
     // === 列表视图 ===
     let agg = aggregate(daily, stats_mode);
     let max = agg.iter().map(|r| r.total()).max().unwrap_or(0);
+    // 对数比例的下界：数据中最小的非零总量（0 值条恒为 0，不参与参照）
+    let min_nz = agg
+        .iter()
+        .map(|r| r.total())
+        .filter(|v| *v > 0)
+        .min()
+        .unwrap_or(0);
     let log_scale = scale_mode == 0;
     let total_up: u64 = agg.iter().fold(0u64, |a, r| a.saturating_add(r.up));
     let total_down: u64 = agg.iter().fold(0u64, |a, r| a.saturating_add(r.down));
@@ -577,7 +591,7 @@ fn recompute(
             up: SharedString::from(format_traffic_bytes(r.up)),
             down: SharedString::from(format_traffic_bytes(r.down)),
             total: SharedString::from(format_traffic_bytes(r.total())),
-            ratio: bar_ratio(r.total(), max, log_scale),
+            ratio: bar_ratio(r.total(), min_nz, max, log_scale),
         })
         .collect();
 
@@ -751,27 +765,49 @@ mod tests {
 
     #[test]
     fn ratio_linear_and_zero_safe() {
-        assert_eq!(bar_ratio(0, 100, false), 0.0);
-        assert_eq!(bar_ratio(50, 100, false), 0.5);
-        assert_eq!(bar_ratio(100, 100, false), 1.0);
+        // 线性分支不使用 min_nz（传 0 表示无参照）
+        assert_eq!(bar_ratio(0, 0, 100, false), 0.0);
+        assert_eq!(bar_ratio(50, 0, 100, false), 0.5);
+        assert_eq!(bar_ratio(100, 0, 100, false), 1.0);
         // max = 0 不 panic，任何值都给 0
-        assert_eq!(bar_ratio(0, 0, false), 0.0);
-        assert_eq!(bar_ratio(123, 0, false), 0.0);
-        assert_eq!(bar_ratio(123, 0, true), 0.0);
+        assert_eq!(bar_ratio(0, 0, 0, false), 0.0);
+        assert_eq!(bar_ratio(123, 0, 0, false), 0.0);
+        assert_eq!(bar_ratio(123, 0, 0, true), 0.0);
     }
 
     #[test]
-    fn ratio_log_is_monotonic_and_clamped() {
-        assert_eq!(bar_ratio(0, 100, true), 0.0);
-        assert!((bar_ratio(100, 100, true) - 1.0).abs() < 1e-6);
-        let a = bar_ratio(1, 100, true);
-        let b = bar_ratio(10, 100, true);
-        let c = bar_ratio(100, 100, true);
-        assert!(a > 0.0 && a < b && b < c, "对数比例必须单调递增");
-        // 对数会把小值抬得更明显：1% 的量在对数下明显大于 0.01
-        assert!(a > 0.01);
+    fn ratio_log_uses_min_nonzero_as_floor() {
+        // 0 值恒为 0
+        assert_eq!(bar_ratio(0, 10, 100, true), 0.0);
+        // 最小非零值是对数下界（ratio 0），最大值是 1
+        assert_eq!(bar_ratio(10, 10, 100, true), 0.0);
+        assert_eq!(bar_ratio(100, 10, 100, true), 1.0);
+        // 几何中点：min=10, max=100, v≈sqrt(10*100)≈32 → 对数正中 0.5
+        let mid = bar_ratio(32, 10, 100, true);
+        assert!((mid - 0.5).abs() < 0.02, "对数中点应约 0.5，实测 {mid}");
+        // 单调
+        let a = bar_ratio(10, 10, 100, true);
+        let b = bar_ratio(31, 10, 100, true);
+        let c = bar_ratio(100, 10, 100, true);
+        assert!(a == 0.0 && a < b && b < c, "对数比例必须单调递增");
+        // 非零值全相等 → 1.0（都是同一量级，条形等长合理）
+        assert_eq!(bar_ratio(50, 50, 50, true), 1.0);
         // 超出 max 的值 clamp 到 1
-        assert_eq!(bar_ratio(200, 100, true), 1.0);
+        assert_eq!(bar_ratio(200, 10, 100, true), 1.0);
+        // 真实场景回归：7~753 GB 的日流量在对数下必须有明显梯度
+        // （旧实现 ln(1+v)/ln(1+max) 会把全部条压到 0.74~1.0，视觉等长）
+        let gb = 1024.0 * 1024.0 * 1024.0;
+        let small = (7.21 * gb) as u64;
+        let big = (753.2 * gb) as u64;
+        let mid_v = (58.34 * gb) as u64;
+        let r_small = bar_ratio(small, small, big, true);
+        let r_mid = bar_ratio(mid_v, small, big, true);
+        assert_eq!(r_small, 0.0, "最小值应贴 0");
+        assert_eq!(bar_ratio(big, small, big, true), 1.0);
+        assert!(
+            r_mid > 0.25 && r_mid < 0.75,
+            "中间量级应有明显梯度，实测 {r_mid}"
+        );
     }
 
     // === 日历 ===

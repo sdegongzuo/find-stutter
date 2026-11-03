@@ -230,6 +230,11 @@ fn overlay_bubble_only_number_clickable() {
     ui.on_event_count_clicked(move || {
         *event_clicks_cb.borrow_mut() += 1;
     });
+    let traffic_clicks = Rc::new(RefCell::new(0u32));
+    let traffic_clicks_cb = traffic_clicks.clone();
+    ui.on_traffic_clicked(move || {
+        *traffic_clicks_cb.borrow_mut() += 1;
+    });
 
     // 点标签（左列行首，CPU / 内存）不应命中
     let n0 = hits.borrow().len();
@@ -256,14 +261,42 @@ fn overlay_bubble_only_number_clickable() {
         "bubble 右列非入口行点击不应改变暂停状态"
     );
 
-    // 今日卡顿文字 → 打开分析，且不误触资源弹窗
+    // 中列第三行是今日流量入口，右列第三行是今日卡顿入口（两者已互换）。
+    // 今日流量 → traffic-clicked，不误触资源弹窗 / 卡顿分析。
+    let before_traffic = *traffic_clicks.borrow();
     let before_events = *event_clicks.borrow();
     let before_hits = hits.borrow().len();
     click(&window, 140.0, 60.0);
     assert_eq!(
+        *traffic_clicks.borrow(),
+        before_traffic + 1,
+        "中列今日流量区应触发一次 traffic-clicked"
+    );
+    assert_eq!(
+        *event_clicks.borrow(),
+        before_events,
+        "今日流量区不应触发 event-count-clicked"
+    );
+    assert_eq!(
+        hits.borrow().len(),
+        before_hits,
+        "今日流量区点击不应触发 resource-clicked"
+    );
+
+    // 今日卡顿 → event-count-clicked，不误触资源弹窗 / 流量统计。
+    let before_traffic = *traffic_clicks.borrow();
+    let before_events = *event_clicks.borrow();
+    let before_hits = hits.borrow().len();
+    click(&window, 240.0, 60.0);
+    assert_eq!(
         *event_clicks.borrow(),
         before_events + 1,
-        "今日卡顿区应触发一次 event-count-clicked"
+        "右列今日卡顿区应触发一次 event-count-clicked"
+    );
+    assert_eq!(
+        *traffic_clicks.borrow(),
+        before_traffic,
+        "今日卡顿区不应触发 traffic-clicked"
     );
     assert_eq!(
         hits.borrow().len(),

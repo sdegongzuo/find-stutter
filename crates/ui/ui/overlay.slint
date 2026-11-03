@@ -1,17 +1,17 @@
 // find-stutter overlay（沉浸式三列网格）
 //
-//   ┌────────────────────────────────────────────┐
-//   │ CPU 23%    ↑ 2.7 KB/s   ● 运行中 · 12:49:57 │
-//   │ 内存 94%   ↓ 2.4 KB/s                  暂停 │
-//   │ GPU --     今日卡顿 1    今日 ↑439M ↓2.7G   │
-//   └────────────────────────────────────────────┘
+//   ┌──────────────────────────────────────────────┐
+//   │ CPU 23%    ↑ 2.7 KB/s   ● 运行中 · 12:49:57  │
+//   │ 内存 94%   ↓ 2.4 KB/s   最近卡顿 4分钟前      │
+//   │ GPU --     今日 ↑439M ↓2.7G   今日卡顿 1      │
+//   └──────────────────────────────────────────────┘
 //
 // 设计要点：
 //   - card / bubble 共用同一三列三行网格，仅由皮肤改变配色、尺寸和吉祥物；
 //     避免两套布局的基线、命中区和文案各自漂移。
 //   - 标签弱化、数值加粗；CPU / 内存按 80% 预警、90%/95% 严重分级着色。
 //   - 今日卡顿 0 时弱化，非 0 才用琥珀色强调，不与真实资源危险抢注意力。
-//   - 服务状态与心跳合并；暂停按钮占右列第二行，不再独占右侧 46px。
+//   - 服务状态与心跳合并；暂停入口在右键菜单/托盘，窗口内无暂停热区。
 //   - 心跳由 Rust 转为本地时区后显示，避免 UTC 直出导致慢 8 小时。
 //
 // 皮肤：颜色/字号/尺寸均由 Rust 端按 skin.toml 注入。
@@ -179,13 +179,13 @@ export component Overlay inherits Window {
         return "";
     }
     function event-count-hit(x: length, y: length) -> bool {
-        return root.in-col(x, main-col2.absolute-position.x, main-col2.width)
+        return root.in-col(x, main-col3.absolute-position.x, main-col3.width)
             && root.in-elem(x, y, main-event-text.absolute-position.x, main-event-text.absolute-position.y, main-event-text.width, main-event-text.height);
     }
-    // 「今日 ↑x ↓y」入口热区（右列）：同样先限定在所属列内，避免窄窗口下
+    // 「今日 ↑x ↓y」入口热区（中列第三行）：先限定在所属列内，避免窄窗口下
     // 文字溢出到相邻列时误判。
     function traffic-hit(x: length, y: length) -> bool {
-        return root.in-col(x, main-col3.absolute-position.x, main-col3.width)
+        return root.in-col(x, main-col2.absolute-position.x, main-col2.width)
             && root.in-elem(x, y, main-net-today-text.absolute-position.x, main-net-today-text.absolute-position.y, main-net-today-text.width, main-net-today-text.height);
     }
     // 数字悬浮高亮：元素自身矩形内
@@ -364,16 +364,15 @@ export component Overlay inherits Window {
                         hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                     }
                 }
-                // 「今日卡顿 N」也是入口（点开卡顿分析），必须和资源数值一样有
-                // 下划线与 hover 底色——否则同一窗口里三个数字两个可点提示、
-                // 一个没有，用户根本不知道它能点。字重 400：它是入口不是指标。
-                main-event-text := ClickableValue {
-                    text: root.event-count;
-                    text-color: root.event-color;
-                    // 与「内存」等标签同为 10px：它是次级入口，不应比资源标签更醒目。
-                    font-size: max(10px, root.text-size - 3px);
+                // 「今日 ↑x ↓y」既是当日累计流量，也是「历史流量统计」入口。
+                // 与「今日卡顿」交换后放中列；仍用 ClickableValue 保持下划线/
+                // hover 提示一致。字重 400：它是入口不是实时速率指标。
+                main-net-today-text := ClickableValue {
+                    text: "今日 " + root.net-today-up + " " + root.net-today-down;
+                    text-color: root.net-color;
+                    font-size: max(9px, root.text-size - 4px);
                     font-weight: 400;
-                    tooltip-text: "今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析";
+                    tooltip-text: root.net-week-tip + "\n\n点击查看历史流量统计";
                     hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
@@ -404,37 +403,16 @@ export component Overlay inherits Window {
                     overflow: elide;
                     Tooltip { text: @markdown("最近一次卡顿时间（本地时区）；今日卡顿总数见中列，点击可查看明细"); }
                 }
-                // 「今日 ↑x ↓y」既是当日累计流量，也是「历史流量统计」入口：
-                // 悬浮加深 + 1px 下划线（与 ClickableValue 同款提示），
-                // tooltip 保留当周明细并追加点击说明。
-                main-net-today-text := Rectangle {
-                    height: 18px;
-                    width: 100%;
-                    background: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height)
-                        ? root.net-color.with-alpha(0.12)
-                        : transparent;
-                    border-radius: 3px;
-                    Text {
-                        // 不再内缩 3px：首行状态从列左边界起排，这里也必须同基线。
-                        x: 0;
-                        width: 100%;
-                        height: 100%;
-                        vertical-alignment: center;
-                        horizontal-alignment: left;
-                        text: "今日 " + root.net-today-up + " " + root.net-today-down;
-                        color: root.net-color;
-                        font-size: max(9px, root.text-size - 4px);
-                        overflow: elide;
-                        Tooltip { text: @markdown("\{root.net-week-tip}\n\n点击查看历史流量统计"); }
-                    }
-                    Rectangle {
-                        visible: root.hovering(main-net-today-text.absolute-position.x, main-net-today-text.absolute-position.y, main-net-today-text.width, main-net-today-text.height);
-                        x: 0;
-                        y: parent.height - 2px;
-                        width: 100%;
-                        height: 1px;
-                        background: root.net-color;
-                    }
+                // 「今日卡顿 N」也是入口（点开卡顿分析），必须和资源数值一样有
+                // 下划线与 hover 底色。字重 400：它是入口不是指标。
+                main-event-text := ClickableValue {
+                    text: root.event-count;
+                    text-color: root.event-color;
+                    // 与「内存」等标签同为 10px：它是次级入口，不应比资源标签更醒目。
+                    font-size: max(10px, root.text-size - 3px);
+                    font-weight: 400;
+                    tooltip-text: "今日新增卡顿次数（不含构建自伤）\n点击打开卡顿分析";
+                    hovered: root.hovering(self.absolute-position.x, self.absolute-position.y, self.width, self.height);
                 }
             }
 
@@ -2183,11 +2161,12 @@ component CalDayCell inherits Rectangle {
 }
 
 // 视图切换标签（分段控件里的一格）
+// 选中态只有白底、无边框：外层槽已有 1px 描边，tab 再画一圈就是双重边框
+//（实测截图如此）。层次靠 白底 vs 透明槽底 + 字重 600/400 区分。
 component TrafficTab inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
     in property <color> active-bg;
-    in property <color> active-border;
     in property <color> strong;
     in property <color> muted;
     callback picked();
@@ -2196,8 +2175,6 @@ component TrafficTab inherits Rectangle {
     width: 88px;
     border-radius: 6px;
     background: root.active ? root.active-bg : transparent;
-    border-width: root.active ? 1px : 0px;
-    border-color: root.active-border;
 
     Text {
         width: 100%;
@@ -2488,8 +2465,6 @@ export component TrafficStats inherits Window {
                         height: 32px;
                         background: root.c-panel;
                         border-radius: 8px;
-                        border-width: 1px;
-                        border-color: root.c-panel-border;
                         HorizontalLayout {
                             padding: 2px;
                             spacing: 2px;
@@ -2497,7 +2472,6 @@ export component TrafficStats inherits Window {
                                 label: "列表视图";
                                 active: root.view-index == 0;
                                 active-bg: #ffffff;
-                                active-border: root.c-panel-border;
                                 strong: root.c-text-strong;
                                 muted: root.c-text-muted;
                                 picked => {
@@ -2509,7 +2483,6 @@ export component TrafficStats inherits Window {
                                 label: "日历视图";
                                 active: root.view-index == 1;
                                 active-bg: #ffffff;
-                                active-border: root.c-panel-border;
                                 strong: root.c-text-strong;
                                 muted: root.c-text-muted;
                                 picked => {
@@ -2532,12 +2505,12 @@ export component TrafficStats inherits Window {
                             spacing: 10px;
 
                             // 工具栏：左侧统计方式，右侧图表比例
+                            // 只留浅底不加边框：里面的 ComboBox 是 fluent 风格自带
+                            // 描边 + 焦点环，容器再描一圈就是双重边框（实测截图如此）
                             Rectangle {
                                 height: 32px;
                                 background: root.c-panel;
                                 border-radius: 8px;
-                                border-width: 1px;
-                                border-color: root.c-panel-border;
                                 HorizontalLayout {
                                     padding-left: 12px;
                                     padding-right: 12px;

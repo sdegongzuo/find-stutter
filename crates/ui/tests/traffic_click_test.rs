@@ -15,8 +15,8 @@
 //!
 //! ## 覆盖的四个入口（互不串台）
 //!
-//! 1. 右列第三行「今日 ↑x ↓y」→ `traffic-clicked`（本窗口）
-//! 2. 中列第三行「今日卡顿 N」→ `event-count-clicked`，不触发 traffic
+//! 1. 中列第三行「今日 ↑x ↓y」→ `traffic-clicked`
+//! 2. 右列第三行「今日卡顿 N」→ `event-count-clicked`，不触发 traffic
 //! 3. 右列第二行「最近卡顿」无热区，不触发 traffic / pause
 //! 4. 左列 CPU 数值 → `resource-clicked("cpu")`，不触发 traffic
 //!
@@ -193,15 +193,15 @@ fn assert_all(w: f32, h: f32, tag: &str) {
     // （spacing 4px）。这里只做粗校验，真正的落点由扫描得出。
     let row3_y = (h - 62.0) / 2.0 + 44.0;
 
-    // ==== 断言 1：右列第三行「今日 ↑x ↓y」→ traffic-clicked ====
-    // 扫描范围：右半窗（x ∈ [55% w, w)）× 整高，步长 3px。
-    // 右列是 38% 宽、贴窗口右侧，55% 起点足以覆盖且不会扫到中列的「今日卡顿」。
-    let pts = scan_points(&win, (w * 0.55, w, 0.0, h), 3.0, &c.traffic);
+    // ==== 断言 1：中列第三行「今日 ↑x ↓y」→ traffic-clicked ====
+    // 扫描范围：中列大致区间 x ∈ [22%, 55%) × 整高，步长 3px。
+    // traffic-hit 自身限定中列第三行，扫整高也只会命中该入口。
+    let pts = scan_points(&win, (w * 0.22, w * 0.55, 0.0, h), 3.0, &c.traffic);
     let tb = bbox(&pts).unwrap_or_else(|| {
-        panic!("[{tag}] 右列第三行未扫到任何 traffic 命中点：入口热区缺失或不可点")
+        panic!("[{tag}] 中列第三行未扫到任何 traffic 命中点：入口热区缺失或不可点")
     });
     eprintln!(
-        "[{tag}] traffic 命中 {} 点，bbox x=[{:.1},{:.1}] y=[{:.1},{:.1}]（右列第三行 y≈{:.1}）",
+        "[{tag}] traffic 命中 {} 点，bbox x=[{:.1},{:.1}] y=[{:.1},{:.1}]（中列第三行 y≈{:.1}）",
         pts.len(),
         tb.0,
         tb.1,
@@ -211,16 +211,16 @@ fn assert_all(w: f32, h: f32, tag: &str) {
     );
     assert!(
         tb.2 >= row3_y - 8.0 && tb.3 <= row3_y + 20.0,
-        "[{tag}] traffic 热区应落在右列第三行，实测 y=[{:.1},{:.1}]，期望起点≈{:.1}",
+        "[{tag}] traffic 热区应落在中列第三行，实测 y=[{:.1},{:.1}]，期望起点≈{:.1}",
         tb.2,
         tb.3,
         row3_y
     );
     assert!(
-        tb.0 >= w * 0.5,
-        "[{tag}] traffic 热区跑出右列：min_x={:.1}，右列起点应 > {:.1}",
-        tb.0,
-        w * 0.5
+        tb.1 < w * 0.55,
+        "[{tag}] traffic 热区跑出中列：max_x={:.1}，中列止于≈{:.1}",
+        tb.1,
+        w * 0.55
     );
 
     let (tx, ty) = center(tb);
@@ -232,11 +232,11 @@ fn assert_all(w: f32, h: f32, tag: &str) {
         "[{tag}] 点击 ({tx}, {ty})（traffic 热区中心）应触发一次 traffic-clicked"
     );
 
-    // ==== 断言 2：中列第三行「今日卡顿 N」→ event-count-clicked，不串台 ====
-    // 扫描范围：中列大致区间 x ∈ [22%, 55%) × 整高，步长 3px。
-    let ev_pts = scan_points(&win, (w * 0.22, w * 0.55, 0.0, h), 3.0, &c.events);
+    // ==== 断言 2：右列第三行「今日卡顿 N」→ event-count-clicked，不串台 ====
+    // 扫描范围：右半窗 x ∈ [55%, w) × 整高，步长 3px。
+    let ev_pts = scan_points(&win, (w * 0.55, w, 0.0, h), 3.0, &c.events);
     let eb = bbox(&ev_pts)
-        .unwrap_or_else(|| panic!("[{tag}] 中列第三行未扫到任何 event-count 命中点"));
+        .unwrap_or_else(|| panic!("[{tag}] 右列第三行未扫到任何 event-count 命中点"));
     eprintln!(
         "[{tag}] event 命中 {} 点，bbox x=[{:.1},{:.1}] y=[{:.1},{:.1}]",
         ev_pts.len(),
