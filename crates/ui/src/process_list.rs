@@ -3023,9 +3023,7 @@ impl ProcessListWindow {
                     // （50ms 后）再看，避免「刚采完就点一下 → 请求被吞掉」。
                     let forced = sample_now_thread.load(Ordering::SeqCst);
                     let now = Instant::now();
-                    let forced_ready = forced
-                        && last_sample_at
-                            .is_none_or(|t| now.duration_since(t) >= MIN_MANUAL_SAMPLE_GAP);
+                    let forced_ready = manual_sample_ready(forced, last_sample_at, now);
                     if now >= deadline || forced_ready {
                         if forced {
                             sample_now_thread.store(false, Ordering::SeqCst);
@@ -4006,6 +4004,15 @@ fn header_text(list_interval_ms: u64) -> String {
     )
 }
 
+/// 手动触发（`sample_now`）此刻是否该真的采一帧。
+///
+/// 抽成纯函数是为了能单测「节流窗口」这个时序判据——它是 `load` 而非
+/// `swap` 语义的核心：被节流时调用方必须把请求留在原位，否则「刚采完
+/// 就点一下」那次的请求会被吞掉。
+fn manual_sample_ready(forced: bool, last: Option<Instant>, now: Instant) -> bool {
+    forced && last.is_none_or(|t| now.duration_since(t) >= MIN_MANUAL_SAMPLE_GAP)
+}
+
 /// 进程列表布局常量（逻辑像素）——与 overlay.slint `ProcessList` 布局**双源**：
 /// 列表从标题栏（~70px）下方开始，行高 29px。改动 slint 布局时需同步此处
 /// （hit_test_row 命中测试依赖）。
@@ -4251,6 +4258,30 @@ mod tests {
         assert!(t.contains("CPU 1s"), "标题缺 CPU 节奏: {t}");
         assert!(t.contains("30s"), "标题缺列表间隔: {t}");
         assert_eq!(header_text(5_000), "进程详情（CPU 1s · 其余 5s）");
+    }
+
+    /// 手动采样节流：500ms 窗口内跳过，且窗口外要放行。
+    ///
+    /// 配合调用方的 `load`（而非 `swap`）语义：被节流时请求留在原位，
+    /// 下一轮再判——否则「刚采完就点一下排序」那次的请求会被吞掉。
+    #[test]
+    fn manual_sample_throttles_within_gap() {
+        let now = Instant::now();
+        assert!(!manual_sample_ready(false, None, now), "没请求不该采");
+        assert!(manual_sample_ready(true, None, now), "首轮没有基准，必须采");
+        assert!(!manual_sample_ready(true, Some(now), now), "刚采过应跳过");
+        assert!(
+            !manual_sample_ready(
+                true,
+                Some(now - MIN_MANUAL_SAMPLE_GAP + Duration::from_millis(1)),
+                now
+            ),
+            "差 1ms 未到窗口，应跳过"
+        );
+        assert!(
+            manual_sample_ready(true, Some(now - MIN_MANUAL_SAMPLE_GAP), now),
+            "满 500ms 应放行"
+        );
     }
 
     /// CPU 轻量刷新：必须真能拿到非零值，且不能破坏全量采样填好的字段。
