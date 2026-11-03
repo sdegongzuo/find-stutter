@@ -2279,10 +2279,13 @@ component TrafficListRow inherits Rectangle {
             horizontal-alignment: right;
             overflow: elide;
         }
-        // 图表列：垂直居中一条 1px 基线，条形叠在基线上（不再铺满整列的灰槽）
+        // 图表列：垂直居中一条 1px 基线，条形叠在基线上（不再铺满整列的灰槽）。
+        // 本列必须 height:100% 撑满行：HorizontalLayout 会把固定高度的子元素
+        // 顶对齐，8px 的小组件贴在 24px 行顶、条形骑在行边界上（实测截图如此）；
+        // 改为撑满后由内部两个矩形各自按行高垂直居中。
         Rectangle {
             horizontal-stretch: 1;
-            height: 8px;
+            height: 100%;
 
             Rectangle {
                 y: (parent.height - 1px) / 2;
@@ -2291,8 +2294,9 @@ component TrafficListRow inherits Rectangle {
                 background: root.divider;
             }
             Rectangle {
+                y: (parent.height - 8px) / 2;
                 width: data.ratio > 0 ? parent.width * data.ratio : 0px;
-                height: 100%;
+                height: 8px;
                 background: @linear-gradient(90deg, #f2c56b 0%, #e8912e 100%);
                 border-radius: 4px;
             }
