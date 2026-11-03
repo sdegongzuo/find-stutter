@@ -83,7 +83,13 @@ pub struct DbReader {
     /// 累计值变化慢，而 SUM 需扫过当日全部样本行（一天最多 ~8.6 万行），
     /// 1Hz 全量重算纯属浪费；10s 刷新粒度对「累计流量」显示足够。
     traffic_refresh_every: u32,
-    traffic_tick: std::cell::Cell<u32>,
+    /// 流量求和的节流计数器。
+    ///
+    /// 用 `AtomicU32` 而非 `Cell<u32>`：`DbReader` 要能被后台 poller 线程独占
+    /// 调用（见 lib.rs 的 `db-poller`），而 `Cell` 不是 `Sync`，会让
+    /// `Arc<DbReader>` 失去 `Send`，进而无法跨线程。原子写的成本在纳秒级，
+    /// 相对一次 sqlite 查询完全可忽略。
+    traffic_tick: std::sync::atomic::AtomicU32,
     /// 最近一次流量统计缓存：`(今日 (sent, recv), 本周 (sent, recv))`。
     /// db 打不开时也返回缓存而非清零，避免界面数字闪烁。
     traffic_cache: Mutex<((u64, u64), (u64, u64))>,
@@ -106,7 +112,7 @@ impl DbReader {
             conn: Mutex::new(None),
             stale_threshold: Duration::from_secs(5),
             traffic_refresh_every: TRAFFIC_REFRESH_EVERY,
-            traffic_tick: std::cell::Cell::new(0),
+            traffic_tick: std::sync::atomic::AtomicU32::new(0),
             traffic_cache: Mutex::new(((0, 0), (0, 0))),
         }
     }
@@ -241,8 +247,10 @@ impl DbReader {
         // net_*_total（开机累计、重启清零）。每 traffic_refresh_every 次 poll 才真正
         // 查库一次，其余 tick 读缓存（SUM 需扫当日全部样本行，逐秒重算太浪费）。
         let (today_net_bytes, week_net_bytes) = {
-            let refresh = self.traffic_tick.get() % self.traffic_refresh_every == 0;
-            self.traffic_tick.set(self.traffic_tick.get().wrapping_add(1));
+            let tick = self
+                .traffic_tick
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let refresh = tick % self.traffic_refresh_every == 0;
             let mut cache = self.traffic_cache.lock();
             if refresh {
                 let (t0, t1) = find_stutter_core::logger::local_today_bounds();

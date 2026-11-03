@@ -25,12 +25,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, HWND_TOP,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
     SW_RESTORE, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT, HTTOP,
-    HTTOPLEFT, HTTOPRIGHT, WM_GETMINMAXINFO, WM_NCHITTEST, WM_NCLBUTTONDOWN,
-    WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_THICKFRAME, MINMAXINFO,
+    HTTOPLEFT, HTTOPRIGHT, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_NCHITTEST,
+    WM_NCLBUTTONDOWN, WM_SYSCOMMAND, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_THICKFRAME, MINMAXINFO,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 
 use crate::Overlay;
+
+/// 「用户正在拖动窗口边框 / 标题栏」——Windows 原生模态尺寸循环是否进行中。
+///
+/// 由 [`native_resize_proc`] 在 `WM_ENTERSIZEMOVE` / `WM_EXITSIZEMOVE` 处维护。
+/// 用途：拖拽期间窗口尺寸由用户手指驱动，任何定时重绘 / 几何对账都只是在
+/// 同一线程上抢帧——只会把拖拽拖慢，不会让用户看到更正确的画面。
+///
+/// 进程级单一标志足够：鼠标捕获是进程内独占的，同一时刻只可能有一个窗口
+/// 处于拖拽循环中。
+static SIZE_MOVE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 原生拖拽（移动 / 缩放）模态循环是否进行中。
+pub fn size_move_active() -> bool {
+    SIZE_MOVE_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// 设置/取消点击穿透
 pub fn set_click_through_for(window: &Overlay, enable: bool) -> Result<(), String> {
@@ -1106,8 +1122,38 @@ unsafe extern "system" fn native_resize_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    // 消息级耗时探针（`FIND_STUTTER_PROF=1` 开启）：窗口线程在这条消息上花了多久。
+    //
+    // 拖拽卡顿的定位靠这个：`SendMessageTimeout` 只能告诉你「线程这一拍被卡了」，
+    // 卡在哪条消息上必须在这里看——是 WM_SIZE（重排 + 整窗重绘）、还是恰好撞上
+    // 某个定时器回调被塞进模态循环派发。
+    let prof = PROF_ENABLED.get_or_init(|| {
+        std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1")
+    });
+    let t0 = std::time::Instant::now();
     // SAFETY：本回调由系统在窗口线程上调用；全部裸调用仅操作本窗口的
     // 矩形/尺寸信息，不跨线程共享可变状态
+    let result = unsafe { native_resize_handle(hwnd, msg, wparam, lparam) };
+    // 以下两类消息的耗时**等于整段拖拽时长**（它们是进入模态循环的入口，
+    // 循环返回后消息才返回），必须排除，否则每次拖拽都刷一条「几秒」的假尖峰：
+    // - `WM_NCLBUTTONDOWN`：我们直通 `DefWindowProcW` 的那条
+    // - `WM_SYSCOMMAND`：`DefWindowProcW` 内部把按下翻译成 `SC_SIZE`/`SC_MOVE`
+    //   后再次进入同一个循环
+    if *prof && msg != WM_NCLBUTTONDOWN && msg != WM_SYSCOMMAND {
+        let ms = t0.elapsed().as_millis();
+        if ms >= 50 {
+            log::warn!("[PROF] 窗口线程 msg=0x{:04X} 处理 {}ms", msg, ms);
+        }
+    }
+    result
+}
+
+/// 探针开关缓存（每个进程只读一次环境变量）。
+static PROF_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 子类过程的实际消息处理（拆出来是为了让 [`native_resize_proc`] 能在外层计时，
+/// 不必在每个 `return` 分支上重复埋点）。
+unsafe fn native_resize_handle(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
         WM_NCHITTEST => {
@@ -1139,6 +1185,17 @@ unsafe extern "system" fn native_resize_proc(
                 ensure_sizebox_style(hwnd);
                 return DefWindowProcW(hwnd, msg, wparam, lparam);
             }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        // 拖拽模态循环的进出：置位 / 清除「正在拖拽」标志。
+        // 只做一次原子写，之后透传给 winit（它靠这两个消息维护内部状态，
+        // 必须继续传递）。
+        WM_ENTERSIZEMOVE => {
+            SIZE_MOVE_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+        WM_EXITSIZEMOVE => {
+            SIZE_MOVE_ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
         WM_GETMINMAXINFO => {

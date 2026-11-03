@@ -58,6 +58,43 @@ slint::include_modules!();
 /// 1Hz 轮询 tick 周期
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// 选择渲染后端：**默认软件光栅化**（`renderer-software`）。
+///
+/// ## 为什么不用 femtovg / OpenGL 作默认
+///
+/// 2026-11-03 针对「进程详情页连续拖放卡顿和延迟」实测：本机主屏（3120×2080）
+/// 由虚拟显示适配器驱动（`Win32_VideoController` 里同时挂着
+/// `Honor Virtual Display Device` / `GameViewer Virtual Display Adapter` /
+/// `IddDesk Device`），femtovg 在这种显示路径上提交帧会被反复阻塞——
+///
+/// | 渲染器 | 每步窗口线程阻塞（120 步 × 3px / 8ms） |
+/// |--------|----------------------------------------|
+/// | femtovg (GL) | 中位 3ms，**最大 2828ms**，全程带 300–2000ms 长尾 |
+/// | software     | 中位 5.3ms，**最大 12.9ms**，两轮完全一致 |
+///
+/// 也就是说 GL 的帧提交延迟直接变成了「拖一下卡一下」。本程序是纯 2D 小界面
+/// （悬浮窗 + 进程列表 + 折线图），软件光栅化的代价完全可接受：拖拽期间单核
+/// ~70%（只在重绘时消耗），静止时只在属性变化时重绘。
+///
+/// 保留覆盖入口：显式设置了 `SLINT_BACKEND`（如 `SLINT_BACKEND=winit-femtovg`）
+/// 时不干预，便于在有正经 GPU 的机器上换回 GL。
+fn select_renderer() {
+    if std::env::var_os("SLINT_BACKEND").is_some() {
+        log::info!("检测到 SLINT_BACKEND，跳过渲染器默认选择");
+        return;
+    }
+    match slint::BackendSelector::new()
+        .backend_name("winit".into())
+        .renderer_name("software".into())
+        .select()
+    {
+        Ok(()) => log::info!("渲染后端: winit + software（软件光栅化）"),
+        // 选不上不致命：`select` 失败时 Slint 会走它自己的默认后端，
+        // 功能照常，只是可能重新引入 GL 帧提交抖动。
+        Err(e) => log::warn!("软件渲染器选择失败，回退 Slint 默认后端: {}", e),
+    }
+}
+
 /// 启动 UI overlay（只读模式）。
 ///
 /// 加载 config.toml → 构造 `DbReader` → 起 1Hz 定时器 → 启动 Slint 事件循环。
@@ -69,6 +106,8 @@ pub fn run() -> anyhow::Result<()> {
     // 没有落盘日志的话「进程突然消失」将无从取证（panic 也不会进 WER）。
     logging::init();
     logging::install_panic_hook();
+
+    select_renderer();
 
     let mut config = find_stutter_core::Config::load("config.toml").unwrap_or_else(|e| {
         log::warn!("config load failed ({}), using defaults", e);
@@ -453,10 +492,46 @@ pub fn run() -> anyhow::Result<()> {
             None
         };
 
-    // 4) 1Hz 轮询：reader.poll() → 推送到 Slint
+    // 4) 1Hz 轮询：**DB 读取放后台线程**，UI 线程只负责取最新结果并推给 Slint。
+    //
+    // 为什么必须分线程（2026-11-03 实测）：`poll_light()` 每 10 次 tick 会跑一次
+    // 「今日 + 本周累计网络流量」`SUM(net_*_bps) FROM samples WHERE timestamp
+    // BETWEEN …`，在本机 28 万行的 samples 上是 180–230ms 的索引范围扫描。这条
+    // 查询跑在 UI 线程上时，用户拖窗口边缘只要撞上它，整个原生尺寸循环就停摆
+    // 200ms —— 表现为「连续拖放卡顿和延迟」（探针 `FIND_STUTTER_PROF=1` 的
+    // `[PROF] 1Hz tick 2xx ms（poll 2xx ms / …）` 就是它）。
+    //
+    // 查询成本还会随 samples 保留量增长（30 天 retention 可达数百万行），
+    // 所以这里不是「把间隔调大」而是彻底移出 UI 线程：无论查询多慢，UI 线程
+    // 只是 `try_recv` 一次（纳秒级），慢了最多晚一拍刷新，绝不阻塞窗口。
+    let (poll_tx, poll_rx) = std::sync::mpsc::channel::<PollResult>();
+    {
+        let reader_for_thread = reader.clone();
+        let prof_thread = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
+        std::thread::Builder::new()
+            .name("db-poller".into())
+            .spawn(move || loop {
+                let t0 = std::time::Instant::now();
+                let poll = reader_for_thread.poll_light();
+                if prof_thread {
+                    let ms = t0.elapsed().as_millis();
+                    if ms >= 20 {
+                        log::info!("[PROF] 后台 poll_light {}ms", ms);
+                    }
+                }
+                // 发送失败 = UI 已退出（接收端 drop）→ 结束线程
+                if poll_tx.send(poll).is_err() {
+                    break;
+                }
+                let spent = t0.elapsed();
+                if spent < POLL_INTERVAL {
+                    std::thread::sleep(POLL_INTERVAL - spent);
+                }
+            })
+            .ok();
+    }
     let timer = Timer::default();
     let weak_ui = ui.as_weak();
-    let reader_for_tick = reader.clone();
     let state_for_tick = state.clone();
     let tray_for_tick = tray.clone();
     let taskbar_for_tick = taskbar.clone();
@@ -499,10 +574,30 @@ pub fn run() -> anyhow::Result<()> {
             }
         });
     }
+    // 「连续拖放卡顿」排查探针：`FIND_STUTTER_PROF=1` 时每个 1Hz tick 打印
+    // 各段耗时（DB 轮询 / 状态更新 / 推 Slint）。默认关闭且一次也不写日志。
+    //
+    // 为什么需要：边缘拖拽走 Windows 原生模态尺寸循环，UI 线程在这期间仍要
+    // 派发这个 tick——tick 里任何一段阻塞都会直接变成「拖拽卡一拍」，而
+    // 单看总耗时无法区分是 sqlite 读、状态合并还是 Slint 属性写入。
+    let prof_tick = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
     timer.start(
         slint::TimerMode::Repeated,
         POLL_INTERVAL,
         move || {
+            // 用户正拖着某个窗口的边框 / 标题栏：这一拍整体让路。
+            //
+            // 拖拽期间窗口尺寸由 Windows 原生模态循环驱动，UI 线程上任何额外
+            // 工作（写 Slint 属性 → 触发另一次重绘、守护窗口样式、消费托盘命令）
+            // 都是在和用户的鼠标抢同一帧。数据晚一拍推送完全不可感知（拖拽本身
+            // 也就一两秒），拖拽结束后第一个 tick 立刻恢复正常。
+            if crate::window::size_move_active() {
+                return;
+            }
+            let prof_t0 = std::time::Instant::now();
+            let prof_poll;
+            let prof_state;
+            let prof_push;
             // -2) 守护窗口样式（winit 在 show / 状态变化时会重算扩展样式）：
             //     悬浮窗 + 伪任务栏 + 资源区临时弹窗 = 工具窗口（不进系统任务栏、不进 Alt-Tab）；
             //     进程详情页 + 卡顿分析页 = 普通应用窗口（要留在任务栏，作为
@@ -575,22 +670,37 @@ pub fn run() -> anyhow::Result<()> {
             }
 
             let paused = state_for_tick.lock().paused;
-            // overlay 只显示上次卡顿时间，走轻量查询（只读 timestamp 列，
-            // 省掉 snapshot/culprits 两个大 JSON 的每 tick 反序列化）。
-            let poll: PollResult = reader_for_tick.poll_light();
+            // 后台线程（db-poller）把结果投进 channel：这里只取最新一条——UI 线程
+            // 被长时间占用后 channel 里可能积压多条，逐条 apply 毫无意义（只有
+            // 最后一帧会显示），直接跳到最新。
+            let prof_a = std::time::Instant::now();
+            let mut latest: Option<PollResult> = None;
+            while let Ok(p) = poll_rx.try_recv() {
+                latest = Some(p);
+            }
+            prof_poll = prof_a.elapsed().as_millis();
             // 1) 更新共享状态（暂停时也保持数据新鲜，恢复后立即显示最新值）
-            state_for_tick.lock().update_from_poll(&poll);
-            // 1b) P2：检测到新的 Major/Critical 事件 → 弹系统通知（暂停时不弹）
-            if !paused {
-                let mut s = state_for_tick.lock();
-                if let Some(ev) = &poll.event {
-                    if crate::notify::should_notify(s.last_notified_at, ev, &config.notifications) {
-                        s.last_notified_at = Some(ev.timestamp);
-                        crate::notify::show_stutter_notification(ev);
+            let prof_b = std::time::Instant::now();
+            if let Some(poll) = &latest {
+                state_for_tick.lock().update_from_poll(poll);
+                // 1b) P2：检测到新的 Major/Critical 事件 → 弹系统通知（暂停时不弹）
+                if !paused {
+                    let mut s = state_for_tick.lock();
+                    if let Some(ev) = &poll.event {
+                        if crate::notify::should_notify(
+                            s.last_notified_at,
+                            ev,
+                            &config.notifications,
+                        ) {
+                            s.last_notified_at = Some(ev.timestamp);
+                            crate::notify::show_stutter_notification(ev);
+                        }
                     }
                 }
             }
+            prof_state = prof_b.elapsed().as_millis();
             // 2) 推到 Slint（窗口已关闭时不操作；暂停时冻结指标显示）
+            let prof_c = std::time::Instant::now();
             if !paused {
                 if let Some(ui) = weak_ui.upgrade() {
                     let mut s = state_for_tick.lock();
@@ -615,6 +725,19 @@ pub fn run() -> anyhow::Result<()> {
                     slint::Color::from_rgb_u8(0x8a, 0x8a, 0x92),
                 ));
             } _ => {}}}
+            prof_push = prof_c.elapsed().as_millis();
+            if prof_tick {
+                let total = prof_t0.elapsed().as_millis();
+                if total >= 5 {
+                    log::info!(
+                        "[PROF] 1Hz tick {}ms（poll {}ms / state {}ms / push {}ms）",
+                        total,
+                        prof_poll,
+                        prof_state,
+                        prof_push
+                    );
+                }
+            }
         },
     );
 

@@ -2912,6 +2912,7 @@ impl ProcessListWindow {
         let sampler_handle = std::thread::Builder::new()
             .name("process-sampler".into())
             .spawn(move || {
+                let prof = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
                 let mut deadline = Instant::now(); // 首轮立即采样
                 let mut svc_deadline = Instant::now(); // 首轮立即枚举服务
                 loop {
@@ -2920,6 +2921,7 @@ impl ProcessListWindow {
                     }
                     let forced = sample_now_thread.swap(false, Ordering::SeqCst);
                     if Instant::now() >= deadline || forced {
+                        let t_sample = Instant::now();
                         let rows = {
                             let mut s = sampler_thread.lock().unwrap();
                             let rows = s.sample();
@@ -2928,6 +2930,14 @@ impl ProcessListWindow {
                         };
                         *cache_thread.lock().unwrap() = rows;
                         *version_thread.lock().unwrap() += 1;
+                        // 采样本身跑在后台线程，但它会吃满一个核并抢 cache 锁；
+                        // 拖拽时若与渲染抢 CPU，同样表现为掉帧 → 一并计入探针
+                        if prof {
+                            let ms = t_sample.elapsed().as_millis();
+                            if ms >= 20 {
+                                log::info!("[PROF] 采样线程 sample() {}ms", ms);
+                            }
+                        }
                         deadline = Instant::now()
                             + Duration::from_millis(
                                 (*refresh_thread.lock().unwrap()).clamp(200, 60_000),
@@ -3371,16 +3381,34 @@ impl ProcessListWindow {
         let timer_for_first = tick_timer.clone();
         let first_done = Arc::new(AtomicBool::new(false));
         let first_done_cb = first_done.clone();
+        // 拖拽卡顿探针（`FIND_STUTTER_PROF=1` 开启）：这拍的几何对账 / 重绘
+        // 各花多少毫秒。拖拽走原生模态尺寸循环时本项目所有 Slint 定时器仍在
+        // 同一线程派发，这里任何一段变慢都会直接体现为「拖一下卡一下」。
+        let prof_tick = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
         tick_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_millis(150),
             move || {
                 if let Some(ui) = weak_tick.upgrade() {
+                    // 用户正拖着边框/标题栏：这一拍整体跳过。
+                    //
+                    // 拖拽期间窗口尺寸由原生模态循环驱动，Slint 已经会按新的
+                    // 尺寸重排 + 重绘；此时再叠加一次全量 render（克隆整份缓存
+                    // + 分组排序 + set_row_data 差量比较）和一次几何对账，
+                    // 都是在同一个线程上和用户的拖拽抢帧 —— 只会让边缘跟手
+                    // 变差，而用户看到的数据晚一个刷新周期完全无感（拖拽本身
+                    // 只有一两秒）。拖拽结束后第一个 tick 立刻恢复正常刷新。
+                    if crate::window::size_move_active() {
+                        return;
+                    }
+                    let prof_t0 = Instant::now();
                     // 几何对账兜底：拖拽写回丢失的尺寸同步若未被前两处
-                    // （按下/写回后）捕获，最迟在下一个刷新周期内自愈
+                    // （按下 / 写回后）捕获，最迟在下一个刷新周期内自愈
                     if ui.window().is_visible() {
                         crate::window::reconcile_geometry(ui.window());
                     }
+                    let prof_rec = prof_t0.elapsed().as_millis();
+                    let prof_r0 = Instant::now();
                     render(
                         &ui,
                         &cache_tick,
@@ -3389,6 +3417,16 @@ impl ProcessListWindow {
                         &expanded_tick,
                         &shared_tick,
                     );
+                    if prof_tick {
+                        let rend = prof_r0.elapsed().as_millis();
+                        if prof_rec + rend >= 5 {
+                            log::info!(
+                                "[PROF] 详情页 tick 对账 {}ms / render {}ms",
+                                prof_rec,
+                                rend
+                            );
+                        }
+                    }
                     // 首帧渲染到非空数据 → 恢复正常刷新节奏（只切一次，
                     // 之后间隔由标题栏下拉回调管理）
                     let has_data = !cache_data_tick.lock().unwrap().is_empty();
