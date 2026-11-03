@@ -552,6 +552,12 @@ impl ProcessSampler {
         // Chromium 家族（WebView2/Edge/Chrome）pid → 角色（命令行 --type 解析，供展示名标注）
         let mut roles: HashMap<u32, ChromiumRole> = HashMap::new();
 
+        // 免句柄内存兜底（懒初始化，Option 区分「未拉过」与「拉了但为空」：
+        // 快照失败返回空表时不能每行都重拉一次 4MB 快照）：存在 OpenProcess
+        // 被拒的进程时才拉一次内核快照（受保护/SYSTEM 进程，
+        // 见 system_process_memory_snapshot 注释）
+        let mut mem_fallback: Option<HashMap<u32, (u64, u64, u64)>> = None;
+
         for (pid, p) in self.sys.processes() {
             let pid_u32 = pid.as_u32();
             // 一次句柄取 IO 计数器 + 内存明细（热路径合并，见函数注释）
@@ -577,10 +583,22 @@ impl ProcessSampler {
             // 内存双口径（任务管理器对齐，一次 GetProcessMemoryInfo 取全）：
             // - 提交大小（Commit Size = PagefileUsage）→「详细信息」页「内存」列
             // - 专用工作集（Private Working Set = PrivateWorkingSetSize）→「进程」页「内存」列
-            // 取不到（权限不足 / 进程已退出）时回退 sysinfo 的工作集，避免显示 0。
+            // 取不到（DACL 拒绝的受保护/SYSTEM 进程）时回退免句柄内核快照
+            // （口径近似：提交大小同义，工作集是全 WS 略大于专用工作集），
+            // 快照也没有（已退出等）再回退 sysinfo 工作集，避免错误显示 0。
             let ws = p.memory();
-            let mem = detail.map_or(ws, |d| d.0); // 提交大小
-            let pws = detail.map_or(ws, |d| d.1); // 专用工作集
+            let (mem, pws) = match detail {
+                Some(d) => (d.0, d.1),
+                None => {
+                    if mem_fallback.is_none() {
+                        mem_fallback = Some(system_process_memory_snapshot());
+                    }
+                    match mem_fallback.as_ref().and_then(|m| m.get(&pid_u32)) {
+                        Some(&(commit, working_set, _)) => (commit, working_set),
+                        None => (ws, ws),
+                    }
+                }
+            };
             // 监听/UDP 端口：port_map 里有就取，没有就是空（绝大多数进程无端口）
             let ports = self.port_cache.get(&pid_u32).cloned().unwrap_or_default();
             let net_stat = net_map.get(&pid_u32).copied().unwrap_or_default();
@@ -2064,6 +2082,82 @@ fn process_io_and_memory(pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
 #[cfg(not(windows))]
 fn process_io_and_memory(_pid: u32) -> (IoSnapshot, Option<(u64, u64, u64)>) {
     (IoSnapshot { read: 0, write: 0 }, None)
+}
+
+/// 免句柄内存兜底：`NtQuerySystemInformation(SystemProcessInformation)` 全量快照。
+///
+/// 背景（2026-11-03 实测）：部分 SYSTEM 服务进程（如 HONOR 预装的
+/// HnCloudService / HnRSMService 等）的 DACL 拒绝普通用户 OpenProcess，
+/// 导致 GetProcessMemoryInfo 失败——我们直调的与 sysinfo 内部用的是同一
+/// API（sysinfo 0.39.6 `process.rs` L312-327 同样依赖 OpenProcess 句柄），
+/// 双双失败后内存列错误显示 0（实测同 PID `Get-Process` 有 27~90MB）。
+///
+/// 该快照走内核枚举，**不需要进程句柄、不受 DACL 限制**（任务管理器
+/// 非提权也能看到 SYSTEM 进程内存的同款路径）。仅在存在读不到内存的
+/// 进程时每 tick 调一次（几百进程约几 MB，`Get-Process` 同款成本）。
+///
+/// 返回 pid → (提交大小 `PagefileUsage`，工作集 `WorkingSetSize`，
+/// 专用页 `PrivatePageCount`)。用 crate 自带结构体，不手写布局。
+#[cfg(windows)]
+fn system_process_memory_snapshot() -> HashMap<u32, (u64, u64, u64)> {
+    use windows::Wdk::System::SystemInformation::{
+        NtQuerySystemInformation, SystemProcessInformation,
+    };
+    use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESS_INFORMATION;
+
+    const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004u32 as i32;
+    const ENTRY_SIZE: usize = std::mem::size_of::<SYSTEM_PROCESS_INFORMATION>();
+    let mut out: HashMap<u32, (u64, u64, u64)> = HashMap::new();
+    // 缓冲从 4MB 起步，INFO_LENGTH_MISMATCH 时按系统提示长度翻倍重试
+    let mut buf_len: u32 = 4 * 1024 * 1024;
+    for _ in 0..5 {
+        let mut buf = vec![0u8; buf_len as usize];
+        let mut need: u32 = 0;
+        let nt = unsafe {
+            NtQuerySystemInformation(
+                SystemProcessInformation,
+                buf.as_mut_ptr() as _,
+                buf_len,
+                &mut need,
+            )
+        };
+        if nt.is_ok() {
+            // 链表逐项解析（NextEntryOffset=0 表示最后一项）
+            let mut offset = 0usize;
+            while offset + ENTRY_SIZE <= buf.len() {
+                let entry = unsafe {
+                    buf.as_ptr()
+                        .add(offset)
+                        .cast::<SYSTEM_PROCESS_INFORMATION>()
+                        .read_unaligned()
+                };
+                // UniqueProcessId 是 HANDLE 承载的 pid；0 是 System Idle Process，跳过
+                let pid = entry.UniqueProcessId.0 as u32;
+                if pid != 0 {
+                    out.insert(
+                        pid,
+                        (
+                            entry.PagefileUsage as u64,
+                            entry.WorkingSetSize as u64,
+                            entry.PrivatePageCount as u64,
+                        ),
+                    );
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += entry.NextEntryOffset as usize;
+            }
+            return out;
+        } else if nt.0 == STATUS_INFO_LENGTH_MISMATCH && need > 0 {
+            buf_len = need.max(buf_len.saturating_mul(2)).min(64 * 1024 * 1024);
+        } else {
+            // 其它 NTSTATUS（理论上不该发生）：放弃兜底，保持空表
+            log::debug!("NtQuerySystemInformation(SystemProcessInformation) 失败: {:?}", nt);
+            return out;
+        }
+    }
+    out
 }
 
 /// 枚举当前运行的 Windows 服务 → pid → 服务显示名列表。
@@ -3652,6 +3746,23 @@ mod tests {
             ports: Vec::new(),
             status: "运行中".into(),
         }
+    }
+
+    // ===== 免句柄内存兜底（真实 Win32，仅 Windows）=====
+
+    /// 快照应能拿到全部进程（含 DACL 拒绝 OpenProcess 的 SYSTEM 进程），
+    /// 且本测试进程自身的内存非 0（回归 2026-11-03「内存列错误显示 0」）。
+    #[cfg(windows)]
+    #[test]
+    fn memory_fallback_snapshot_contains_self_with_nonzero_mem() {
+        let snap = system_process_memory_snapshot();
+        // 系统至少有几十个进程；拿不到说明快照本身失败
+        assert!(snap.len() >= 10, "快照进程数异常少: {}", snap.len());
+        let (commit, ws, _private) = snap
+            .get(&std::process::id())
+            .copied()
+            .expect("快照必须包含自身测试进程");
+        assert!(commit > 0 && ws > 0, "自身进程内存为 0: commit={commit} ws={ws}");
     }
 
     // ===== 窗口边缘 resize 坐标计算 =====
