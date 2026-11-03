@@ -4,7 +4,8 @@
 //!
 //! ## 任务管理器风格特性
 //!
-//! - **1Hz 实时刷新**：窗口打开期间 `Timer` 每秒重采（非一次性快照）
+//! - **CPU 1Hz、其余按间隔**：CPU 列每秒独立轻量重采（任务管理器口径），
+//!   端口 / 网络 / 磁盘 IO / 内存明细按标题栏下拉的间隔重采（默认 30s）
 //! - **列头点击排序**：PID / 名称 / CPU / 内存 / 磁盘 / 网络 六列可排序
 //!   （点击切方向；箭头显示当前排序列）
 //! - **CPU 归一化**：`cpu_usage / 核数` → 0~100%（占满全部核 = 100%），
@@ -32,6 +33,20 @@
 //! sysinfo 的 `cpu_usage` 是「两次采样增量 ÷ 系统增量 × 核数」，必须
 //! **复用同一个 `System` 实例**持续采样；每次新建会丢基线导致首采失真。
 //! 本模块持有 `Mutex<System>` 供刷新循环复用。
+//!
+//! ## 两条采样节拍（2026-11-03 修「CPU 数据不对」）
+//!
+//! - **CPU 固定 1s**（[`CPU_REFRESH_MS`]，`refresh_cpu_only`）：cpu_usage 是
+//!   两次刷新之间的**平均值**，跟着列表间隔（默认 30s）走就变成 30 秒均值，
+//!   突发负载被抹平——实测同一时刻 DoubaoWork 界面 0.5%，PDH 2s 采样 1.5~2%。
+//!   1s 才与任务管理器同窗口。只读 `GetProcessTimes`，几百进程几毫秒。
+//! - **其余列跟随下拉间隔**（默认 30s）：端口表 + 网络查询 + 每进程 IO/内存，
+//!   几十毫秒级，不能高频。
+//!
+//! 两个坑：① 两次 per-process 刷新间隔小于 `MINIMUM_CPU_UPDATE_INTERVAL`
+//! （Windows 200ms）时 sysinfo **不计算**、沿用旧值（初值 0），所以
+//! `sample()` 会先补足间隔；② `new()` 后的首轮同理，不补就会「窗口打开
+//! 第一屏 CPU 全 0.0%」。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -97,6 +112,11 @@ pub struct ProcessSampler {
     prev_io: HashMap<u32, IoSnapshot>,
     /// 上次采样时刻
     prev_time: Option<Instant>,
+    /// 上次 **per-process** 刷新时刻。sysinfo 的 cpu_usage 是两次刷新之间的增量，
+    /// 间隔小于 `MINIMUM_CPU_UPDATE_INTERVAL`（Windows 200ms）时它不计算、直接沿用
+    /// 旧值（初值 0）。`new()` 刚建过基线，首轮采样必须补足最小间隔，否则打开窗口
+    /// 第一屏 CPU 全是 0.0%。
+    last_refresh_at: Option<Instant>,
     /// 全机物理内存（字节；sample() 时更新，聚合行内存占比用）
     total_mem: u64,
     /// 上次采样的 pid → 端口列表（sample() 期间重新枚举；
@@ -116,6 +136,19 @@ struct IoSnapshot {
     read: u64,
     write: u64,
 }
+
+/// sysinfo 重算 per-process CPU 的最小间隔（Windows 下 `MINIMUM_CPU_UPDATE_INTERVAL`
+/// 是 200ms）。不足这个间隔时它**不计算**、沿用旧值（初值 0），所以两次
+/// per-process 刷新必须拉开 ≥200ms。这里取 220ms 留一点余量。
+const MIN_CPU_UPDATE: Duration = Duration::from_millis(220);
+
+/// CPU 列的独立采样节拍（毫秒）。
+///
+/// 必须与「列表刷新间隔」解耦：sysinfo 的 cpu_usage 是两次刷新之间的平均值，
+/// 跟着 30s 的列表间隔走就变成 30 秒平均值，突发负载被完全抹平（实测同一
+/// 时刻 DoubaoWork 界面 0.5% / PDH 2s 采样 1.5~2%）。固定 1s 与任务管理器
+/// 同窗口，才谈得上「数据对得上」。
+const CPU_REFRESH_MS: u64 = 1_000;
 
 /// 网络速率的平滑窗口（秒）：窗口内多行求平均，纯 1 秒瞬时值抖动太大。
 ///
@@ -523,10 +556,35 @@ impl ProcessSampler {
             sys,
             prev_io: HashMap::new(),
             prev_time: None,
+            // 这里刚刷新过一遍 → 首轮 sample() 需要等过 sysinfo 的最小更新间隔
+            last_refresh_at: Some(Instant::now()),
             port_cache: HashMap::new(),
             name_cache: HashMap::new(),
             net: ProcessNetReader::new(db_path),
         }
+    }
+
+    /// CPU 专用轻量刷新：只取 per-process CPU 时间，不碰内存 / 命令行 / IO 计数器。
+    ///
+    /// 用于把 CPU 列从「跟随列表刷新间隔（默认 30s）的平均值」里解耦出来，按
+    /// 1s 节拍独立更新——任务管理器也是 1s 窗口，两者口径才对得上。单进程
+    /// 只有一次 `GetProcessTimes`，499 进程实测几毫秒，1Hz 常驻开销可忽略；
+    /// 全量 `sample()`（端口表 + 网络查询 + 每进程 IO/内存）仍按列表间隔跑。
+    ///
+    /// 返回 `pid → cpu_usage`（sysinfo 原始口径：0~100×核数，显示前再归一化）。
+    /// 新出现的进程在这里只拿到 CPU（其余字段为空），等下一次全量 sample 补全行。
+    pub fn refresh_cpu_only(&mut self) -> HashMap<u32, f32> {
+        self.sys.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_cpu(),
+        );
+        self.last_refresh_at = Some(Instant::now());
+        self.sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.cpu_usage()))
+            .collect()
     }
 
     /// 采集一次快照（全量，不截断）。
@@ -535,11 +593,23 @@ impl ProcessSampler {
     /// 显示阶段再按聚合后的行数限制，避免「同组部分实例被截掉、
     /// 剩下的看起来像独立进程」。
     pub fn sample(&mut self) -> Vec<ProcessRow> {
+        // 距上次 per-process 刷新不足 sysinfo 的最小更新间隔时，它不会重算
+        // cpu_usage（沿用旧值）。首轮 new() 后立刻采样正好撞上这个窗口，
+        // 表现为「窗口刚打开时 CPU 列全是 0.0%」。补足间隔——本函数跑在
+        // 采样线程，sleep 不影响 UI。
+        if let Some(t) = self.last_refresh_at {
+            let elapsed = t.elapsed();
+            if elapsed < MIN_CPU_UPDATE {
+                std::thread::sleep(MIN_CPU_UPDATE - elapsed);
+            }
+        }
+
         // 精确刷新（进程 + CPU + 内存）：refresh_all 每轮还会枚举磁盘 /
         // 网络接口 / 组件，本页不用，纯浪费（每 tick 都付一次）
         self.sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         self.sys.refresh_cpu_all();
         self.sys.refresh_memory();
+        self.last_refresh_at = Some(Instant::now());
 
         let now = Instant::now();
         let dt = self.prev_time.map(|t| now.duration_since(t).as_secs_f64());
@@ -2896,9 +2966,16 @@ impl ProcessListWindow {
         // 关闭回调（资源区弹窗用；默认空，lib.rs 创建后按需注册）
         let on_closed: Arc<Mutex<Option<Box<dyn Fn() + Send>>>> = Arc::new(Mutex::new(None));
 
-        // #12 采样/渲染分离：采样线程独立跑（UI 只消费 cache 快照），
-        // 间隔跟随 refresh_ms（下拉可调，线程每轮读取）。
-        // - `sample_now`：手动刷新置位 → 线程立即采样（不等剩余间隔）
+        // #12 采样/渲染分离：采样线程独立跑（UI 只消费 cache 快照）。
+        //
+        // 两条节拍：
+        // - **全量采样**跟随 refresh_ms（下拉可调）：端口表 + 网络查询 +
+        //   每进程 IO/内存，几十毫秒级，不能高频；
+        // - **CPU 轻量刷新**固定 [`CPU_REFRESH_MS`]（1s）：同 sysinfo 的
+        //   cpu_usage 是「两次刷新的平均」，跟着 30s 走就成了 30 秒平均值，
+        //   突发负载全被抹平。1s 与任务管理器同窗口。
+        //
+        // - `sample_now`：手动刷新置位 → 线程立即全量采样（不等剩余间隔）
         // - `cache_version`：每次采样完成 +1，手动刷新等它变化再重绘
         //   （避免 UI 线程直接 sample() 与后台线程交错污染速率差分基线）
         let stop_thread = stop_sampling.clone();
@@ -2915,6 +2992,8 @@ impl ProcessListWindow {
                 let prof = std::env::var("FIND_STUTTER_PROF").as_deref() == Ok("1");
                 let mut deadline = Instant::now(); // 首轮立即采样
                 let mut svc_deadline = Instant::now(); // 首轮立即枚举服务
+                // 首轮全量采样刚建完 CPU 基线，CPU 通道顺延一个节拍
+                let mut cpu_deadline = Instant::now() + Duration::from_millis(CPU_REFRESH_MS);
                 loop {
                     if stop_thread.load(Ordering::SeqCst) {
                         break;
@@ -2942,6 +3021,34 @@ impl ProcessListWindow {
                             + Duration::from_millis(
                                 (*refresh_thread.lock().unwrap()).clamp(200, 60_000),
                             );
+                        // 全量采样已带最新 CPU，CPU 通道从此刻重新计时
+                        cpu_deadline = Instant::now() + Duration::from_millis(CPU_REFRESH_MS);
+                    } else if Instant::now() >= cpu_deadline {
+                        // CPU 轻量刷新：只读 GetProcessTimes，几毫秒，把新值
+                        // 合并进缓存行（不改行结构，render 时按 cpu 列排序自然跟上）。
+                        // 必须先放开 sampler 锁再拿 cache 锁——与全量分支的
+                        // 加锁顺序一致（sampler → cache），不会交叉死锁。
+                        let t_cpu = Instant::now();
+                        let cpu_map = {
+                            let mut s = sampler_thread.lock().unwrap();
+                            s.refresh_cpu_only()
+                        };
+                        {
+                            let mut c = cache_thread.lock().unwrap();
+                            for r in c.iter_mut() {
+                                if let Some(v) = cpu_map.get(&r.pid) {
+                                    r.cpu_usage = *v;
+                                }
+                            }
+                        }
+                        *version_thread.lock().unwrap() += 1;
+                        if prof {
+                            let ms = t_cpu.elapsed().as_millis();
+                            if ms >= 20 {
+                                log::info!("[PROF] CPU 轻量刷新 {}ms", ms);
+                            }
+                        }
+                        cpu_deadline = Instant::now() + Duration::from_millis(CPU_REFRESH_MS);
                     }
                     // 服务映射（SCM 枚举）独立于采样节奏：30s 刷一次足够
                     //（服务启停罕见；首轮回填保证窗口打开即有 svchost 服务名）
@@ -3332,12 +3439,9 @@ impl ProcessListWindow {
         // 刚 show 完 winit 的 HWND 句柄可能还取不到（实测首次安装会失败），
         // 因此在下方 500ms 延迟回调里重试；install 幂等。
         crate::window::install_native_resize(ui.window());
-        // 初始化标题栏：刷新间隔下拉索引 + header 显示当前间隔
+        // 初始化标题栏：刷新间隔下拉索引 + header 显示当前节奏
         ui.set_refresh_interval_index(interval_ms_to_index(*refresh_ms.lock().unwrap()));
-        ui.set_header_text(SharedString::from(format!(
-            "进程详情（{} 自动刷新）",
-            interval_ms_to_text(*refresh_ms.lock().unwrap())
-        )));
+        ui.set_header_text(SharedString::from(header_text(*refresh_ms.lock().unwrap())));
         // 窗口样式按角色分两类：
         // - 主进程详情页：普通应用窗口（留在任务栏 / Alt-Tab），配合不置顶——
         //   点别的 APP 就被压到后面，任务栏按钮是切回入口；
@@ -3368,14 +3472,13 @@ impl ProcessListWindow {
         // 自动刷新：首帧用 150ms 快速间隔。采样线程首轮 sysinfo 初始化 +
         // 友好名版本资源读取可能耗时数秒，快速 tick 保证窗口一打开、数据
         // 一就绪就立即渲染（间隔即白屏下限，不能太大；空 cache 的 render
-        // 是毫秒级，密集 tick 无代价）；一旦渲染到非空数据，切换回用户
-        // 配置的刷新间隔（标题栏下拉可调）。
+        // 是毫秒级，密集 tick 无代价）；一旦渲染到非空数据，切到固定 1s
+        // 重绘节奏（CPU 通道 1s 更新，重绘必须同频才看得到）。
         let weak_tick = ui.as_weak();
         let sort_tick = sort.clone();
         let search_tick = search.clone();
         let expanded_tick = expanded.clone();
         let shared_tick = shared.clone();
-        let refresh_ms_tick = refresh_ms.clone();
         let cache_data_tick = cache_tick.clone();
         let tick_timer = Arc::new(slint::Timer::default());
         let timer_for_first = tick_timer.clone();
@@ -3427,13 +3530,15 @@ impl ProcessListWindow {
                             );
                         }
                     }
-                    // 首帧渲染到非空数据 → 恢复正常刷新节奏（只切一次，
-                    // 之后间隔由标题栏下拉回调管理）
+                    // 首帧渲染到非空数据 → 进入稳态节奏（只切一次）。
+                    //
+                    // 重绘固定 [`CPU_REFRESH_MS`]（1s），**不再跟随列表刷新间隔**：
+                    // CPU 由采样线程按 1s 独立更新（`refresh_cpu_only`），如果重绘
+                    // 还是 30s 一次，新值要等半分钟才上屏，等于没改。render 只读
+                    // 缓存（毫秒级），1Hz 的开销远小于一次全量采样。
                     let has_data = !cache_data_tick.lock().unwrap().is_empty();
                     if has_data && !first_done_cb.swap(true, Ordering::SeqCst) {
-                        timer_for_first.set_interval(Duration::from_millis(
-                            *refresh_ms_tick.lock().unwrap(),
-                        ));
+                        timer_for_first.set_interval(Duration::from_millis(CPU_REFRESH_MS));
                     }
                 }
             },
@@ -3444,21 +3549,16 @@ impl ProcessListWindow {
             enable_flag.store(true, Ordering::SeqCst);
         });
 
-        // 刷新间隔下拉 → 更新状态 + 重启 timer（slint Timer 可改 interval 后 restart）
+        // 刷新间隔下拉 → 只影响「全量数据」（端口 / 网络 / 磁盘 IO / 内存明细）
+        // 的采样节拍；CPU 列固定 1s 独立刷新（见 CPU_REFRESH_MS），不随下拉变化。
         let refresh_ms_for_cb = refresh_ms.clone();
-        let timer_for_cb = tick_timer.clone();
         let weak_interval_ui = ui.as_weak();
         ui.on_refresh_interval_changed(move |value: slint::SharedString| {
             let ms = interval_text_to_ms(value.as_str());
             *refresh_ms_for_cb.lock().unwrap() = ms;
-            timer_for_cb.set_interval(Duration::from_millis(ms));
-            timer_for_cb.restart();
-            log::info!("刷新间隔改为 {}ms", ms);
+            log::info!("列表刷新间隔改为 {}ms（CPU 仍按 1s 刷新）", ms);
             if let Some(ui) = weak_interval_ui.upgrade() {
-                ui.set_header_text(SharedString::from(format!(
-                    "进程详情（{} 自动刷新）",
-                    interval_ms_to_text(ms)
-                )));
+                ui.set_header_text(SharedString::from(header_text(ms)));
             }
         });
 
@@ -3849,6 +3949,17 @@ fn interval_ms_to_text(ms: u64) -> &'static str {
     INTERVAL_OPTIONS[interval_ms_to_index(ms) as usize].1
 }
 
+/// 标题栏文案。
+///
+/// 两部分节奏不同，必须分开写：CPU 固定 1s（与任务管理器同窗口），
+/// 其余列（端口 / 网络 / 磁盘 IO / 内存明细）跟随下拉的列表间隔。
+fn header_text(list_interval_ms: u64) -> String {
+    format!(
+        "进程详情（CPU 1s · 其余 {}）",
+        interval_ms_to_text(list_interval_ms)
+    )
+}
+
 /// 进程列表布局常量（逻辑像素）——与 overlay.slint `ProcessList` 布局**双源**：
 /// 列表从标题栏（~70px）下方开始，行高 29px。改动 slint 布局时需同步此处
 /// （hit_test_row 命中测试依赖）。
@@ -4079,6 +4190,66 @@ mod tests {
             ports: Vec::new(),
             status: "运行中".into(),
         }
+    }
+
+    // ===== CPU 采样节拍（2026-11-03「CPU 数据不对」修复）=====
+
+    /// 标题栏必须同时点明两条节奏。
+    ///
+    /// 只写「30s 自动刷新」会让人以为 CPU 也是 30 秒一个数——而那正是当日
+    /// 现场：CPU 跟着列表间隔走，出来的是 30 秒平均值（DoubaoWork 界面
+    /// 0.5%，PDH 2s 采样 1.5~2%）。修复后 CPU 固定 1s，标题要写清楚。
+    #[test]
+    fn header_text_mentions_cpu_1s_and_list_interval() {
+        let t = header_text(30_000);
+        assert!(t.contains("CPU 1s"), "标题缺 CPU 节奏: {t}");
+        assert!(t.contains("30s"), "标题缺列表间隔: {t}");
+        assert_eq!(header_text(5_000), "进程详情（CPU 1s · 其余 5s）");
+    }
+
+    /// CPU 轻量刷新：必须真能拿到非零值，且不能破坏全量采样填好的字段。
+    ///
+    /// 背景：sysinfo 的 per-process `cpu_usage` 要求两次刷新间隔 ≥200ms，
+    /// 否则**不计算**、沿用旧值（初值 0）。`new()` 刚建过基线，首轮采样
+    /// 立刻撞上 → 打开窗口第一屏 CPU 全 0.0%。
+    ///
+    /// 这里自己烧一个线程制造确定的 CPU 占用，不依赖机器闲不闲。
+    #[cfg(windows)]
+    #[test]
+    fn refresh_cpu_only_reports_running_thread_cpu() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_burner = stop.clone();
+        let burner = std::thread::spawn(move || {
+            let mut x: u64 = 0;
+            while !stop_burner.load(Ordering::Relaxed) {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            x
+        });
+        // 先让 burner 真正吃上核，再让采样器建立基线
+        std::thread::sleep(Duration::from_millis(300));
+
+        let mut s = ProcessSampler::new(None);
+        let rows = s.sample(); // 全量：进程名 / 内存都由这一趟填
+        assert!(!rows.is_empty(), "全量采样不应为空");
+        std::thread::sleep(Duration::from_millis(300));
+        let cpu = s.refresh_cpu_only();
+        stop.store(true, Ordering::Relaxed);
+        let _ = burner.join();
+
+        assert!(cpu.len() >= 10, "CPU 通道进程数异常少: {}", cpu.len());
+        let self_pid = std::process::id();
+        let own = *cpu.get(&self_pid).expect("CPU 通道必须包含自身进程");
+        assert!(own > 0.0, "自身在烧 CPU 却报 0（基线不足？）: {own}");
+
+        // 轻量刷新只动 CPU：之后的全量采样里，进程名和内存不能被清空
+        let after = s.sample();
+        let own_row = after
+            .iter()
+            .find(|r| r.pid == self_pid)
+            .expect("自身进程行不应消失");
+        assert!(!own_row.name.is_empty(), "轻量刷新把进程名打空了");
+        assert!(own_row.memory_bytes > 0, "轻量刷新把内存打回 0 了");
     }
 
     // ===== 免句柄内存兜底（真实 Win32，仅 Windows）=====

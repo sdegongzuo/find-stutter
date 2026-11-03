@@ -6,10 +6,23 @@
 
 use find_stutter_core::{Collector, Sample};
 use serde_json::{json, Value};
+use std::time::Duration;
+
+/// per-process CPU 基线等待时长。
+///
+/// sysinfo 的 `cpu_usage` 是「两次刷新之间的增量 ÷ 同期系统增量」，Windows 下
+/// 两次刷新的最小间隔是 `MINIMUM_CPU_UPDATE_INTERVAL`（200ms）：间隔不足时它
+/// **不计算**、直接沿用旧值（初值 0）。`Collector::new()` 里刚 `refresh_all()`
+/// 建立过基线，紧接着 `collect()` 必然撞上这个门槛 —— 实测 top 进程 cpu_usage
+/// 全是 `0.0`。这里补足最小间隔再采，多花 250ms 换真实读数。
+const CPU_BASELINE_WAIT: Duration = Duration::from_millis(250);
 
 /// 现场采集一帧并转 JSON（不写库；`limit` 截取 top 进程数）。
 pub fn snapshot_json(limit: usize) -> anyhow::Result<Value> {
     let mut collector = Collector::new();
+    // 见 CPU_BASELINE_WAIT：new() 已建基线，必须等过 sysinfo 的最小更新间隔，
+    // 否则进程 CPU 恒为 0（不是「没占用」，是根本没算）。
+    std::thread::sleep(CPU_BASELINE_WAIT);
     let sample: Sample = collector.collect();
     Ok(sample_to_json(&sample, limit))
 }
