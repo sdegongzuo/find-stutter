@@ -2521,21 +2521,20 @@ export component TrafficStats inherits Window {
                             height: 100%;
                             spacing: 10px;
 
-                            // 工具栏：左侧统计方式，右侧图表比例
-                            // 只留浅底不加边框：里面的 ComboBox 是 fluent 风格自带
-                            // 描边 + 焦点环，容器再描一圈就是双重边框（实测截图如此）
+                            // 工具栏：左侧统计方式，右侧图表比例。
+                            // 不做灰条底：fluent ComboBox 自带白底+描边，嵌在
+                            // 灰条上像两块白色补丁（用户截图抓出）；控件直接排在
+                            // 窗口白底上只剩描边，风格统一。
                             Rectangle {
-                                height: 32px;
-                                background: root.c-panel;
-                                border-radius: 8px;
+                                height: 34px;
                                 HorizontalLayout {
-                                    padding-left: 12px;
-                                    padding-right: 12px;
+                                    padding-left: 2px;
+                                    padding-right: 2px;
                                     spacing: 8px;
                                     Text {
                                         text: "统计方式";
                                         color: root.c-text-muted;
-                                        font-size: 11px;
+                                        font-size: 12px;
                                         vertical-alignment: center;
                                     }
                                     ComboBox {
@@ -2550,7 +2549,7 @@ export component TrafficStats inherits Window {
                                     Text {
                                         text: "图表显示比例";
                                         color: root.c-text-muted;
-                                        font-size: 11px;
+                                        font-size: 12px;
                                         vertical-alignment: center;
                                     }
                                     ComboBox {
