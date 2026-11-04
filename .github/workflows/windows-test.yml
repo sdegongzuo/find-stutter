@@ -1,0 +1,55 @@
+# Windows 测试流水线：本机队列的快速闸门 + 云端的权威闸门。
+# 约束详见 docs/并行开发规范.md §3 与 §9。
+name: windows-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 合并队列（GitHub 原生或第三方）入队时派发的是 merge_group 事件，
+  # 缺这个触发器会导致 required check 永远不上报、合并被卡住。
+  merge_group:
+
+env:
+  # 自动测试绝不拉起 SCM 服务、不弹 UAC；本机 Win32 采集的 ui_probe 已由 #[cfg(test)] 短路。
+  FIND_STUTTER_SKIP_SERVICE: "1"
+  CARGO_TERM_COLOR: never
+  CARGO_BUILD_JOBS: 2
+
+jobs:
+  test:
+    # job 名即 required status check 的 context，分支保护里要填 "test"。
+    name: test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # edition 2024 需要 Rust >= 1.85。
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # 不要加 --all-targets / --examples：三个 examples 需要真实交互式桌面，
+      # 而 GitHub-hosted Windows runner 以服务方式运行、没有交互桌面。
+      # 6 个 UI 集成测试用 Slint 无头 testing backend，可以正常跑。
+      - name: 运行工作区测试
+        run: cargo test --workspace -- --test-threads=2
+
+      - name: 失败时上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs
+          path: |
+            target/**/*.log
+            target/**/stdout*
+          if-no-files-found: ignore

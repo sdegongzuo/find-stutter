@@ -1,0 +1,32 @@
+# 合并队列（替代 GitHub 原生 Merge Queue）
+#
+# 为什么用 Mergify：本仓库由个人账号 sdegongzuo 持有，GitHub 原生 Merge Queue
+# 仅对「组织拥有的 public 仓库」或 Enterprise Cloud 组织私有仓库开放，个人账号不可用。
+# 启用前提：在 Mergify 控制台安装 GitHub App 并授权本仓库（需用户操作，不自动执行）。
+# check-success=test 对应 .github/workflows/windows-test.yml 里的 job name: test。
+#
+# 与本机队列的分工见 docs/并行开发规范.md §9：
+#   本机 am am-run 单一 build slot = 快速反馈闸门（唯一 target，串行）
+#   GitHub Actions + 这里的队列 = 权威闸门，唯一有权写入 main
+
+queue_rules:
+  - name: default
+    queue_conditions:
+      - check-success=test
+    merge_conditions:
+      - check-success=test
+    # 严格 FIFO，和本机「共享一个 target 只能排队」保持一致；
+    # 队列变长后可按需调大到 3 做批次验证（rollup）。
+    batch_size: 1
+    batch_max_wait_time: 5 min
+    merge_method: squash
+
+pull_request_rules:
+  - name: 由总控打 label 入队
+    conditions:
+      - base=main
+      - check-success=test
+      - label=ready-to-queue
+    actions:
+      queue:
+        name: default
